@@ -76,6 +76,25 @@ pub struct PartitionMeta {
     pub file_count: u64,
 }
 
+/// Metadata for an API key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyMeta {
+    /// Unique identifier (UUID simple string)
+    pub key_id: String,
+    /// Human-readable label
+    pub name: String,
+    /// SHA-256 hash of the raw key (stored; never store the raw key)
+    pub key_hash: String,
+    /// Key prefix for display (first 8 chars of raw key + "...")
+    pub key_prefix: String,
+    /// Unix timestamp when this key was created
+    pub created_at: u64,
+    /// Unix timestamp of the last successful use (0 = never used)
+    pub last_used_at: u64,
+    /// Whether this key is currently active
+    pub enabled: bool,
+}
+
 /// A dedup index entry: maps a content hash → block location
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupEntry {

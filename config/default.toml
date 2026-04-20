@@ -21,3 +21,9 @@ http_addr    = "0.0.0.0:8080"
 grpc_addr    = "0.0.0.0:8081"
 metrics_addr = "0.0.0.0:9090"
 enable_access_log = true
+
+[auth]
+# Set enabled = true to require API keys for all requests (except /api/status and /ui)
+enabled = false
+# Routes exempt from authentication (prefix match)
+exempt_routes = ["/api/status", "/ui"]

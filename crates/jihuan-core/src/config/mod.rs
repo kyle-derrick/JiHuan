@@ -93,6 +93,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 /// Core storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -174,11 +178,30 @@ pub struct ServerConfig {
     pub enable_access_log: bool,
 }
 
+/// Authentication configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthConfig {
+    /// Whether API key authentication is required
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+
+    /// Routes that are exempt from authentication (prefix match)
+    /// Default: ["/api/status", "/ui"]
+    #[serde(default = "default_exempt_routes")]
+    pub exempt_routes: Vec<String>,
+}
+
+fn default_exempt_routes() -> Vec<String> {
+    vec!["/api/status".to_string(), "/ui".to_string()]
+}
+
 /// Top-level application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub storage: StorageConfig,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl AppConfig {
@@ -327,6 +350,7 @@ impl ConfigTemplate {
                 max_body_size: None,
                 enable_access_log: true,
             },
+            auth: AuthConfig::default(),
         }
     }
 }

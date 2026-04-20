@@ -77,6 +77,9 @@ clap = { version = "4", features = ["derive", "env"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
+# static file embedding
+include_dir = "0.7"
+
 # utils
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

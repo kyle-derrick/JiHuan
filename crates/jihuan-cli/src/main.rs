@@ -24,6 +24,10 @@ struct Cli {
     )]
     server: String,
 
+    /// API key for authentication (env: JIHUAN_API_KEY)
+    #[arg(long, env = "JIHUAN_API_KEY", global = true)]
+    api_key: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -150,7 +154,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let base = cli.server.trim_end_matches('/').to_string();
+    let api_key = cli.api_key.clone();
     let client = reqwest::Client::new();
+
+    macro_rules! authed {
+        ($req:expr) => {{
+            let r = $req;
+            if let Some(ref key) = api_key {
+                r.header("X-API-Key", key)
+            } else {
+                r
+            }
+        }};
+    }
 
     match &cli.command {
         // ── put ───────────────────────────────────────────────────────────────
@@ -178,9 +194,9 @@ async fn main() -> Result<()> {
                 .mime_str(&mime)?;
             let form = reqwest::multipart::Form::new().part("file", part);
 
-            let resp = client
+            let resp = authed!(client
                 .post(format!("{}/api/v1/files", base))
-                .multipart(form)
+                .multipart(form))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -194,8 +210,8 @@ async fn main() -> Result<()> {
 
         // ── get ───────────────────────────────────────────────────────────────
         Commands::Get { file_id, output } => {
-            let resp = client
-                .get(format!("{}/api/v1/files/{}", base, file_id))
+            let resp = authed!(client
+                .get(format!("{}/api/v1/files/{}", base, file_id)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -217,8 +233,8 @@ async fn main() -> Result<()> {
 
         // ── delete ────────────────────────────────────────────────────────────
         Commands::Delete { file_id } => {
-            let resp = client
-                .delete(format!("{}/api/v1/files/{}", base, file_id))
+            let resp = authed!(client
+                .delete(format!("{}/api/v1/files/{}", base, file_id)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -229,8 +245,8 @@ async fn main() -> Result<()> {
 
         // ── stat ──────────────────────────────────────────────────────────────
         Commands::Stat { file_id } => {
-            let resp = client
-                .get(format!("{}/api/v1/files/{}/meta", base, file_id))
+            let resp = authed!(client
+                .get(format!("{}/api/v1/files/{}/meta", base, file_id)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -249,8 +265,7 @@ async fn main() -> Result<()> {
 
         // ── status ────────────────────────────────────────────────────────────
         Commands::Status => {
-            let resp = client
-                .get(format!("{}/api/status", base))
+            let resp = authed!(client.get(format!("{}/api/status", base)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -268,8 +283,7 @@ async fn main() -> Result<()> {
 
         // ── gc ────────────────────────────────────────────────────────────────
         Commands::Gc => {
-            let resp = client
-                .post(format!("{}/api/gc/trigger", base))
+            let resp = authed!(client.post(format!("{}/api/gc/trigger", base)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;
@@ -286,8 +300,7 @@ async fn main() -> Result<()> {
 
         // ── list-blocks ───────────────────────────────────────────────────────
         Commands::ListBlocks => {
-            let resp = client
-                .get(format!("{}/api/block/list", base))
+            let resp = authed!(client.get(format!("{}/api/block/list", base)))
                 .send()
                 .await
                 .context("Failed to connect to server")?;

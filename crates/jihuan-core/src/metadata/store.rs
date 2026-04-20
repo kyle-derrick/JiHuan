@@ -4,7 +4,7 @@ use std::sync::Arc;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::error::{JiHuanError, Result};
-use crate::metadata::types::{BlockMeta, DedupEntry, FileMeta};
+use crate::metadata::types::{ApiKeyMeta, BlockMeta, DedupEntry, FileMeta};
 
 // Table definitions: key type → value type (both &[u8] for bincode-encoded blobs)
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
@@ -13,6 +13,10 @@ const DEDUP_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("dedup");
 const PARTITIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
 /// Maps partition_id → list of file_ids (stored as bincode Vec<String>)
 const PARTITION_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partition_files");
+/// Maps key_id → ApiKeyMeta (JSON-encoded)
+const APIKEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("apikeys");
+/// Maps key_hash → key_id (for fast lookup by raw key hash)
+const APIKEY_HASH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("apikey_hash");
 
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|e| JiHuanError::Serialization(e.to_string()))
@@ -51,6 +55,10 @@ impl MetadataStore {
             tx.open_table(PARTITIONS_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(APIKEY_HASH_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.commit()
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
@@ -405,6 +413,182 @@ impl MetadataStore {
         tx.commit()
             .map_err(|e| JiHuanError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // API Key operations
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Insert a new API key record.
+    pub fn insert_api_key(&self, key: &ApiKeyMeta) -> Result<()> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let bytes = encode(key)?;
+            let mut table = tx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            table
+                .insert(key.key_id.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut hash_table = tx
+                .open_table(APIKEY_HASH_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            hash_table
+                .insert(key.key_hash.as_str(), key.key_id.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Look up an API key by its SHA-256 hash. Updates `last_used_at` on success.
+    pub fn get_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKeyMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let hash_table = tx
+            .open_table(APIKEY_HASH_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let key_id = match hash_table
+            .get(key_hash)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => v.value().to_string(),
+            None => return Ok(None),
+        };
+        let table = tx
+            .open_table(APIKEYS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(key_id.as_str())
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get an API key by its ID.
+    pub fn get_api_key(&self, key_id: &str) -> Result<Option<ApiKeyMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(APIKEYS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(key_id)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all API keys.
+    pub fn list_api_keys(&self) -> Result<Vec<ApiKeyMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(APIKEYS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut keys = Vec::new();
+        for entry in table.iter().map_err(|e| JiHuanError::Database(e.to_string()))? {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            keys.push(decode(v.value())?);
+        }
+        Ok(keys)
+    }
+
+    /// Update the `last_used_at` timestamp for an API key.
+    pub fn touch_api_key(&self, key_id: &str, now: u64) -> Result<()> {
+        // Read phase: extract current value without holding a write transaction
+        let updated_bytes: Option<Vec<u8>> = {
+            let rtx = self
+                .db
+                .begin_read()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let table = rtx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            match table
+                .get(key_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+            {
+                Some(r) => {
+                    let mut meta: ApiKeyMeta = decode(r.value())?;
+                    meta.last_used_at = now;
+                    Some(encode(&meta)?)
+                }
+                None => None,
+            }
+        };
+        // Write phase: only open write transaction after read transaction is dropped
+        if let Some(bytes) = updated_bytes {
+            let tx = self
+                .db
+                .begin_write()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            {
+                let mut table = tx
+                    .open_table(APIKEYS_TABLE)
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                table
+                    .insert(key_id, bytes.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete (revoke) an API key by ID. Returns the removed key if found.
+    pub fn delete_api_key(&self, key_id: &str) -> Result<Option<ApiKeyMeta>> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        // Phase 1: remove from apikeys table, extract owned bytes before dropping AccessGuard
+        let removed_raw: Option<Vec<u8>> = {
+            let mut table = tx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let result = table
+                .remove(key_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()));
+            // Eagerly copy bytes to owned Vec so AccessGuard (and table borrow) is released
+            match result {
+                Ok(Some(guard)) => Some(guard.value().to_vec()),
+                Ok(None) => None,
+                Err(e) => return Err(e),
+            }
+        };
+        let removed_meta: Option<ApiKeyMeta> = match removed_raw {
+            Some(ref b) => Some(decode(b)?),
+            None => None,
+        };
+        // Phase 2: remove from hash index (table borrow dropped above)
+        if let Some(ref meta) = removed_meta {
+            let mut hash_table = tx
+                .open_table(APIKEY_HASH_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            hash_table
+                .remove(meta.key_hash.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        let removed = removed_meta;
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(removed)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
