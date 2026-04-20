@@ -5,8 +5,7 @@ use axum::{
     extract::{Multipart, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
-    Json, Router,
+    Json,
 };
 use serde::Serialize;
 
@@ -35,18 +34,10 @@ pub struct ErrorResponse {
     pub code: u16,
 }
 
-pub fn router(engine: Arc<Engine>) -> Router {
-    Router::new()
-        .route("/", post(upload_file))
-        .route("/{file_id}", get(download_file))
-        .route("/{file_id}", delete(delete_file))
-        .route("/{file_id}/meta", get(get_file_meta))
-        .with_state(engine)
-}
 
 /// POST /api/v1/files
 /// Upload a file via multipart form data
-async fn upload_file(
+pub async fn upload_file(
     State(engine): State<Arc<Engine>>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
@@ -95,7 +86,7 @@ async fn upload_file(
 
 /// GET /api/v1/files/:file_id
 /// Download a file
-async fn download_file(
+pub async fn download_file(
     State(engine): State<Arc<Engine>>,
     Path(file_id): Path<String>,
 ) -> Result<Response, AppError> {
@@ -144,7 +135,7 @@ async fn download_file(
 }
 
 /// DELETE /api/v1/files/:file_id
-async fn delete_file(
+pub async fn delete_file(
     State(engine): State<Arc<Engine>>,
     Path(file_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
@@ -157,12 +148,16 @@ async fn delete_file(
 }
 
 /// GET /api/v1/files/:file_id/meta
-async fn get_file_meta(
+pub async fn get_file_meta(
     State(engine): State<Arc<Engine>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<FileMetaResponse>, AppError> {
+    tracing::debug!(file_id = %file_id, "get_file_meta called");
     let fid = file_id.clone();
-    let meta = tokio::task::spawn_blocking(move || engine.get_file_meta(&fid))
+    let meta = tokio::task::spawn_blocking(move || {
+        tracing::debug!(fid = %fid, "querying engine.get_file_meta");
+        engine.get_file_meta(&fid)
+    })
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?

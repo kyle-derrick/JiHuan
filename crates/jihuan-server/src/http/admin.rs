@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use serde::Serialize;
 
@@ -11,13 +10,6 @@ use jihuan_core::Engine;
 
 use crate::http::files::AppError;
 
-pub fn router(engine: Arc<Engine>) -> Router {
-    Router::new()
-        .route("/status", get(get_status))
-        .route("/gc/trigger", post(trigger_gc))
-        .route("/block/list", get(list_blocks))
-        .with_state(engine)
-}
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
@@ -54,7 +46,7 @@ pub struct BlockInfoDto {
 }
 
 /// GET /api/status
-async fn get_status(State(engine): State<Arc<Engine>>) -> Result<Json<StatusResponse>, AppError> {
+pub async fn get_status(State(engine): State<Arc<Engine>>) -> Result<Json<StatusResponse>, AppError> {
     let e = engine.clone();
     let (fc, bc) = tokio::task::spawn_blocking(move || {
         let fc = e.file_count().unwrap_or(0);
@@ -77,7 +69,7 @@ async fn get_status(State(engine): State<Arc<Engine>>) -> Result<Json<StatusResp
 }
 
 /// POST /api/gc/trigger
-async fn trigger_gc(State(engine): State<Arc<Engine>>) -> Result<Json<GcResponse>, AppError> {
+pub async fn trigger_gc(State(engine): State<Arc<Engine>>) -> Result<Json<GcResponse>, AppError> {
     let stats = engine
         .trigger_gc()
         .await
@@ -93,7 +85,7 @@ async fn trigger_gc(State(engine): State<Arc<Engine>>) -> Result<Json<GcResponse
 }
 
 /// GET /api/block/list
-async fn list_blocks(
+pub async fn list_blocks(
     State(engine): State<Arc<Engine>>,
 ) -> Result<Json<BlockListResponse>, AppError> {
     let blocks = tokio::task::spawn_blocking(move || engine.metadata().list_all_blocks())

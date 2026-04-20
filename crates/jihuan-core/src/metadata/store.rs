@@ -65,6 +65,7 @@ impl MetadataStore {
 
     /// Insert a new file record. Errors if the file_id already exists.
     pub fn insert_file(&self, file: &FileMeta) -> Result<()> {
+        tracing::debug!(file_id = %file.file_id, "MetadataStore::insert_file");
         let tx = self
             .db
             .begin_write()
@@ -113,6 +114,7 @@ impl MetadataStore {
 
     /// Get a file by its ID
     pub fn get_file(&self, file_id: &str) -> Result<Option<FileMeta>> {
+        tracing::debug!(file_id = %file_id, "MetadataStore::get_file");
         let tx = self
             .db
             .begin_read()
