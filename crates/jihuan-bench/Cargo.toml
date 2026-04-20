@@ -1,0 +1,28 @@
+[package]
+name = "jihuan-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jihuan-core = { path = "../jihuan-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "storage_bench"
+harness = false
+
+[[bench]]
+name = "dedup_bench"
+harness = false
+
+[[bench]]
+name = "compression_bench"
+harness = false

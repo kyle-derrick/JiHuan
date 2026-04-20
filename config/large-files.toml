@@ -1,0 +1,24 @@
+# JiHuan - Large Files Configuration
+# 90%+ files over 100 MB (videos, backups, datasets, ISO images).
+# Larger chunk & block sizes improve throughput and dedup granularity.
+
+[storage]
+data_dir = "./jihuan-data/data"
+meta_dir = "./jihuan-data/meta"
+wal_dir  = "./jihuan-data/wal"
+block_file_size    = 2147483648  # 2 GB
+chunk_size         = 8388608     # 8 MB
+hash_algorithm     = "sha256"
+compression_algorithm = "zstd"
+compression_level  = 1
+time_partition_hours = 72
+gc_threshold       = 0.8
+gc_interval_secs   = 600
+max_open_block_files = 32
+verify_on_read     = true
+
+[server]
+http_addr    = "0.0.0.0:8080"
+grpc_addr    = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = true

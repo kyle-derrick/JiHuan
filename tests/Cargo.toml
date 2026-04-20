@@ -1,0 +1,9 @@
+[package]
+name = "jihuan-tests"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jihuan-core = { path = "../crates/jihuan-core" }
+tokio = { workspace = true }
+tempfile = { workspace = true }

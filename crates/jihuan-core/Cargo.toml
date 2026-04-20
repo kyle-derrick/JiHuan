@@ -1,0 +1,44 @@
+[package]
+name = "jihuan-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+digest = { workspace = true }
+hex = { workspace = true }
+crc32fast = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+redb = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+lru = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+once_cell = { workspace = true }
+num_cpus = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

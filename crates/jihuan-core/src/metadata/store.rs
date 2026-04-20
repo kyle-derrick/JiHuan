@@ -1,0 +1,565 @@
+use std::path::Path;
+use std::sync::Arc;
+
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+use crate::error::{JiHuanError, Result};
+use crate::metadata::types::{BlockMeta, DedupEntry, FileMeta};
+
+// Table definitions: key type → value type (both &[u8] for bincode-encoded blobs)
+const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
+const BLOCKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
+const DEDUP_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("dedup");
+const PARTITIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
+/// Maps partition_id → list of file_ids (stored as bincode Vec<String>)
+const PARTITION_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partition_files");
+
+fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(v).map_err(|e| JiHuanError::Serialization(e.to_string()))
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|e| JiHuanError::Serialization(e.to_string()))
+}
+
+/// Thread-safe metadata store backed by redb
+pub struct MetadataStore {
+    db: Arc<Database>,
+}
+
+impl MetadataStore {
+    /// Open (or create) the metadata database at the given path
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(JiHuanError::Io)?;
+        }
+
+        let db = Database::create(path).map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        // Ensure all tables exist
+        {
+            let tx = db
+                .begin_write()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(PARTITIONS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // File operations
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Insert a new file record. Errors if the file_id already exists.
+    pub fn insert_file(&self, file: &FileMeta) -> Result<()> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+            if table
+                .get(file.file_id.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+                .is_some()
+            {
+                return Err(JiHuanError::AlreadyExists(format!(
+                    "File '{}' already exists",
+                    file.file_id
+                )));
+            }
+
+            let bytes = encode(file)?;
+            table
+                .insert(file.file_id.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        {
+            // Update partition → file list
+            let mut pt = tx
+                .open_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let pid = file.partition_id.to_string();
+            let mut ids: Vec<String> = pt
+                .get(pid.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            ids.push(file.file_id.clone());
+            let bytes = encode(&ids)?;
+            pt.insert(pid.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get a file by its ID
+    pub fn get_file(&self, file_id: &str) -> Result<Option<FileMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(file_id)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a file record. Returns the deleted FileMeta if it existed.
+    pub fn delete_file(&self, file_id: &str) -> Result<Option<FileMeta>> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        let file_opt: Option<FileMeta> = {
+            let mut table = tx
+                .open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let raw = table
+                .remove(file_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            match raw {
+                Some(v) => {
+                    let bytes = v.value().to_vec();
+                    Some(decode(&bytes)?)
+                }
+                None => None,
+            }
+        };
+
+        if let Some(ref file) = file_opt {
+            let mut pt = tx
+                .open_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let pid = file.partition_id.to_string();
+            let mut ids: Vec<String> = pt
+                .get(pid.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            ids.retain(|id| id != file_id);
+            let bytes = encode(&ids)?;
+            pt.insert(pid.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(file_opt)
+    }
+
+    /// List all file IDs in a partition
+    pub fn list_files_in_partition(&self, partition_id: u64) -> Result<Vec<String>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(PARTITION_FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let pid = partition_id.to_string();
+        match table
+            .get(pid.as_str())
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => decode(v.value()),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Delete all files in a partition. Returns the list of deleted FileMeta.
+    pub fn delete_partition(&self, partition_id: u64) -> Result<Vec<FileMeta>> {
+        let file_ids = self.list_files_in_partition(partition_id)?;
+        let mut deleted = Vec::with_capacity(file_ids.len());
+        for fid in &file_ids {
+            if let Some(f) = self.delete_file(fid)? {
+                deleted.push(f);
+            }
+        }
+        Ok(deleted)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Block operations
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn insert_block(&self, block: &BlockMeta) -> Result<()> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let bytes = encode(block)?;
+            table
+                .insert(block.block_id.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_block(&self, block_id: &str) -> Result<Option<BlockMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(BLOCKS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(block_id)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn update_block_ref_count(&self, block_id: &str, delta: i64) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let new_ref_count = {
+            let mut table = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut block: BlockMeta = match table
+                .get(block_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+            {
+                Some(v) => decode(v.value())?,
+                None => {
+                    return Err(JiHuanError::NotFound(format!(
+                        "Block '{}' not found",
+                        block_id
+                    )))
+                }
+            };
+            let new_count = (block.ref_count as i64 + delta).max(0) as u64;
+            block.ref_count = new_count;
+            let bytes = encode(&block)?;
+            table
+                .insert(block_id, bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            new_count
+        };
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(new_ref_count)
+    }
+
+    pub fn delete_block(&self, block_id: &str) -> Result<Option<BlockMeta>> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let result = {
+            let mut table = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let raw = table
+                .remove(block_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            match raw {
+                Some(v) => {
+                    let bytes = v.value().to_vec();
+                    Some(decode(&bytes)?)
+                }
+                None => None,
+            }
+        };
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(result)
+    }
+
+    /// List all block IDs with ref_count == 0
+    pub fn list_unreferenced_blocks(&self) -> Result<Vec<BlockMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(BLOCKS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut result = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let block: BlockMeta = decode(v.value())?;
+            if block.ref_count == 0 {
+                result.push(block);
+            }
+        }
+        Ok(result)
+    }
+
+    /// List all blocks
+    pub fn list_all_blocks(&self) -> Result<Vec<BlockMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(BLOCKS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut result = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let block: BlockMeta = decode(v.value())?;
+            result.push(block);
+        }
+        Ok(result)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Dedup index operations
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn get_dedup_entry(&self, hash: &str) -> Result<Option<DedupEntry>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(DEDUP_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(hash)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn insert_dedup_entry(&self, entry: &DedupEntry) -> Result<()> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let bytes = encode(entry)?;
+            table
+                .insert(entry.hash.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn remove_dedup_entry(&self, hash: &str) -> Result<()> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            table
+                .remove(hash)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stats
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn file_count(&self) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        table
+            .len()
+            .map_err(|e| JiHuanError::Database(e.to_string()))
+    }
+
+    pub fn block_count(&self) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(BLOCKS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        table
+            .len()
+            .map_err(|e| JiHuanError::Database(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::types::{ChunkMeta, FileMeta};
+    use tempfile::tempdir;
+
+    fn make_store() -> (MetadataStore, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let store = MetadataStore::open(tmp.path().join("meta.db")).unwrap();
+        (store, tmp)
+    }
+
+    fn make_file(id: &str, partition_id: u64) -> FileMeta {
+        FileMeta {
+            file_id: id.to_string(),
+            file_name: format!("{}.txt", id),
+            file_size: 1024,
+            create_time: 1000000,
+            partition_id,
+            chunks: vec![ChunkMeta {
+                block_id: "blk1".to_string(),
+                offset: 0,
+                original_size: 1024,
+                compressed_size: 512,
+                hash: "abc123".to_string(),
+                index: 0,
+            }],
+            content_type: None,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_file() {
+        let (store, _tmp) = make_store();
+        let file = make_file("file1", 0);
+        store.insert_file(&file).unwrap();
+        let got = store.get_file("file1").unwrap();
+        assert_eq!(got, Some(file));
+    }
+
+    #[test]
+    fn test_insert_duplicate_file_errors() {
+        let (store, _tmp) = make_store();
+        let file = make_file("dup", 0);
+        store.insert_file(&file).unwrap();
+        assert!(store.insert_file(&file).is_err());
+    }
+
+    #[test]
+    fn test_delete_file() {
+        let (store, _tmp) = make_store();
+        store.insert_file(&make_file("f1", 0)).unwrap();
+        let deleted = store.delete_file("f1").unwrap();
+        assert!(deleted.is_some());
+        assert_eq!(store.get_file("f1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_partition_file_listing() {
+        let (store, _tmp) = make_store();
+        store.insert_file(&make_file("f1", 5)).unwrap();
+        store.insert_file(&make_file("f2", 5)).unwrap();
+        store.insert_file(&make_file("f3", 6)).unwrap();
+
+        let p5 = store.list_files_in_partition(5).unwrap();
+        assert_eq!(p5.len(), 2);
+        let p6 = store.list_files_in_partition(6).unwrap();
+        assert_eq!(p6.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_partition() {
+        let (store, _tmp) = make_store();
+        store.insert_file(&make_file("f1", 3)).unwrap();
+        store.insert_file(&make_file("f2", 3)).unwrap();
+        let deleted = store.delete_partition(3).unwrap();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(store.list_files_in_partition(3).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_block_ref_count() {
+        let (store, _tmp) = make_store();
+        let block = BlockMeta::new("blk1", "/data/blk1.blk", 1024 * 1024, 1000);
+        store.insert_block(&block).unwrap();
+
+        let rc = store.update_block_ref_count("blk1", 3).unwrap();
+        assert_eq!(rc, 3);
+        let rc = store.update_block_ref_count("blk1", -1).unwrap();
+        assert_eq!(rc, 2);
+        let rc = store.update_block_ref_count("blk1", -10).unwrap(); // clamps to 0
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn test_list_unreferenced_blocks() {
+        let (store, _tmp) = make_store();
+        store
+            .insert_block(&BlockMeta::new("b1", "/b1.blk", 100, 0))
+            .unwrap();
+        store
+            .insert_block(&BlockMeta::new("b2", "/b2.blk", 100, 0))
+            .unwrap();
+        store.update_block_ref_count("b1", 1).unwrap();
+
+        let unreferenced = store.list_unreferenced_blocks().unwrap();
+        assert_eq!(unreferenced.len(), 1);
+        assert_eq!(unreferenced[0].block_id, "b2");
+    }
+
+    #[test]
+    fn test_dedup_entry_crud() {
+        let (store, _tmp) = make_store();
+        let entry = DedupEntry {
+            hash: "sha256abc".to_string(),
+            block_id: "blk1".to_string(),
+            offset: 64,
+            original_size: 4096,
+            compressed_size: 2000,
+        };
+        store.insert_dedup_entry(&entry).unwrap();
+        let got = store.get_dedup_entry("sha256abc").unwrap();
+        assert!(got.is_some());
+        store.remove_dedup_entry("sha256abc").unwrap();
+        assert!(store.get_dedup_entry("sha256abc").unwrap().is_none());
+    }
+}

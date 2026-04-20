@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package jihuan.v1;
+
+// ─── File Service ────────────────────────────────────────────────────────────
+
+service FileService {
+  // Upload a file (client-streaming for large files)
+  rpc PutFile(stream PutFileRequest) returns (PutFileResponse);
+
+  // Download a file (server-streaming for large files)
+  rpc GetFile(GetFileRequest) returns (stream GetFileResponse);
+
+  // Delete a file
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // Get file metadata without downloading data
+  rpc GetFileMeta(GetFileMetaRequest) returns (GetFileMetaResponse);
+}
+
+// ─── Admin Service ────────────────────────────────────────────────────────────
+
+service AdminService {
+  // Get system status and metrics
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // Trigger GC manually
+  rpc TriggerGc(TriggerGcRequest) returns (TriggerGcResponse);
+
+  // List all block files
+  rpc ListBlocks(ListBlocksRequest) returns (ListBlocksResponse);
+}
+
+// ─── File Service Messages ────────────────────────────────────────────────────
+
+message PutFileRequest {
+  oneof payload {
+    PutFileInfo info = 1;      // First message: file metadata
+    bytes chunk_data = 2;      // Subsequent messages: file content
+  }
+}
+
+message PutFileInfo {
+  string file_name = 1;
+  uint64 file_size = 2;
+  string content_type = 3;
+}
+
+message PutFileResponse {
+  string file_id = 1;
+  uint64 stored_size = 2;
+  bool deduplicated = 3;
+}
+
+message GetFileRequest {
+  string file_id = 1;
+}
+
+message GetFileResponse {
+  oneof payload {
+    GetFileMeta meta = 1;
+    bytes chunk_data = 2;
+  }
+}
+
+message GetFileMeta {
+  string file_id = 1;
+  string file_name = 2;
+  uint64 file_size = 3;
+  string content_type = 4;
+  uint64 create_time = 5;
+}
+
+message DeleteFileRequest {
+  string file_id = 1;
+}
+
+message DeleteFileResponse {
+  bool success = 1;
+}
+
+message GetFileMetaRequest {
+  string file_id = 1;
+}
+
+message GetFileMetaResponse {
+  GetFileMeta meta = 1;
+  bool found = 2;
+}
+
+// ─── Admin Service Messages ───────────────────────────────────────────────────
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  uint64 file_count = 1;
+  uint64 block_count = 2;
+  uint64 total_bytes = 3;
+  double dedup_ratio = 4;
+  double compression_ratio = 5;
+  string version = 6;
+  string hash_algorithm = 7;
+  string compression_algorithm = 8;
+  uint32 compression_level = 9;
+}
+
+message TriggerGcRequest {}
+
+message TriggerGcResponse {
+  uint64 blocks_deleted = 1;
+  uint64 bytes_reclaimed = 2;
+  uint64 partitions_deleted = 3;
+  uint64 files_deleted = 4;
+  uint64 duration_ms = 5;
+}
+
+message ListBlocksRequest {
+  uint32 page_size = 1;
+  string page_token = 2;
+}
+
+message BlockInfo {
+  string block_id = 1;
+  uint64 size = 2;
+  uint64 ref_count = 3;
+  uint64 create_time = 4;
+  string path = 5;
+}
+
+message ListBlocksResponse {
+  repeated BlockInfo blocks = 1;
+  string next_page_token = 2;
+}

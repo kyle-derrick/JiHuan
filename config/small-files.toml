@@ -1,0 +1,24 @@
+# JiHuan - Small Files Configuration
+# 90%+ files under 10 KB (images, thumbnails, documents, icons).
+# Smaller chunk & block sizes reduce waste from partially-filled blocks.
+
+[storage]
+data_dir = "./jihuan-data/data"
+meta_dir = "./jihuan-data/meta"
+wal_dir  = "./jihuan-data/wal"
+block_file_size    = 536870912   # 512 MB
+chunk_size         = 2097152     # 2 MB
+hash_algorithm     = "sha256"
+compression_algorithm = "zstd"
+compression_level  = 3
+time_partition_hours = 24
+gc_threshold       = 0.7
+gc_interval_secs   = 300
+max_open_block_files = 64
+verify_on_read     = true
+
+[server]
+http_addr    = "0.0.0.0:8080"
+grpc_addr    = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = true

@@ -1,0 +1,23 @@
+# JiHuan default general-purpose configuration
+# Balanced safety, speed, and space - suitable for most workloads
+
+[storage]
+data_dir = "./data"
+meta_dir = "./meta"
+wal_dir = "./wal"
+block_file_size = 1073741824  # 1GB
+chunk_size = 4194304           # 4MB
+hash_algorithm = "sha256"
+compression_algorithm = "zstd"
+compression_level = 1
+time_partition_hours = 24
+gc_threshold = 0.7
+gc_interval_secs = 300
+max_open_block_files = 64
+verify_on_read = true
+
+[server]
+http_addr = "0.0.0.0:8080"
+grpc_addr = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = true

@@ -1,0 +1,24 @@
+# JiHuan - Extreme Speed Configuration
+# Hot data, low-latency scenarios. Does not prioritise space savings.
+# NOTE: MD5 is only appropriate for internal/private systems.
+
+[storage]
+data_dir = "./jihuan-data/data"
+meta_dir = "./jihuan-data/meta"
+wal_dir  = "./jihuan-data/wal"
+block_file_size    = 536870912   # 512 MB
+chunk_size         = 8388608     # 8 MB
+hash_algorithm     = "md5"
+compression_algorithm = "none"
+compression_level  = 0
+time_partition_hours = 12
+gc_threshold       = 0.8
+gc_interval_secs   = 120
+max_open_block_files = 128
+verify_on_read     = false
+
+[server]
+http_addr    = "0.0.0.0:8080"
+grpc_addr    = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = false
