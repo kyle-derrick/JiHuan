@@ -200,6 +200,37 @@ pub async fn compact(
     }))
 }
 
+/// POST `/api/admin/seal` — v0.4.4: force-seal the currently active block.
+///
+/// Normally a block is sealed automatically when its on-disk size reaches
+/// `storage.block_file_size` (default 1 GiB). Operators who want to
+/// *immediately* benefit from compaction / GC on a low-utilisation block
+/// need a manual trigger — otherwise the block sits as `active` and
+/// `compact_block` correctly refuses it.
+///
+/// Returns the sealed block's id + final size (`size: 0` when the active
+/// writer was already empty and no block was sealed).
+#[derive(Debug, Serialize)]
+pub struct SealResponse {
+    pub sealed_block_id: Option<String>,
+    pub size: u64,
+}
+
+pub async fn seal(
+    State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
+) -> Result<Json<SealResponse>, AppError> {
+    require_scope(&caller, "admin")?;
+    let result = tokio::task::spawn_blocking(move || engine.seal_active_block())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(SealResponse {
+        sealed_block_id: result.as_ref().map(|r| r.block_id.clone()),
+        size: result.map(|r| r.size).unwrap_or(0),
+    }))
+}
+
 /// GET /api/block/list
 pub async fn list_blocks(
     State(engine): State<Arc<Engine>>,

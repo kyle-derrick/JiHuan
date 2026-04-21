@@ -69,6 +69,18 @@ fn default_gc_interval_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_auto_compact_threshold() -> f64 {
+    0.5
+}
+
+fn default_auto_compact_min_size_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+fn default_auto_compact_every_gc_ticks() -> u32 {
+    12 // with 5-min GC tick → once per hour
+}
+
 fn default_max_open_block_files() -> usize {
     64
 }
@@ -156,6 +168,29 @@ pub struct StorageConfig {
     /// and all succeed, so leave headroom below the real filesystem limit.
     #[serde(default)]
     pub max_storage_bytes: Option<u64>,
+
+    /// v0.4.4 auto-compaction: when enabled, every `auto_compact_every_gc_ticks`
+    /// GC passes runs `compact_low_utilization(auto_compact_threshold,
+    /// auto_compact_min_size_bytes)` to reclaim fragmented space inside
+    /// partially-deleted blocks. Disabled by default because compaction
+    /// re-compresses live chunks and generates write amplification — operators
+    /// opt in when they care more about disk efficiency than peak CPU.
+    #[serde(default)]
+    pub auto_compact_enabled: bool,
+    /// Compact any sealed block whose `live_bytes / size` is below this
+    /// ratio. `0.5` means "compact any block more than half-empty".
+    #[serde(default = "default_auto_compact_threshold")]
+    pub auto_compact_threshold: f64,
+    /// Skip blocks smaller than this when auto-compacting. Prevents the
+    /// scheduler from churning on tiny blocks where the re-encode cost
+    /// dominates the space saved.
+    #[serde(default = "default_auto_compact_min_size_bytes")]
+    pub auto_compact_min_size_bytes: u64,
+    /// Run auto-compaction every N GC ticks. `1` = every tick (aggressive);
+    /// larger values amortise the I/O cost. Ignored when `auto_compact_enabled`
+    /// is false.
+    #[serde(default = "default_auto_compact_every_gc_ticks")]
+    pub auto_compact_every_gc_ticks: u32,
 }
 
 /// Server configuration
@@ -395,6 +430,10 @@ impl ConfigTemplate {
                 max_open_block_files: 64,
                 verify_on_read: true,
                 max_storage_bytes: None,
+                auto_compact_enabled: false,
+                auto_compact_threshold: default_auto_compact_threshold(),
+                auto_compact_min_size_bytes: default_auto_compact_min_size_bytes(),
+                auto_compact_every_gc_ticks: default_auto_compact_every_gc_ticks(),
             },
             server: ServerConfig {
                 http_addr: default_http_addr(),

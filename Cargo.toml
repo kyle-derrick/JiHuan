@@ -4,6 +4,7 @@ members = [
     "crates/jihuan-core",
     "crates/jihuan-server",
     "crates/jihuan-cli",
+    "crates/jihuan-client",
     "crates/jihuan-bench",
     "tests",
 ]

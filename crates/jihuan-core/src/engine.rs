@@ -82,6 +82,13 @@ struct OverlayEntry {
     compressed_size: u64,
 }
 
+/// Info about a block that was just sealed by [`Engine::seal_active_block`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SealedBlockInfo {
+    pub block_id: String,
+    pub size: u64,
+}
+
 /// Per-block statistics returned by [`Engine::compact_block`].
 ///
 /// Serialisable so that the HTTP admin endpoint can round-trip the value
@@ -327,6 +334,61 @@ impl Engine {
     /// Trigger GC manually (synchronous, blocking)
     pub async fn trigger_gc(&self) -> Result<crate::gc::GcStats> {
         self.gc.run_once().await
+    }
+
+    /// v0.4.4: start the background auto-compaction loop, if enabled in
+    /// config. Returns `None` when `storage.auto_compact_enabled = false`.
+    ///
+    /// The cadence is `gc_interval_secs * auto_compact_every_gc_ticks`, so
+    /// the default shipped config (300 s × 12) fires once an hour. Each
+    /// tick calls `compact_low_utilization` with the configured threshold
+    /// + minimum size. Errors are logged but never break the loop.
+    pub fn start_auto_compaction(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let s = &self.config.storage;
+        if !s.auto_compact_enabled {
+            return None;
+        }
+        let period_secs = s
+            .gc_interval_secs
+            .saturating_mul(s.auto_compact_every_gc_ticks.max(1) as u64);
+        let threshold = s.auto_compact_threshold;
+        let min_size = s.auto_compact_min_size_bytes;
+        let engine = self.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period_secs));
+            // First tick fires immediately in tokio; we want to delay past
+            // first GC so startup doesn't pay the compaction cost before
+            // the server is even handling requests.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let e = engine.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    e.compact_low_utilization(threshold, min_size)
+                })
+                .await;
+                match res {
+                    Ok(Ok(stats)) => {
+                        if !stats.is_empty() {
+                            let total_saved: i64 = stats.iter().map(|s| s.bytes_saved).sum();
+                            tracing::info!(
+                                blocks_compacted = stats.len(),
+                                total_bytes_saved = total_saved,
+                                "auto-compaction tick completed"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "auto-compaction tick failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-compaction tick panicked");
+                    }
+                }
+            }
+        }))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -686,11 +748,21 @@ impl Engine {
 
     /// Seal (finish) the active block writer, making it accessible to `BlockReader`.
     /// After sealing, the block is added to the reader cache.
-    pub fn seal_active_block(&self) -> Result<()> {
+    ///
+    /// Returns `Ok(Some(SealedBlockInfo))` when a block was actually sealed,
+    /// or `Ok(None)` when the active writer was empty (nothing to seal).
+    /// The info lets the admin `/api/admin/seal` endpoint surface which
+    /// block was just sealed so operators can immediately target it for
+    /// compaction.
+    pub fn seal_active_block(&self) -> Result<Option<SealedBlockInfo>> {
         let mut guard = self.active_writer.lock();
         if let Some(ab) = guard.take() {
             let sealed_id = ab.writer.block_id().to_string();
             let summary = ab.writer.finish()?;
+            let info = SealedBlockInfo {
+                block_id: sealed_id.clone(),
+                size: summary.total_size,
+            };
             self.register_block(&summary)?;
             // Add the freshly-sealed block to the reader cache
             if let Ok(reader) = BlockReader::open(&summary.path) {
@@ -700,8 +772,9 @@ impl Engine {
             // Unpin the block now that it's sealed; ref_count is already >0
             // on any block that had at least one chunk written.
             self.pinned_blocks.lock().remove(&sealed_id);
+            return Ok(Some(info));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Graceful shutdown: seal the active block and fsync the WAL.
@@ -1595,6 +1668,59 @@ mod tests {
         assert_eq!(first.file_count, second.file_count);
         assert_eq!(first.disk_usage_bytes, second.disk_usage_bytes);
         assert_eq!(first.logical_bytes, second.logical_bytes);
+    }
+
+    // ── v0.4.4: Auto-compaction regressions ──────────────────────────────
+
+    #[test]
+    fn test_start_auto_compaction_returns_none_when_disabled() {
+        // Default config → auto_compact_enabled = false. Must not spawn a
+        // task; returning None keeps startup free of unnecessary background
+        // work for the common case.
+        let tmp = tempdir().unwrap();
+        let engine = Arc::new(open_engine(&tmp));
+        assert!(engine.start_auto_compaction().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_start_auto_compaction_runs_when_enabled() {
+        // Enable auto-compaction at a 1 s cadence (gc_interval_secs=1 ×
+        // every_gc_ticks=1). Upload two files sharing one block, delete
+        // one to create a compaction candidate, then wait for one tick
+        // past the first (which is consumed on startup). Verify the
+        // low-util block got rewritten.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        cfg.storage.gc_interval_secs = 1;
+        cfg.storage.auto_compact_enabled = true;
+        cfg.storage.auto_compact_threshold = 0.75;
+        cfg.storage.auto_compact_min_size_bytes = 0;
+        cfg.storage.auto_compact_every_gc_ticks = 1;
+        let engine = Arc::new(Engine::open(cfg).unwrap());
+
+        let p_a: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+        let p_b: Vec<u8> = (0..150_000u32).map(|i| ((i * 11) % 251) as u8).collect();
+        let id_a = engine.put_bytes(&p_a, "a.bin", None).unwrap();
+        let id_b = engine.put_bytes(&p_b, "b.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+        let old_block = engine.meta.get_file(&id_a).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+        engine.delete_file(&id_b).unwrap();
+
+        let _handle = engine.start_auto_compaction().expect("handle");
+        // Wait past two ticks: first (init) + one real tick.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+        // Old block metadata should be gone; new (compacted) block exists.
+        assert!(
+            engine.meta.get_block(&old_block).unwrap().is_none(),
+            "auto-compaction should have rewritten the low-util block"
+        );
+        // And file A still round-trips.
+        assert_eq!(engine.get_bytes(&id_a).unwrap(), p_a);
     }
 
     // ── v0.4.3: Block compaction regressions ─────────────────────────────

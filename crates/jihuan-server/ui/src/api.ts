@@ -285,6 +285,48 @@ export interface GcResponse {
 export const triggerGc = () =>
   apiJSON<GcResponse>('/api/gc/trigger', { method: 'POST' })
 
+// ── Compaction (v0.4.4) ─────────────────────────────────────────────────────
+
+export interface CompactionBlockStats {
+  old_block_id: string
+  new_block_id: string | null
+  old_size_bytes: number
+  new_size_bytes: number
+  bytes_saved: number
+  live_chunks: number
+  dropped_chunks: number
+}
+
+export interface CompactResponse {
+  compacted: CompactionBlockStats[]
+  total_bytes_saved: number
+}
+
+export interface CompactRequest {
+  block_id?: string
+  threshold?: number
+  min_size_bytes?: number
+}
+
+/** POST /api/admin/compact — explicit block_id takes priority over scan. */
+export const compactBlocks = (req: CompactRequest = {}) =>
+  apiJSON<CompactResponse>('/api/admin/compact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+
+export interface SealResponse {
+  sealed_block_id: string | null
+  size: number
+}
+
+/** POST /api/admin/seal — force-seal the current active block so it becomes
+ * eligible for compaction / GC. Returns null sealed_block_id when the active
+ * writer was already empty (nothing to seal). */
+export const sealActiveBlock = () =>
+  apiJSON<SealResponse>('/api/admin/seal', { method: 'POST' })
+
 // ── API Keys ────────────────────────────────────────────────────────────────
 
 export interface KeyInfo {

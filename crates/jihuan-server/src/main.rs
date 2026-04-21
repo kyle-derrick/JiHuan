@@ -152,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start background GC
     let _gc_handle = engine.start_gc();
+    // v0.4.4: start background auto-compaction loop if enabled in config.
+    // When disabled, this is a no-op (returns None) and the handle is dropped.
+    let _compaction_handle = engine.start_auto_compaction();
 
     // Bootstrap admin key. Policy: when auth is enabled, ensure at least one
     // enabled admin-scoped key exists. If not, mint one and print it to stderr

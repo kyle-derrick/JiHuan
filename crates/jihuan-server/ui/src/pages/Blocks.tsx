@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
-import { RefreshCw, Trash2, Eye, X, Trash } from 'lucide-react'
+import { RefreshCw, Trash2, Eye, X, Trash, Shrink, Lock as LockIcon } from 'lucide-react'
 import {
-  listBlocks, getBlockDetail, deleteBlock, triggerGc,
+  listBlocks, getBlockDetail, deleteBlock, triggerGc, compactBlocks, sealActiveBlock,
   type BlockInfo, type BlockDetail,
 } from '@/api'
 import { formatBytes, formatUnixTime } from '@/lib/utils'
@@ -15,6 +15,8 @@ export default function Blocks() {
   const [detail, setDetail] = useState<BlockDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [gcing, setGcing] = useState(false)
+  const [compacting, setCompacting] = useState(false)
+  const [sealing, setSealing] = useState(false)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const load = async () => {
@@ -80,6 +82,56 @@ export default function Blocks() {
     }
   }
 
+  /** v0.4.4: force-seal the active block so it becomes compaction-eligible. */
+  const handleSeal = async () => {
+    setSealing(true)
+    setError('')
+    try {
+      const r = await sealActiveBlock()
+      if (r.sealed_block_id) {
+        setInfo(
+          `已封存 Block ${r.sealed_block_id.slice(0, 12)}…（${formatBytes(r.size)}），现在可以压实了`,
+        )
+      } else {
+        setInfo('当前无活跃 Block，无需封存')
+      }
+      await load()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSealing(false)
+    }
+  }
+
+  /** v0.4.4: trigger compaction. Without block_id → scan low-utilisation. */
+  const handleCompact = async (blockId?: string) => {
+    const label = blockId ? `Block ${blockId.slice(0, 8)}…` : '低利用率 Block'
+    setCompacting(true)
+    setError('')
+    try {
+      const r = await compactBlocks(
+        blockId
+          ? { block_id: blockId }
+          : { threshold: 0.5, min_size_bytes: 4 * 1024 * 1024 },
+      )
+      if (r.compacted.length === 0) {
+        setInfo(`压实完成：${label} 无需重写`)
+      } else {
+        const savedStr = formatBytes(Math.abs(r.total_bytes_saved))
+        const sign = r.total_bytes_saved >= 0 ? '节省' : '增长'
+        setInfo(
+          `压实完成：${r.compacted.length} 个 Block，共 ${sign} ${savedStr}`,
+        )
+      }
+      setDetail(null)
+      await load()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setCompacting(false)
+    }
+  }
+
   const totalSize = blocks.reduce((acc, b) => acc + b.size, 0)
   const activeCount = blocks.filter(b => !b.sealed).length
   const orphanCount = blocks.filter(b => b.ref_count === 0).length
@@ -89,6 +141,28 @@ export default function Blocks() {
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">Block 管理</h1>
         <div className="flex gap-2">
+          <button
+            onClick={handleSeal}
+            disabled={sealing || activeCount === 0}
+            title={
+              activeCount === 0
+                ? '当前无活跃 Block'
+                : '封存活跃 Block（使其可被压实 / GC 回收）'
+            }
+            className="flex items-center gap-1.5 px-3 py-2 text-sm text-sky-700 bg-sky-50 border border-sky-200 rounded-lg hover:bg-sky-100 disabled:opacity-50"
+          >
+            <LockIcon size={14} className={sealing ? 'animate-spin' : ''} />
+            {sealing ? '封存中…' : '封存活跃 Block'}
+          </button>
+          <button
+            onClick={() => handleCompact()}
+            disabled={compacting}
+            title="扫描并压实利用率低于 50% 且大小 ≥ 4 MiB 的 Block"
+            className="flex items-center gap-1.5 px-3 py-2 text-sm text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 disabled:opacity-50"
+          >
+            <Shrink size={14} className={compacting ? 'animate-spin' : ''} />
+            {compacting ? '压实中…' : '压实低利用率'}
+          </button>
           <button
             onClick={handleGc}
             disabled={gcing}
@@ -174,6 +248,20 @@ export default function Blocks() {
                       title="详情"
                     >
                       <Eye size={14} />
+                    </button>
+                    <button
+                      onClick={() => handleCompact(b.block_id)}
+                      disabled={!b.sealed || b.ref_count === 0 || compacting}
+                      className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-gray-400"
+                      title={
+                        !b.sealed
+                          ? '活跃 Block 不可压实'
+                          : b.ref_count === 0
+                            ? '无活引用 — 直接走 GC 即可'
+                            : '压实此 Block（丢弃已删除内容）'
+                      }
+                    >
+                      <Shrink size={14} />
                     </button>
                     <button
                       onClick={() => handleDelete(b.block_id)}

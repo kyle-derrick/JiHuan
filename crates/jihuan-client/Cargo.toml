@@ -1,0 +1,27 @@
+[package]
+name = "jihuan-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+jihuan-core = { path = "../jihuan-core" }
+
+# runtime + traits
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# (de)serialisation of shared DTOs
+serde = { workspace = true }
+bytes = { workspace = true }
+
+# error + logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

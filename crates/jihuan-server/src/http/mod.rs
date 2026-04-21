@@ -65,6 +65,7 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         .route("/api/status", get(admin::get_status))
         .route("/api/gc/trigger", post(admin::trigger_gc))
         .route("/api/admin/compact", post(admin::compact))
+        .route("/api/admin/seal", post(admin::seal))
         .route("/api/block/list", get(admin::list_blocks))
         .route(
             "/api/block/:block_id",

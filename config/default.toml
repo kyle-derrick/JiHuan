@@ -19,6 +19,14 @@ verify_on_read     = true
 # Uploads that would exceed this are rejected with HTTP 507.
 # max_storage_bytes  = 10737418240  # e.g. 10 GB
 
+# v0.4.4 auto-compaction: rewrite partially-deleted blocks in the background
+# so their freed space becomes usable again. Opt-in because compaction
+# re-compresses live chunks (extra CPU + write amplification).
+auto_compact_enabled       = true        # flip on by default for general use
+auto_compact_threshold     = 0.5         # rewrite blocks <50% utilised
+auto_compact_min_size_bytes = 4194304    # 4 MiB — skip tiny blocks
+auto_compact_every_gc_ticks = 12         # 12 × 300 s = once per hour
+
 [server]
 http_addr    = "0.0.0.0:8080"
 grpc_addr    = "0.0.0.0:8081"

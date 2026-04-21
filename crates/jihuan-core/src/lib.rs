@@ -16,5 +16,5 @@ pub mod metrics;
 pub mod utils;
 pub mod wal;
 
-pub use engine::{CompactionBlockStats, Engine};
+pub use engine::{CompactionBlockStats, Engine, SealedBlockInfo};
 pub use error::{JiHuanError, Result};

@@ -16,6 +16,12 @@ gc_threshold       = 0.7
 gc_interval_secs   = 300
 max_open_block_files = 64
 verify_on_read     = true
+# v0.4.4: small-file workloads fragment quickly under deletions.
+# Compact aggressively to reclaim the freed slots.
+auto_compact_enabled        = true
+auto_compact_threshold      = 0.5
+auto_compact_min_size_bytes = 2097152    # 2 MiB
+auto_compact_every_gc_ticks = 12         # 12 × 300 s = once per hour
 
 [server]
 http_addr    = "0.0.0.0:8080"

@@ -1328,6 +1328,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jihuan-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "jihuan-core",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "jihuan-core"
 version = "0.1.0"
 dependencies = [

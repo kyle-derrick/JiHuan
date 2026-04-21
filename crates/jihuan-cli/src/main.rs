@@ -67,6 +67,21 @@ enum Commands {
     Status,
     /// Trigger server-side garbage collection
     Gc,
+    /// v0.4.4: force-seal the currently active (unsealed) block.
+    /// Needed before you can compact a block — an active block is always rejected.
+    Seal,
+    /// v0.4.4: trigger block compaction (rewrite low-utilisation blocks)
+    Compact {
+        /// Compact this specific block_id. Mutually exclusive with threshold.
+        #[arg(long)]
+        block_id: Option<String>,
+        /// Utilisation threshold (0.0–1.0). Blocks below this are compacted.
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f64,
+        /// Skip blocks smaller than this many bytes.
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        min_size_bytes: u64,
+    },
     /// List all block files on the server
     ListBlocks,
     /// Validate a local config file (no server needed)
@@ -112,6 +127,23 @@ struct GcResponse {
     partitions_deleted: u64,
     files_deleted: u64,
     duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactionBlockStats {
+    old_block_id: String,
+    new_block_id: Option<String>,
+    old_size_bytes: u64,
+    new_size_bytes: u64,
+    bytes_saved: i64,
+    live_chunks: u64,
+    dropped_chunks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactResponse {
+    compacted: Vec<CompactionBlockStats>,
+    total_bytes_saved: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +328,78 @@ async fn main() -> Result<()> {
             println!("  Partitions deleted: {}", g.partitions_deleted);
             println!("  Files deleted:      {}", g.files_deleted);
             println!("  Duration:           {}ms", g.duration_ms);
+        }
+
+        // ── seal (v0.4.4) ────────────────────────────────────────────────────
+        Commands::Seal => {
+            let resp = authed!(client.post(format!("{}/api/admin/seal", base)))
+                .send()
+                .await
+                .context("Failed to connect to server")?;
+            let resp = check_response(resp, "seal").await?;
+            #[derive(Debug, Deserialize)]
+            struct SealResp {
+                sealed_block_id: Option<String>,
+                size: u64,
+            }
+            let r: SealResp = resp.json().await?;
+            match r.sealed_block_id {
+                Some(id) => println!("Sealed block {} (final size {} bytes).", id, r.size),
+                None => println!("No active block to seal — active writer was empty."),
+            }
+        }
+
+        // ── compact (v0.4.4) ─────────────────────────────────────────────────
+        Commands::Compact {
+            block_id,
+            threshold,
+            min_size_bytes,
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(id) = block_id {
+                body.insert("block_id".into(), serde_json::Value::String(id.clone()));
+            } else {
+                body.insert(
+                    "threshold".into(),
+                    serde_json::json!(threshold),
+                );
+                body.insert(
+                    "min_size_bytes".into(),
+                    serde_json::json!(min_size_bytes),
+                );
+            }
+            let resp = authed!(client
+                .post(format!("{}/api/admin/compact", base))
+                .json(&serde_json::Value::Object(body)))
+            .send()
+            .await
+            .context("Failed to connect to server")?;
+
+            let resp = check_response(resp, "compact").await?;
+            let r: CompactResponse = resp.json().await?;
+            if r.compacted.is_empty() {
+                println!("No blocks matched the compaction criteria.");
+            } else {
+                println!("Compacted {} block(s):", r.compacted.len());
+                println!(
+                    "{:<40} {:<40} {:>14} {:>14} {:>14} {:>8} {:>8}",
+                    "OLD BLOCK", "NEW BLOCK", "OLD SIZE", "NEW SIZE", "SAVED", "LIVE", "DROP"
+                );
+                println!("{}", "-".repeat(140));
+                for s in &r.compacted {
+                    println!(
+                        "{:<40} {:<40} {:>14} {:>14} {:>14} {:>8} {:>8}",
+                        s.old_block_id,
+                        s.new_block_id.clone().unwrap_or_else(|| "(empty)".into()),
+                        s.old_size_bytes,
+                        s.new_size_bytes,
+                        s.bytes_saved,
+                        s.live_chunks,
+                        s.dropped_chunks,
+                    );
+                }
+                println!("\nTotal bytes saved: {}", r.total_bytes_saved);
+            }
         }
 
         // ── list-blocks ───────────────────────────────────────────────────────

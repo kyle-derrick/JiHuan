@@ -16,6 +16,8 @@ gc_threshold       = 0.8
 gc_interval_secs   = 120
 max_open_block_files = 128
 verify_on_read     = false
+# v0.4.4: disabled for speed profile — compaction adds CPU / write amp.
+auto_compact_enabled = false
 
 [server]
 http_addr    = "0.0.0.0:8080"
