@@ -196,13 +196,48 @@ impl GcService {
     }
 }
 
-/// Delete incomplete (no valid footer) block files in the data directory.
-/// Called during startup crash recovery.
-pub fn cleanup_incomplete_blocks(data_dir: &PathBuf) -> Result<u32> {
+/// Summary of the startup block cleanup. The caller logs this so operators
+/// see exactly what happened on a recovery restart.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CleanupReport {
+    /// Incomplete block files with **no** metadata row — safe to delete
+    /// (they were never committed; the crash happened before any chunk
+    /// metadata was persisted).
+    pub deleted_orphans: u32,
+    /// Incomplete block files that **are still referenced** by the metadata
+    /// store. We NEVER delete these — they hold the only copy of the
+    /// chunks for already-committed file metadata. Instead we rename them
+    /// to `<block>.blk.orphan` so an operator can later run the recovery
+    /// tool (or simply restore them manually once they've sealed).
+    pub quarantined_referenced: u32,
+}
+
+/// Startup cleanup for block files that lack a valid footer.
+///
+/// Prior to the Phase-2.7 fix this function blindly deleted any incomplete
+/// `.blk` — which destroyed data whenever the server was killed without
+/// running `Engine::seal_active_block()` because the unsealed active
+/// block's metadata rows were already committed in redb. The new behaviour:
+///
+/// * `.blk` has valid footer               → leave alone.
+/// * `.blk` has no footer AND metadata row → **rename to `.blk.orphan`**.
+///   Preserves data; caller can reseal or strip dangling metadata via
+///   [`Engine::repair`](crate::Engine::repair).
+/// * `.blk` has no footer AND no metadata row → **delete**. True crash
+///   before any chunk commit; the file cannot possibly be referenced.
+///
+/// Returns a [`CleanupReport`] so the caller can log exactly what moved
+/// where. Never returns an error on individual filesystem failures —
+/// those are logged at `error!` and skipped so one bad file doesn't
+/// prevent the server from starting.
+pub fn cleanup_incomplete_blocks(
+    data_dir: &PathBuf,
+    meta: &crate::metadata::store::MetadataStore,
+) -> Result<CleanupReport> {
     use crate::block::reader::BlockReader;
-    let mut removed = 0u32;
+    let mut report = CleanupReport::default();
     if !data_dir.exists() {
-        return Ok(0);
+        return Ok(report);
     }
     for entry in walkdir::WalkDir::new(data_dir)
         .into_iter()
@@ -212,49 +247,73 @@ pub fn cleanup_incomplete_blocks(data_dir: &PathBuf) -> Result<u32> {
         })
     {
         let path = entry.path();
-        if !BlockReader::is_complete(path) {
-            tracing::warn!(
-                path = %path.display(),
-                "Crash recovery: removing incomplete block file"
-            );
+        if BlockReader::is_complete(path) {
+            continue;
+        }
+
+        // Block id is the file stem (see `Engine::block_path`).
+        let block_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::error!(path=%path.display(), "Startup: cannot derive block_id from file name, skipping");
+                continue;
+            }
+        };
+
+        // Does metadata still reference this block? We can't know ref_count
+        // precisely because GC might be pending, but presence of a BlockMeta
+        // row means dedup entries / ChunkMeta *might* be pointing here —
+        // that's enough to refuse deletion.
+        let meta_row = match meta.get_block(&block_id) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(block_id=%block_id, error=%e, "Startup: metadata lookup failed; skipping to be safe");
+                continue;
+            }
+        };
+
+        if meta_row.is_some() {
+            // QUARANTINE: rename to .blk.orphan so data is preserved.
+            let orphan_path = path.with_extension("blk.orphan");
+            match std::fs::rename(path, &orphan_path) {
+                Ok(()) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        orphan = %orphan_path.display(),
+                        block_id = %block_id,
+                        "Startup: unsealed block referenced by metadata — QUARANTINED to .blk.orphan. \
+                         Files whose chunks live in this block will return 500 until you either (a) \
+                         reseal the .blk.orphan and rename it back to .blk, or (b) set JIHUAN_REPAIR=1 \
+                         to purge the dangling metadata."
+                    );
+                    report.quarantined_referenced += 1;
+                }
+                Err(e) => {
+                    tracing::error!(path=%path.display(), error=%e, "Startup: failed to rename incomplete block");
+                }
+            }
+        } else {
+            // True orphan — no metadata row, safe to delete.
+            tracing::warn!(path=%path.display(), block_id=%block_id, "Startup: deleting orphan incomplete block (no metadata reference)");
             if let Err(e) = std::fs::remove_file(path) {
-                tracing::error!(path=%path.display(), error=%e, "Failed to remove incomplete block");
+                tracing::error!(path=%path.display(), error=%e, "Startup: failed to remove orphan block");
             } else {
-                removed += 1;
+                report.deleted_orphans += 1;
             }
         }
     }
-    Ok(removed)
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::types::{BlockMeta, ChunkMeta, FileMeta};
+    use crate::metadata::types::BlockMeta;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     fn make_store(tmp: &tempfile::TempDir) -> Arc<MetadataStore> {
         Arc::new(MetadataStore::open(tmp.path().join("meta.db")).unwrap())
-    }
-
-    fn make_file(id: &str, partition_id: u64, block_id: &str) -> FileMeta {
-        FileMeta {
-            file_id: id.to_string(),
-            file_name: format!("{}.txt", id),
-            file_size: 1024,
-            create_time: partition_id * 86400,
-            partition_id,
-            chunks: vec![ChunkMeta {
-                block_id: block_id.to_string(),
-                offset: 0,
-                original_size: 1024,
-                compressed_size: 512,
-                hash: "abc".to_string(),
-                index: 0,
-            }],
-            content_type: None,
-        }
     }
 
     #[tokio::test]
@@ -317,17 +376,61 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_incomplete_blocks() {
+    fn test_cleanup_deletes_orphan_incomplete_blocks() {
+        // No metadata row → true orphan, should be deleted.
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
+        let store_path = tmp.path().join("m.db");
+        let store = MetadataStore::open(&store_path).unwrap();
 
-        // Create a fake incomplete block (just magic, no footer)
         let incomplete = data_dir.join("inc.blk");
         std::fs::write(&incomplete, &crate::block::format::BLOCK_MAGIC).unwrap();
 
-        // Create a valid complete block
+        let report = cleanup_incomplete_blocks(&data_dir, &store).unwrap();
+        assert_eq!(report.deleted_orphans, 1);
+        assert_eq!(report.quarantined_referenced, 0);
+        assert!(!incomplete.exists());
+    }
+
+    #[test]
+    fn test_cleanup_quarantines_referenced_incomplete_blocks() {
+        // Metadata row exists → block was the active writer when we crashed.
+        // Must NOT be deleted; must be renamed to .blk.orphan.
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let store_path = tmp.path().join("m.db");
+        let store = MetadataStore::open(&store_path).unwrap();
+
+        let block_id = "active-block-00000000000000000000000";
+        let block_path = data_dir.join(format!("{}.blk", block_id));
+        std::fs::write(&block_path, &crate::block::format::BLOCK_MAGIC).unwrap();
+
+        store
+            .insert_block(&BlockMeta::new(
+                block_id,
+                block_path.to_str().unwrap(),
+                0,
+                0,
+            ))
+            .unwrap();
+
+        let report = cleanup_incomplete_blocks(&data_dir, &store).unwrap();
+        assert_eq!(report.deleted_orphans, 0);
+        assert_eq!(report.quarantined_referenced, 1);
+        assert!(!block_path.exists(), "original .blk must be renamed, not deleted");
+        let orphan = data_dir.join(format!("{}.blk.orphan", block_id));
+        assert!(orphan.exists(), "expected .blk.orphan to be created");
+    }
+
+    #[test]
+    fn test_cleanup_leaves_complete_blocks_alone() {
         use crate::block::writer::BlockWriter;
         use crate::config::{CompressionAlgorithm, HashAlgorithm};
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let store_path = tmp.path().join("m.db");
+        let store = MetadataStore::open(&store_path).unwrap();
+
         let complete = data_dir.join("complete.blk");
         let mut w = BlockWriter::create(
             &complete,
@@ -341,9 +444,9 @@ mod tests {
         w.write_chunk(b"data", "").unwrap();
         w.finish().unwrap();
 
-        let removed = cleanup_incomplete_blocks(&data_dir).unwrap();
-        assert_eq!(removed, 1);
-        assert!(!incomplete.exists());
+        let report = cleanup_incomplete_blocks(&data_dir, &store).unwrap();
+        assert_eq!(report.deleted_orphans, 0);
+        assert_eq!(report.quarantined_referenced, 0);
         assert!(complete.exists());
     }
 }

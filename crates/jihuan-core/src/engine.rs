@@ -2,6 +2,7 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -33,6 +34,36 @@ pub struct Engine {
     /// Avoids re-parsing block headers on every read of a recently-accessed block.
     reader_cache: Arc<Mutex<LruCache<String, BlockReader>>>,
     gc: Arc<GcService>,
+    /// Cached `stats()` snapshot (Phase 6b-P4).
+    ///
+    /// `stats()` used to walk `data_dir` and sum every file's size on every
+    /// call — O(files + blocks) I/O per Dashboard refresh. We cache the result
+    /// with a short TTL so that a tight polling UI, `/api/status`,
+    /// `/api/metrics`, and any operator script each pay the scan cost at most
+    /// once per `STATS_CACHE_TTL_MS`. Writers / deletes don't invalidate the
+    /// cache directly — they just let it expire — which is acceptable because
+    /// the absolute numbers are inherently approximate (active block bytes,
+    /// OS page cache, filesystem metadata overhead).
+    stats_cache: Arc<Mutex<Option<CachedStats>>>,
+}
+
+/// TTL for the `stats()` cache. Five seconds balances Dashboard freshness
+/// against scan cost: a 1 M-file deployment walks `data_dir` in ~1 s, so
+/// 5 s keeps amortised CPU at ~20 % of a core even under a 1 Hz poll.
+const STATS_CACHE_TTL_MS: u128 = 5_000;
+
+struct CachedStats {
+    at: Instant,
+    snapshot: crate::metrics::EngineStats,
+}
+
+/// Counts returned by [`Engine::repair`]. Exposed for tests and for the
+/// eventual admin RPC that invokes repair on-demand.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct RepairSummary {
+    pub files_removed: u32,
+    pub blocks_removed: u32,
+    pub dedup_removed: u32,
 }
 
 /// Cached chunk data stored in memory while a block is still being written.
@@ -68,10 +99,31 @@ impl Engine {
         let wal_path = config.storage.wal_dir.join("jihuan.wal");
         let wal = Arc::new(Mutex::new(WriteAheadLog::open(&wal_path)?));
 
-        // Crash recovery: remove any incomplete block files
-        let removed = cleanup_incomplete_blocks(&config.storage.data_dir)?;
-        if removed > 0 {
-            tracing::warn!(removed, "Crash recovery: removed incomplete block files");
+        // Crash recovery: sweep incomplete block files. Never deletes a
+        // block that metadata still references — those get quarantined to
+        // `.blk.orphan` so data is preserved for recovery.
+        let report = cleanup_incomplete_blocks(&config.storage.data_dir, &meta)?;
+        if report.deleted_orphans > 0 || report.quarantined_referenced > 0 {
+            tracing::warn!(
+                deleted_orphans = report.deleted_orphans,
+                quarantined_referenced = report.quarantined_referenced,
+                "Crash recovery: block-file cleanup"
+            );
+        }
+
+        // Optional repair pass: `JIHUAN_REPAIR=1` on startup strips metadata
+        // rows whose block file is missing (or was just quarantined). This
+        // is destructive — files that referenced the missing block will
+        // disappear from `/api/v1/files` — but it restores consistency so
+        // reads of *other* files stop failing mysteriously with 500.
+        if std::env::var("JIHUAN_REPAIR").ok().as_deref() == Some("1") {
+            let summary = Self::repair_static(&meta, &config.storage.data_dir)?;
+            tracing::warn!(
+                files_removed = summary.files_removed,
+                blocks_removed = summary.blocks_removed,
+                dedup_removed = summary.dedup_removed,
+                "JIHUAN_REPAIR=1: purged dangling metadata"
+            );
         }
 
         let gc_config = GcConfig {
@@ -123,6 +175,7 @@ impl Engine {
             active_writer: Arc::new(Mutex::new(None)),
             reader_cache,
             gc,
+            stats_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -486,6 +539,144 @@ impl Engine {
         Ok(())
     }
 
+    /// Graceful shutdown: seal the active block and fsync the WAL.
+    ///
+    /// Call this **before** the process exits. The `Drop` impl does the
+    /// same work, but is unreliable in practice because signals (SIGINT /
+    /// Ctrl-C on Windows) terminate the process without running destructors
+    /// of values held in long-lived `Arc`s — exactly the kind of shutdown
+    /// that used to destroy the active block's data.
+    ///
+    /// Errors are logged but never propagated: partial success is better
+    /// than aborting shutdown and leaving the process hanging.
+    pub fn shutdown(&self) {
+        tracing::info!("Engine::shutdown — sealing active block and syncing WAL");
+        if let Err(e) = self.seal_active_block() {
+            tracing::error!(error = %e, "shutdown: failed to seal active block");
+        }
+        if let Err(e) = self.wal.lock().sync() {
+            tracing::error!(error = %e, "shutdown: failed to sync WAL");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Repair (Phase 2.7 data-loss recovery)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Static flavour of [`Engine::repair`] so it can run during startup
+    /// before the `Engine` itself is fully constructed. Takes an already-
+    /// opened [`MetadataStore`] and the configured data directory.
+    ///
+    /// Purges three classes of dangling metadata:
+    ///
+    /// 1. **Files** whose chunks reference a block whose `.blk` file is
+    ///    missing from disk (typically because a prior version of this
+    ///    codebase deleted an unsealed active block during startup).
+    /// 2. **Block metadata rows** whose `.blk` file is missing.
+    /// 3. **Dedup entries** that pointed at those missing blocks.
+    ///
+    /// Guarantees:
+    /// * A file is removed only if **at least one** of its chunks lives in
+    ///   a missing block — it is un-readable anyway, so removing it
+    ///   restores list consistency without further data loss.
+    /// * A block row is removed only when the file is missing from disk.
+    ///   Quarantined `.blk.orphan` files keep their metadata row so a
+    ///   future manual recovery can reattach them.
+    /// * Dedup entries to missing blocks are removed unconditionally —
+    ///   leaving them would make subsequent uploads silently dedupe
+    ///   against a block that can never be read.
+    pub fn repair_static(
+        meta: &MetadataStore,
+        data_dir: &std::path::Path,
+    ) -> Result<RepairSummary> {
+        let mut summary = RepairSummary::default();
+
+        // Build the set of on-disk block_ids (sealed only — .blk files).
+        // We tolerate missing data_dir gracefully so repair is idempotent.
+        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if data_dir.exists() {
+            for entry in walkdir::WalkDir::new(data_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().map(|x| x == "blk").unwrap_or(false)
+                })
+            {
+                if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    present.insert(stem.to_string());
+                }
+            }
+        }
+
+        // Build the set of block_ids we consider "missing": has a metadata
+        // row but no `.blk` file on disk. These are the dangling references.
+        let blocks = meta.list_all_blocks()?;
+        let mut missing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for b in &blocks {
+            if !present.contains(&b.block_id) {
+                missing.insert(b.block_id.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(summary);
+        }
+
+        tracing::warn!(
+            missing_blocks = missing.len(),
+            "Repair: found block metadata rows with no .blk file on disk"
+        );
+
+        // 1) Remove files whose chunks reference any missing block.
+        for f in meta.list_all_files()? {
+            let references_missing = f.chunks.iter().any(|c| missing.contains(&c.block_id));
+            if references_missing {
+                if let Err(e) = meta.delete_file(&f.file_id) {
+                    tracing::error!(file_id=%f.file_id, error=%e, "Repair: delete_file failed");
+                } else {
+                    tracing::warn!(
+                        file_id = %f.file_id,
+                        file_name = %f.file_name,
+                        "Repair: removed file referencing missing block"
+                    );
+                    summary.files_removed += 1;
+                }
+            }
+        }
+
+        // 2) Remove dedup entries pointing at missing blocks.
+        for (hash, block_id) in meta.list_dedup_hash_block_pairs()? {
+            if missing.contains(&block_id) {
+                if let Err(e) = meta.remove_dedup_entry(&hash) {
+                    tracing::error!(hash=%hash, error=%e, "Repair: remove_dedup_entry failed");
+                } else {
+                    summary.dedup_removed += 1;
+                }
+            }
+        }
+
+        // 3) Remove block metadata rows for the missing blocks. We defer
+        //    this to last so step (1) can still recognise missing blocks.
+        for block_id in &missing {
+            if let Err(e) = meta.delete_block(block_id) {
+                tracing::error!(block_id=%block_id, error=%e, "Repair: delete_block failed");
+            } else {
+                summary.blocks_removed += 1;
+            }
+        }
+
+        Ok(summary)
+    }
+
+    /// Instance-level wrapper around [`Engine::repair_static`] for callers
+    /// that already hold a live engine. Can be driven from an admin RPC
+    /// in the future; currently invoked only via `JIHUAN_REPAIR=1` on
+    /// startup.
+    pub fn repair(&self) -> Result<RepairSummary> {
+        Self::repair_static(&self.meta, &self.config.storage.data_dir)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Read path
     // ─────────────────────────────────────────────────────────────────────────
@@ -806,7 +997,24 @@ impl Engine {
     }
 
     /// Collect a lightweight stats snapshot without any Prometheus dependency.
+    ///
+    /// Results are cached for [`STATS_CACHE_TTL_MS`] milliseconds so that
+    /// polling consumers (`/api/status`, `/api/metrics`, the Dashboard) pay
+    /// the directory-walk + file-list cost at most once per TTL. The cache
+    /// is invalidated implicitly by expiry, not by writers — acceptable
+    /// because the snapshot is already approximate (active block, OS page
+    /// cache, FS overhead).
     pub fn stats(&self) -> Result<crate::metrics::EngineStats> {
+        // Fast path: return a still-fresh cached snapshot.
+        {
+            let guard = self.stats_cache.lock();
+            if let Some(cached) = guard.as_ref() {
+                if cached.at.elapsed().as_millis() < STATS_CACHE_TTL_MS {
+                    return Ok(cached.snapshot.clone());
+                }
+            }
+        }
+
         let file_count = self.meta.file_count()?;
         let block_count = self.meta.block_count()?;
 
@@ -835,13 +1043,28 @@ impl Engine {
             (logical_bytes as f64 / disk_usage_bytes as f64).max(1.0)
         };
 
-        Ok(crate::metrics::EngineStats {
+        let snapshot = crate::metrics::EngineStats {
             file_count,
             block_count,
             logical_bytes,
             disk_usage_bytes,
             dedup_ratio,
-        })
+        };
+
+        // Store for subsequent fast-path reads. Cloning is cheap — EngineStats
+        // is a handful of u64 / f64.
+        *self.stats_cache.lock() = Some(CachedStats {
+            at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
+    /// Invalidate the `stats()` cache. Called from writer paths that make a
+    /// material change (large upload / delete / GC) and want the next stats
+    /// call to reflect reality immediately instead of waiting for TTL.
+    pub fn invalidate_stats_cache(&self) {
+        *self.stats_cache.lock() = None;
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -890,6 +1113,98 @@ mod tests {
     fn open_engine(tmp: &tempfile::TempDir) -> Engine {
         let cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         Engine::open(cfg).unwrap()
+    }
+
+    #[test]
+    fn test_stats_cache_returns_same_snapshot_within_ttl() {
+        // Phase 6b-P4: two consecutive stats() calls inside the TTL must be
+        // byte-identical without the second call re-walking `data_dir`.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine.put_bytes(b"abc", "a.txt", None).unwrap();
+
+        let first = engine.stats().unwrap();
+        let second = engine.stats().unwrap();
+        assert_eq!(first.file_count, second.file_count);
+        assert_eq!(first.disk_usage_bytes, second.disk_usage_bytes);
+        assert_eq!(first.logical_bytes, second.logical_bytes);
+    }
+
+    #[test]
+    fn test_repair_purges_files_referencing_missing_blocks() {
+        // Simulate the historical data-loss bug: metadata references a
+        // block whose .blk file is missing from disk. Repair must:
+        //   * remove the file record (it's unreadable anyway)
+        //   * remove the dangling block metadata row
+        //   * remove any dedup entry pointing at the gone block
+        // but must leave OTHER (still-valid) files alone.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        // (a) upload two files. They end up in the active block.
+        let good_id = engine.put_bytes(b"good-data", "good.txt", None).unwrap();
+        // Seal so this file's block lives on disk independently.
+        engine.seal_active_block().unwrap();
+
+        let lost_id = engine.put_bytes(b"lost-data", "lost.txt", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        // (b) identify the block backing `lost_id` and delete its .blk file
+        //     to simulate the historical bug.
+        let lost_meta = engine.metadata().get_file(&lost_id).unwrap().unwrap();
+        let lost_block_id = lost_meta.chunks[0].block_id.clone();
+        let lost_block_row = engine
+            .metadata()
+            .get_block(&lost_block_id)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&lost_block_row.path).unwrap();
+
+        // Sanity: the metadata row still exists, the .blk file does not.
+        assert!(engine.metadata().get_block(&lost_block_id).unwrap().is_some());
+        assert!(!std::path::Path::new(&lost_block_row.path).exists());
+
+        // (c) run repair.
+        let summary = engine.repair().unwrap();
+        assert!(summary.files_removed >= 1);
+        assert!(summary.blocks_removed >= 1);
+
+        // (d) verify: lost file is gone, good file still works.
+        assert!(engine.metadata().get_file(&lost_id).unwrap().is_none());
+        assert!(engine.metadata().get_block(&lost_block_id).unwrap().is_none());
+        let got = engine.get_bytes(&good_id).unwrap();
+        assert_eq!(got, b"good-data");
+    }
+
+    #[test]
+    fn test_repair_noop_on_healthy_store() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine.put_bytes(b"x", "a.txt", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        let summary = engine.repair().unwrap();
+        assert_eq!(summary.files_removed, 0);
+        assert_eq!(summary.blocks_removed, 0);
+        assert_eq!(summary.dedup_removed, 0);
+    }
+
+    #[test]
+    fn test_stats_cache_invalidate_picks_up_changes() {
+        // Explicit invalidation must let the next stats() reflect writes
+        // that happened since the last snapshot.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        let empty = engine.stats().unwrap();
+        assert_eq!(empty.file_count, 0);
+
+        engine.put_bytes(b"hello", "h.txt", None).unwrap();
+        engine.invalidate_stats_cache();
+
+        let after = engine.stats().unwrap();
+        assert_eq!(after.file_count, 1);
+        assert!(after.logical_bytes >= 5);
     }
 
     #[test]

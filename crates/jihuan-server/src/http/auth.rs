@@ -15,10 +15,11 @@ use tokio::sync::RwLock;
 
 use jihuan_core::{
     config::AuthConfig,
-    metadata::types::ApiKeyMeta,
+    metadata::types::{ApiKeyMeta, AuditResult},
     Engine,
 };
 
+use crate::http::audit;
 use crate::http::files::AppError;
 
 // ─── Session store (in-memory, cookie-backed) ─────────────────────────────────
@@ -185,7 +186,7 @@ fn now_secs() -> u64 {
 /// Synthetic principal used when auth is disabled or the route is exempt.
 /// Carries all three scopes so that `require_scope(..)` checks always pass.
 /// The key_hash is deliberately empty — this record is never persisted.
-fn disabled_auth_principal() -> ApiKeyMeta {
+pub(crate) fn disabled_auth_principal() -> ApiKeyMeta {
     ApiKeyMeta {
         key_id: "__auth_disabled__".to_string(),
         name: "auth-disabled".to_string(),
@@ -432,10 +433,21 @@ pub async fn create_key(
     let key_id = meta.key_id.clone();
     let key_prefix = meta.key_prefix.clone();
 
+    let engine_for_audit = engine.clone();
     tokio::task::spawn_blocking(move || engine.metadata().insert_api_key(&meta))
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?;
+
+    audit::record(
+        engine_for_audit,
+        Some(caller.0.key_id.clone()),
+        None,
+        "key.create",
+        Some(key_id.clone()),
+        AuditResult::Ok,
+        Some(200),
+    );
 
     Ok(Json(CreateKeyResponse {
         key_id,
@@ -509,17 +521,39 @@ pub async fn delete_key(
     axum::extract::Path(key_id): axum::extract::Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_scope(&caller, "admin")?;
-    let removed = tokio::task::spawn_blocking(move || engine.metadata().delete_api_key(&key_id))
+    let engine_task = engine.clone();
+    let key_id_task = key_id.clone();
+    let removed = tokio::task::spawn_blocking(move || engine_task.metadata().delete_api_key(&key_id_task))
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?;
 
     if removed.is_none() {
+        audit::record(
+            engine,
+            Some(caller.0.key_id.clone()),
+            None,
+            "key.delete",
+            Some(key_id),
+            AuditResult::Denied {
+                reason: "not found".to_string(),
+            },
+            Some(404),
+        );
         return Err(AppError {
             status: StatusCode::NOT_FOUND,
             message: format!("Key not found"),
         });
     }
+    audit::record(
+        engine,
+        Some(caller.0.key_id.clone()),
+        None,
+        "key.delete",
+        Some(key_id),
+        AuditResult::Ok,
+        Some(204),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -547,6 +581,7 @@ pub struct LoginResponse {
 /// un-authenticated browser.
 pub async fn login(
     State(auth): State<AuthState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
     let raw = req.key.trim();
@@ -563,15 +598,38 @@ pub async fn login(
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?;
 
+    let actor_ip = audit::client_ip(&headers, None);
     let meta = match meta {
         Some(m) if m.enabled => m,
-        Some(_) => {
+        Some(m) => {
+            audit::record(
+                auth.engine.clone(),
+                Some(m.key_id.clone()),
+                actor_ip.clone(),
+                "auth.login_failed",
+                None,
+                AuditResult::Denied {
+                    reason: "key disabled".to_string(),
+                },
+                Some(403),
+            );
             return Err(AppError {
                 status: StatusCode::FORBIDDEN,
                 message: "API key is disabled".to_string(),
             });
         }
         None => {
+            audit::record(
+                auth.engine.clone(),
+                None,
+                actor_ip.clone(),
+                "auth.login_failed",
+                None,
+                AuditResult::Denied {
+                    reason: "invalid key".to_string(),
+                },
+                Some(401),
+            );
             // Constant-ish 401 regardless of whether the key existed to avoid
             // key-enumeration oracles.
             return Err(AppError {
@@ -584,6 +642,16 @@ pub async fn login(
     // Mint + persist the session.
     let token = new_session_token();
     auth.sessions.insert(token.clone(), meta.key_id.clone()).await;
+
+    audit::record(
+        auth.engine.clone(),
+        Some(meta.key_id.clone()),
+        actor_ip,
+        "auth.login",
+        None,
+        AuditResult::Ok,
+        Some(200),
+    );
 
     // Build the Set-Cookie header. We deliberately do not set `Secure` because
     // the default deployment is plain HTTP on localhost; a TLS-enabled deployment
@@ -616,9 +684,20 @@ pub async fn logout(
     State(auth): State<AuthState>,
     req_headers: HeaderMap,
 ) -> Response {
+    let mut actor_key_id: Option<String> = None;
     if let Some(tok) = cookie_value(&req_headers, SESSION_COOKIE) {
+        actor_key_id = auth.sessions.lookup(tok).await;
         auth.sessions.remove(tok).await;
     }
+    audit::record(
+        auth.engine.clone(),
+        actor_key_id,
+        audit::client_ip(&req_headers, None),
+        "auth.logout",
+        None,
+        AuditResult::Ok,
+        Some(204),
+    );
     // Overwrite the cookie with an immediately-expired value.
     let clear = format!(
         "{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
@@ -697,5 +776,14 @@ pub async fn change_password(
     }
 
     tracing::info!(%key_id, "API key credential rotated via change-password");
+    audit::record(
+        auth.engine.clone(),
+        Some(key_id.clone()),
+        None,
+        "auth.change_password",
+        Some(key_id),
+        AuditResult::Ok,
+        Some(204),
+    );
     Ok(StatusCode::NO_CONTENT)
 }

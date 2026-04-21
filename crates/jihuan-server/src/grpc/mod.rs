@@ -1,4 +1,5 @@
 pub mod admin_service;
+pub mod auth_interceptor;
 pub mod file_service;
 
 // Include the generated protobuf code at compile time.

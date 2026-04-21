@@ -7,6 +7,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use jihuan_core::Engine;
 
+use crate::grpc::auth_interceptor::require_scope_grpc;
 use crate::grpc::pb::{
     file_service_server::FileService, get_file_response, put_file_request, DeleteFileRequest,
     DeleteFileResponse, GetFileMetaRequest, GetFileMetaResponse, GetFileRequest, GetFileResponse,
@@ -31,6 +32,7 @@ impl FileService for FileServiceImpl {
         &self,
         request: Request<Streaming<PutFileRequest>>,
     ) -> Result<Response<PutFileResponse>, Status> {
+        require_scope_grpc(&request, "write")?;
         let mut stream = request.into_inner();
         let mut file_name = String::new();
         let mut _file_size = 0u64;
@@ -83,6 +85,7 @@ impl FileService for FileServiceImpl {
         &self,
         request: Request<GetFileRequest>,
     ) -> Result<Response<Self::GetFileStream>, Status> {
+        require_scope_grpc(&request, "read")?;
         let file_id = request.into_inner().file_id;
         let engine = self.engine.clone();
         let fid = file_id.clone();
@@ -174,6 +177,7 @@ impl FileService for FileServiceImpl {
         &self,
         request: Request<DeleteFileRequest>,
     ) -> Result<Response<DeleteFileResponse>, Status> {
+        require_scope_grpc(&request, "write")?;
         let file_id = request.into_inner().file_id;
         let engine = self.engine.clone();
 
@@ -192,6 +196,7 @@ impl FileService for FileServiceImpl {
         &self,
         request: Request<GetFileMetaRequest>,
     ) -> Result<Response<GetFileMetaResponse>, Status> {
+        require_scope_grpc(&request, "read")?;
         let file_id = request.into_inner().file_id;
         let engine = self.engine.clone();
 

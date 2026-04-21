@@ -4,6 +4,7 @@ use tonic::{Request, Response, Status};
 
 use jihuan_core::Engine;
 
+use crate::grpc::auth_interceptor::require_scope_grpc;
 use crate::grpc::pb::{
     admin_service_server::AdminService, BlockInfo, GetStatusRequest, GetStatusResponse,
     ListBlocksRequest, ListBlocksResponse, TriggerGcRequest, TriggerGcResponse,
@@ -25,6 +26,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         _request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
+        require_scope_grpc(&_request, "admin")?;
         let engine = self.engine.clone();
         let (file_count, block_count) = tokio::task::spawn_blocking(move || {
             let fc = engine.file_count().unwrap_or(0);
@@ -53,6 +55,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         _request: Request<TriggerGcRequest>,
     ) -> Result<Response<TriggerGcResponse>, Status> {
+        require_scope_grpc(&_request, "admin")?;
         let stats = self
             .engine
             .trigger_gc()
@@ -72,6 +75,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         _request: Request<ListBlocksRequest>,
     ) -> Result<Response<ListBlocksResponse>, Status> {
+        require_scope_grpc(&_request, "admin")?;
         let engine = self.engine.clone();
         let blocks = tokio::task::spawn_blocking(move || engine.metadata().list_all_blocks())
             .await

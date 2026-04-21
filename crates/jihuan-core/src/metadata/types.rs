@@ -115,3 +115,42 @@ pub struct DedupEntry {
     pub original_size: u64,
     pub compressed_size: u64,
 }
+
+/// Result of an audited action (Phase 2.6).
+///
+/// Kept out-of-band from HTTP status because an audit consumer often cares
+/// about semantic outcome (e.g. a 404 on a purge attempt is still "success"
+/// from an audit-trail standpoint; a 401 is always a denial worth recording).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditResult {
+    Ok,
+    Denied { reason: String },
+    Error { message: String },
+}
+
+/// A structured audit event recording a security- or data-relevant action.
+/// Stored in the `audit` table keyed by `(ts_nanos, seq)` so scans return
+/// events in chronological order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Unix timestamp in seconds. Duplicated from the storage key for
+    /// convenience so consumers don't have to decode the raw key.
+    pub ts: u64,
+    /// `key_id` of the caller, or `None` for un-authenticated events
+    /// (e.g. a failed login).
+    pub actor_key_id: Option<String>,
+    /// Caller IP as best-effort extracted from the connecting socket or the
+    /// `X-Forwarded-For` header when behind a proxy.
+    pub actor_ip: Option<String>,
+    /// Canonical action name, snake_case. Examples:
+    ///   `auth.login`, `auth.login_failed`, `auth.logout`, `auth.change_password`,
+    ///   `key.create`, `key.delete`, `file.delete`, `gc.trigger`, `config.update`.
+    pub action: String,
+    /// Optional target identifier (file_id / key_id / block_id / ...).
+    pub target: Option<String>,
+    /// Outcome classification (see [`AuditResult`]).
+    pub result: AuditResult,
+    /// Associated HTTP status, if the event was produced from an HTTP handler.
+    pub http_status: Option<u16>,
+}

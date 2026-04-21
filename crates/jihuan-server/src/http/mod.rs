@@ -11,6 +11,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use jihuan_core::Engine;
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod files;
 pub mod ui;
@@ -69,6 +70,8 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
             get(admin::get_block_detail).delete(admin::delete_block),
         )
         .route("/api/config", get(admin::get_config))
+        // Audit log (Phase 2.6)
+        .route("/api/admin/audit", get(audit::list_audit))
         // Same-origin Prometheus metrics proxy for UI and integrations that
         // cannot reach the standalone `:9090/metrics` port (CORS / firewall).
         .route("/api/metrics", get(admin::render_metrics))

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::error::{JiHuanError, Result};
-use crate::metadata::types::{ApiKeyMeta, BlockMeta, DedupEntry, FileMeta};
+use crate::metadata::types::{ApiKeyMeta, AuditEvent, BlockMeta, DedupEntry, FileMeta};
 
 // Table definitions: key type → value type (both &[u8] for bincode-encoded blobs)
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
@@ -17,6 +17,11 @@ const PARTITION_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const APIKEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("apikeys");
 /// Maps key_hash → key_id (for fast lookup by raw key hash)
 const APIKEY_HASH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("apikey_hash");
+/// Audit log (Phase 2.6). Keyed by 16-byte BE composite `[ts_secs:u64][seq:u64]`
+/// so that table iteration returns events in chronological order. The
+/// `seq` component is monotonically increased per process so that two
+/// events landing in the same second still have a stable ordering.
+const AUDIT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("audit");
 
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(v).map_err(|e| JiHuanError::Serialization(e.to_string()))
@@ -29,6 +34,9 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// Thread-safe metadata store backed by redb
 pub struct MetadataStore {
     db: Arc<Database>,
+    /// Monotonic sequence counter for audit events — disambiguates events
+    /// that share the same second timestamp. (Phase 2.6)
+    audit_seq: std::sync::atomic::AtomicU64,
 }
 
 impl MetadataStore {
@@ -60,11 +68,16 @@ impl MetadataStore {
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(APIKEY_HASH_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(AUDIT_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.commit()
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
         }
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            audit_seq: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -420,6 +433,33 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Enumerate every dedup entry (hash → block_id pairs only).
+    ///
+    /// Used by [`Engine::repair`](crate::Engine::repair) to find dedup
+    /// entries that point at block files missing from disk. Kept minimal
+    /// (no DedupEntry clone) so a large dedup table doesn't spike memory
+    /// during a repair pass — we only need the hash + block_id to decide
+    /// whether to delete.
+    pub fn list_dedup_hash_block_pairs(&self) -> Result<Vec<(String, String)>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(DEDUP_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let de: DedupEntry = decode(v.value())?;
+            out.push((k.value().to_string(), de.block_id));
+        }
+        Ok(out)
+    }
+
     pub fn remove_dedup_entry(&self, hash: &str) -> Result<()> {
         let tx = self
             .db
@@ -690,6 +730,143 @@ impl MetadataStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Audit log (Phase 2.6)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Append a single audit event. Key is `[ts_secs:u64_be][seq:u64_be]`.
+    /// Returns the composed key bytes (useful for correlation / tests).
+    pub fn insert_audit_event(&self, event: &AuditEvent) -> Result<[u8; 16]> {
+        let seq = self
+            .audit_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut key = [0u8; 16];
+        key[0..8].copy_from_slice(&event.ts.to_be_bytes());
+        key[8..16].copy_from_slice(&seq.to_be_bytes());
+        let bytes = encode(event)?;
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(AUDIT_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            table
+                .insert(key.as_slice(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(key)
+    }
+
+    /// Return the most recent audit events (newest first), optionally
+    /// filtered by actor/action and bounded by timestamp range. `limit`
+    /// caps the returned set. All filters are applied in-memory after the
+    /// range scan — acceptable because the expected volume is moderate
+    /// (<10⁵ events/day). Heavy-traffic deployments can add secondary
+    /// indices later without touching callers.
+    pub fn list_audit_events(
+        &self,
+        since_secs: Option<u64>,
+        until_secs: Option<u64>,
+        actor_key_id: Option<&str>,
+        action_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(AUDIT_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        // Build a range `[lo, hi)` over the 16-byte composite key. The seq
+        // component is zeroed for `lo` and max for `hi` so the filter is
+        // strictly by the timestamp half.
+        let lo = {
+            let mut k = [0u8; 16];
+            k[0..8].copy_from_slice(&since_secs.unwrap_or(0).to_be_bytes());
+            k
+        };
+        let hi = {
+            let mut k = [0xFFu8; 16];
+            k[0..8].copy_from_slice(&until_secs.unwrap_or(u64::MAX).to_be_bytes());
+            k
+        };
+
+        let mut out = Vec::new();
+        let range = table
+            .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        // Iterate newest-first by reversing the range iterator.
+        for entry in range.rev() {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let ev: AuditEvent = decode(v.value())?;
+            if let Some(a) = actor_key_id {
+                if ev.actor_key_id.as_deref() != Some(a) {
+                    continue;
+                }
+            }
+            if let Some(prefix) = action_prefix {
+                if !ev.action.starts_with(prefix) {
+                    continue;
+                }
+            }
+            out.push(ev);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove audit events strictly older than `cutoff_secs`. Used by the
+    /// retention policy (default 90 days). Returns the number of rows
+    /// deleted.
+    pub fn purge_audit_events_before(&self, cutoff_secs: u64) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut deleted = 0u64;
+        {
+            let mut table = tx
+                .open_table(AUDIT_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut hi = [0u8; 16];
+            hi[0..8].copy_from_slice(&cutoff_secs.to_be_bytes());
+            // Collect keys first (can't mutate while iterating redb ranges).
+            let mut keys: Vec<[u8; 16]> = Vec::new();
+            for entry in table
+                .range::<&[u8]>(&[][..]..hi.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+            {
+                let (k, _) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+                let raw = k.value();
+                if raw.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(raw);
+                    keys.push(arr);
+                }
+            }
+            for k in keys {
+                if table
+                    .remove(k.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?
+                    .is_some()
+                {
+                    deleted += 1;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(deleted)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Stats
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -845,5 +1022,78 @@ mod tests {
         assert!(got.is_some());
         store.remove_dedup_entry("sha256abc").unwrap();
         assert!(store.get_dedup_entry("sha256abc").unwrap().is_none());
+    }
+
+    // ─── Phase 2.6 audit log ─────────────────────────────────────────────────
+
+    fn mk_audit(ts: u64, action: &str, actor: Option<&str>) -> AuditEvent {
+        AuditEvent {
+            ts,
+            actor_key_id: actor.map(String::from),
+            actor_ip: None,
+            action: action.to_string(),
+            target: None,
+            result: crate::metadata::types::AuditResult::Ok,
+            http_status: Some(200),
+        }
+    }
+
+    #[test]
+    fn test_audit_insert_and_list_newest_first() {
+        let (store, _tmp) = make_store();
+        store.insert_audit_event(&mk_audit(100, "auth.login", Some("k1"))).unwrap();
+        store.insert_audit_event(&mk_audit(200, "auth.logout", Some("k1"))).unwrap();
+        store.insert_audit_event(&mk_audit(150, "key.create", Some("k2"))).unwrap();
+
+        let events = store.list_audit_events(None, None, None, None, 10).unwrap();
+        assert_eq!(events.len(), 3);
+        // Newest first
+        assert_eq!(events[0].ts, 200);
+        assert_eq!(events[2].ts, 100);
+    }
+
+    #[test]
+    fn test_audit_filters() {
+        let (store, _tmp) = make_store();
+        store.insert_audit_event(&mk_audit(100, "auth.login", Some("k1"))).unwrap();
+        store.insert_audit_event(&mk_audit(200, "auth.logout", Some("k1"))).unwrap();
+        store.insert_audit_event(&mk_audit(150, "key.create", Some("k2"))).unwrap();
+
+        let only_k1 = store.list_audit_events(None, None, Some("k1"), None, 10).unwrap();
+        assert_eq!(only_k1.len(), 2);
+        assert!(only_k1.iter().all(|e| e.actor_key_id.as_deref() == Some("k1")));
+
+        let auth_prefix = store.list_audit_events(None, None, None, Some("auth."), 10).unwrap();
+        assert_eq!(auth_prefix.len(), 2);
+        assert!(auth_prefix.iter().all(|e| e.action.starts_with("auth.")));
+
+        let bounded = store.list_audit_events(Some(120), Some(180), None, None, 10).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].ts, 150);
+    }
+
+    #[test]
+    fn test_audit_purge_before() {
+        let (store, _tmp) = make_store();
+        for ts in [10u64, 20, 30, 40] {
+            store.insert_audit_event(&mk_audit(ts, "x", None)).unwrap();
+        }
+        let deleted = store.purge_audit_events_before(25).unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = store.list_audit_events(None, None, None, None, 10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|e| e.ts >= 25));
+    }
+
+    #[test]
+    fn test_audit_seq_disambiguates_same_second() {
+        // Two events with identical ts must still land and both be
+        // retrievable — the sequence counter prevents key collisions.
+        let (store, _tmp) = make_store();
+        let k1 = store.insert_audit_event(&mk_audit(500, "a", None)).unwrap();
+        let k2 = store.insert_audit_event(&mk_audit(500, "b", None)).unwrap();
+        assert_ne!(k1, k2);
+        let all = store.list_audit_events(None, None, None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

@@ -263,12 +263,21 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors_layer);
 
-    // Build gRPC server
-    let file_svc = grpc::pb::file_service_server::FileServiceServer::new(
+    // Build gRPC server with auth interceptor (Phase 2.3).
+    // The interceptor closure runs before every RPC method, validates the
+    // API key in request metadata, and attaches an `AuthedKey` extension
+    // that handlers read via `require_scope_grpc`. When auth is disabled
+    // it injects a synthetic full-scope principal so the same `require_*`
+    // calls keep compiling without per-method branching.
+    let grpc_interceptor =
+        grpc::auth_interceptor::make_interceptor(engine.clone(), config.auth.clone());
+    let file_svc = grpc::pb::file_service_server::FileServiceServer::with_interceptor(
         grpc::file_service::FileServiceImpl::new(engine.clone()),
+        grpc_interceptor.clone(),
     );
-    let admin_svc = grpc::pb::admin_service_server::AdminServiceServer::new(
+    let admin_svc = grpc::pb::admin_service_server::AdminServiceServer::with_interceptor(
         grpc::admin_service::AdminServiceImpl::new(engine.clone()),
+        grpc_interceptor,
     );
     let grpc_server = tonic::transport::Server::builder()
         .add_service(file_svc)
@@ -277,22 +286,100 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("HTTP server listening on {}", http_addr);
     tracing::info!("gRPC server listening on {}", grpc_addr);
 
-    // Run both servers concurrently
-    tokio::select! {
-        result = axum::serve(
-            tokio::net::TcpListener::bind(http_addr).await?,
-            http_router,
-        ) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "HTTP server error");
+    // ── Graceful shutdown ────────────────────────────────────────────────────
+    //
+    // Signals (Ctrl-C on Windows, SIGINT / SIGTERM on Unix) otherwise kill the
+    // process immediately — `Arc<Engine>` copies held in handlers never drop,
+    // `Engine::Drop` never runs, and the active block stays unsealed. On next
+    // start, `cleanup_incomplete_blocks` used to delete it → catastrophic
+    // data loss. We now install a signal listener, drive both servers under
+    // `with_graceful_shutdown`, and call `Engine::shutdown()` explicitly
+    // **before** returning so the block is sealed and the WAL is fsynced.
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to install SIGTERM handler; Ctrl-C only");
+                    tokio::signal::ctrl_c().await.ok();
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+                _ = term.recv() => tracing::info!("received SIGTERM"),
             }
-        },
-        result = grpc_server.serve(grpc_addr) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "gRPC server error");
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!(error = %e, "failed to wait for Ctrl-C");
+            } else {
+                tracing::info!("received Ctrl-C");
             }
-        },
+        }
+    };
+
+    // Two separate oneshot halves so each server can be driven by its own
+    // graceful-shutdown adapter and we can await them concurrently.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut http_rx = shutdown_tx.subscribe();
+    let mut grpc_rx = shutdown_tx.subscribe();
+    let shutdown_tx_signal = shutdown_tx.clone();
+
+    let http_handle = tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(error = %e, "HTTP bind failed");
+                return;
+            }
+        };
+        if let Err(e) = axum::serve(listener, http_router)
+            .with_graceful_shutdown(async move {
+                let _ = http_rx.recv().await;
+            })
+            .await
+        {
+            tracing::error!(error = %e, "HTTP server error");
+        }
+    });
+
+    let grpc_handle = tokio::spawn(async move {
+        if let Err(e) = grpc_server
+            .serve_with_shutdown(grpc_addr, async move {
+                let _ = grpc_rx.recv().await;
+            })
+            .await
+        {
+            tracing::error!(error = %e, "gRPC server error");
+        }
+    });
+
+    // Block on signal, then fan out shutdown to both servers.
+    shutdown_signal.await;
+    tracing::info!("Graceful shutdown initiated");
+    let _ = shutdown_tx_signal.send(());
+
+    // Wait for both servers to drain. The timeout guards against a stuck
+    // long-poll request — after 30 s we proceed with engine shutdown
+    // regardless so we never leave the block unsealed.
+    let drain = async {
+        let _ = tokio::join!(http_handle, grpc_handle);
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("Server drain timed out after 30s; proceeding with engine shutdown");
     }
+
+    // CRITICAL: seal the active block and fsync the WAL. Skipping this is
+    // what caused the historical data-loss-on-restart bug.
+    engine.shutdown();
+    tracing::info!("Shutdown complete");
 
     Ok(())
 }
