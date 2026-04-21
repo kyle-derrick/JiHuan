@@ -12,6 +12,8 @@ use serde::Serialize;
 
 use jihuan_core::{Engine, JiHuanError};
 
+use crate::http::auth::{require_scope, AuthedKey};
+
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     pub file_id: String,
@@ -74,8 +76,10 @@ pub struct ListFilesQuery {
 /// List all files with optional limit/offset pagination
 pub async fn list_files(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Query(q): Query<ListFilesQuery>,
 ) -> Result<Json<FileListResponse>, AppError> {
+    require_scope(&caller, "read")?;
     let all = tokio::task::spawn_blocking(move || engine.list_all_files())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
@@ -136,8 +140,10 @@ pub async fn list_files(
 /// to roughly one chunk (`storage.chunk_size`) plus a small mpsc queue.
 pub async fn upload_file(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
+    require_scope(&caller, "write")?;
     // Find the first file field
     let mut field = loop {
         let f = multipart
@@ -240,12 +246,17 @@ impl std::io::Read for ChannelReader {
 }
 
 /// GET /api/v1/files/:file_id
-/// Download a file
+/// Download a file. Supports a single-range `Range: bytes=start-end` request
+/// (responds 206 Partial Content). Multi-range and otherwise unsatisfiable
+/// ranges return 416.
 pub async fn download_file(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Path(file_id): Path<String>,
+    req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    // First fetch metadata for filename and content-type
+    require_scope(&caller, "read")?;
+    // First fetch metadata for filename, content-type and size
     let meta = {
         let e = engine.clone();
         let fid = file_id.clone();
@@ -254,19 +265,32 @@ pub async fn download_file(
             .map_err(|e| AppError::internal(e.to_string()))?
             .map_err(AppError::from_jihuan)?
     };
-
     let meta = meta.ok_or_else(|| AppError::not_found(&file_id))?;
-
-    let e = engine.clone();
-    let fid = file_id.clone();
-    let data = tokio::task::spawn_blocking(move || e.get_bytes(&fid))
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?
-        .map_err(AppError::from_jihuan)?;
 
     let content_type = meta
         .content_type
+        .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
+    let file_size = meta.file_size;
+
+    // Parse the Range header (single-range only; reject multi-range)
+    let range_req = match req_headers.get(header::RANGE) {
+        Some(v) => match parse_single_byte_range(v.to_str().unwrap_or(""), file_size) {
+            Ok(r) => Some(r),
+            Err(RangeParseError::Multi) | Err(RangeParseError::Unsatisfiable) => {
+                // RFC 9110 §15.5.17: Content-Range: bytes */<complete-length>
+                let mut headers = HeaderMap::new();
+                headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+                headers.insert(
+                    header::CONTENT_RANGE,
+                    format!("bytes */{}", file_size).parse().unwrap(),
+                );
+                return Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
+            }
+            Err(RangeParseError::Malformed) => None, // ignore malformed → full response
+        },
+        None => None,
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -281,19 +305,157 @@ pub async fn download_file(
             .parse()
             .unwrap(),
     );
-    headers.insert(
-        header::CONTENT_LENGTH,
-        data.len().to_string().parse().unwrap(),
-    );
+    headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
 
-    Ok((StatusCode::OK, headers, Body::from(data)).into_response())
+    if let Some((start, end)) = range_req {
+        // 206 Partial Content
+        let e = engine.clone();
+        let fid = file_id.clone();
+        let data = tokio::task::spawn_blocking(move || e.get_range(&fid, start, end))
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+            .map_err(AppError::from_jihuan)?;
+
+        headers.insert(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, file_size)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            data.len().to_string().parse().unwrap(),
+        );
+        Ok((StatusCode::PARTIAL_CONTENT, headers, Body::from(data)).into_response())
+    } else {
+        // 200 OK — whole file
+        let e = engine.clone();
+        let fid = file_id.clone();
+        let data = tokio::task::spawn_blocking(move || e.get_bytes(&fid))
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+            .map_err(AppError::from_jihuan)?;
+
+        headers.insert(
+            header::CONTENT_LENGTH,
+            data.len().to_string().parse().unwrap(),
+        );
+        Ok((StatusCode::OK, headers, Body::from(data)).into_response())
+    }
+}
+
+#[derive(Debug)]
+enum RangeParseError {
+    /// `Range: bytes=...,...` — multi-range is not supported
+    Multi,
+    /// Range is syntactically valid but cannot be satisfied (e.g. start>=size)
+    Unsatisfiable,
+    /// Header does not match `bytes=...` grammar — treat as "no range".
+    Malformed,
+}
+
+/// Parse a single-range `Range` header against `file_size`.
+///
+/// Returns `(start, end)` where both ends are inclusive byte offsets.
+/// Supports:
+///   • `bytes=a-b`  →  [a, b]
+///   • `bytes=a-`   →  [a, file_size-1]
+///   • `bytes=-n`   →  last `n` bytes (suffix)
+fn parse_single_byte_range(header: &str, file_size: u64) -> Result<(u64, u64), RangeParseError> {
+    let spec = header
+        .trim()
+        .strip_prefix("bytes=")
+        .ok_or(RangeParseError::Malformed)?
+        .trim();
+
+    if spec.contains(',') {
+        return Err(RangeParseError::Multi);
+    }
+
+    let (a, b) = spec.split_once('-').ok_or(RangeParseError::Malformed)?;
+    let a = a.trim();
+    let b = b.trim();
+
+    if file_size == 0 {
+        return Err(RangeParseError::Unsatisfiable);
+    }
+
+    let (start, end) = match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Err(RangeParseError::Malformed),
+        (true, false) => {
+            // Suffix: last N bytes
+            let n: u64 = b.parse().map_err(|_| RangeParseError::Malformed)?;
+            if n == 0 {
+                return Err(RangeParseError::Unsatisfiable);
+            }
+            let start = file_size.saturating_sub(n);
+            (start, file_size - 1)
+        }
+        (false, true) => {
+            let start: u64 = a.parse().map_err(|_| RangeParseError::Malformed)?;
+            (start, file_size - 1)
+        }
+        (false, false) => {
+            let start: u64 = a.parse().map_err(|_| RangeParseError::Malformed)?;
+            let end: u64 = b.parse().map_err(|_| RangeParseError::Malformed)?;
+            (start, end)
+        }
+    };
+
+    if start > end || start >= file_size {
+        return Err(RangeParseError::Unsatisfiable);
+    }
+    // Clamp end to last byte
+    Ok((start, end.min(file_size - 1)))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic() {
+        assert_eq!(parse_single_byte_range("bytes=0-99", 1000).unwrap(), (0, 99));
+        assert_eq!(
+            parse_single_byte_range("bytes=500-", 1000).unwrap(),
+            (500, 999)
+        );
+        assert_eq!(parse_single_byte_range("bytes=-100", 1000).unwrap(), (900, 999));
+        // Clamps end
+        assert_eq!(
+            parse_single_byte_range("bytes=0-9999", 1000).unwrap(),
+            (0, 999)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid() {
+        assert!(matches!(
+            parse_single_byte_range("bytes=0-100,200-300", 1000),
+            Err(RangeParseError::Multi)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("bytes=1000-2000", 1000),
+            Err(RangeParseError::Unsatisfiable)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("items=0-10", 1000),
+            Err(RangeParseError::Malformed)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("bytes=5-3", 1000),
+            Err(RangeParseError::Unsatisfiable)
+        ));
+    }
 }
 
 /// DELETE /api/v1/files/:file_id
 pub async fn delete_file(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Path(file_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    require_scope(&caller, "write")?;
     tokio::task::spawn_blocking(move || engine.delete_file(&file_id))
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
@@ -305,8 +467,10 @@ pub async fn delete_file(
 /// GET /api/v1/files/:file_id/meta
 pub async fn get_file_meta(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Path(file_id): Path<String>,
 ) -> Result<Json<FileMetaResponse>, AppError> {
+    require_scope(&caller, "read")?;
     tracing::debug!(file_id = %file_id, "get_file_meta called");
     let fid = file_id.clone();
     let meta = tokio::task::spawn_blocking(move || {
@@ -392,6 +556,13 @@ impl AppError {
             JiHuanError::InvalidArgument(msg) => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: msg,
+            },
+            // 507 Insufficient Storage is the standard code for "server knows
+            // the request is valid but cannot store the representation". Maps
+            // cleanly onto our configured `max_storage_bytes` cap.
+            e @ JiHuanError::StorageFull { .. } => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                message: e.to_string(),
             },
             other => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,

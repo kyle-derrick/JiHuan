@@ -614,6 +614,81 @@ impl MetadataStore {
         Ok(removed)
     }
 
+    /// Rotate an API key's credential: overwrite `key_hash` + `key_prefix`
+    /// in place, leaving `key_id`, `name`, `scopes`, `created_at`, and
+    /// `enabled` unchanged. The old hash entry is removed from the secondary
+    /// index so the old plaintext can no longer authenticate.
+    ///
+    /// Returns `Ok(true)` when the row existed and was updated, `Ok(false)`
+    /// when no key matched `key_id`.
+    pub fn update_api_key_hash(
+        &self,
+        key_id: &str,
+        new_hash: &str,
+        new_prefix: &str,
+    ) -> Result<bool> {
+        // Read-modify phase: fetch the existing meta and compute the new
+        // encoded payload without holding a write transaction.
+        let (updated_bytes, old_hash) = {
+            let rtx = self
+                .db
+                .begin_read()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let table = rtx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            match table
+                .get(key_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+            {
+                Some(r) => {
+                    let mut meta: ApiKeyMeta = decode(r.value())?;
+                    let old = meta.key_hash.clone();
+                    meta.key_hash = new_hash.to_string();
+                    meta.key_prefix = new_prefix.to_string();
+                    (Some(encode(&meta)?), old)
+                }
+                None => return Ok(false),
+            }
+        };
+
+        let bytes = match updated_bytes {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        // Write phase: atomically rewrite both tables so an interrupted update
+        // cannot leave a stale hash → key_id mapping pointing at the wrong row.
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            table
+                .insert(key_id, bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        {
+            let mut hash_table = tx
+                .open_table(APIKEY_HASH_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            if !old_hash.is_empty() {
+                hash_table
+                    .remove(old_hash.as_str())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+            hash_table
+                .insert(new_hash, key_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(true)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Stats
     // ─────────────────────────────────────────────────────────────────────────

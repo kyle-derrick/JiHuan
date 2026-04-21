@@ -3,16 +3,24 @@ use std::time::Instant;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    Json,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Extension, Json,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::OnceLock;
 
 use jihuan_core::Engine;
 
+use crate::http::auth::{require_scope, AuthedKey};
 use crate::http::files::AppError;
+
+/// Tuple-struct wrapper so the handle can be inserted as an axum `Extension`
+/// even when Prometheus recorder installation failed.
+#[derive(Clone)]
+pub struct MetricsHandle(pub Option<PrometheusHandle>);
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
@@ -29,7 +37,15 @@ pub fn init_start_time() {
 pub struct StatusResponse {
     pub file_count: u64,
     pub block_count: u64,
+    /// Sum of all user-uploaded file sizes, pre-dedup / pre-compression.
+    pub logical_bytes: u64,
+    /// Actual on-disk bytes under `data_dir` (compressed, deduplicated, plus
+    /// block headers/footers). May temporarily exceed `logical_bytes` on
+    /// tiny datasets due to block overhead.
     pub disk_usage_bytes: u64,
+    /// Configured hard storage cap; `None` = unlimited. Mirrors
+    /// `storage.max_storage_bytes` so the UI can draw a usage gauge.
+    pub max_storage_bytes: Option<u64>,
     pub dedup_ratio: f64,
     pub uptime_secs: u64,
     pub version: String,
@@ -97,7 +113,9 @@ pub async fn get_status(State(engine): State<Arc<Engine>>) -> Result<Json<Status
     Ok(Json(StatusResponse {
         file_count: stats.file_count,
         block_count: stats.block_count,
+        logical_bytes: stats.logical_bytes,
         disk_usage_bytes: stats.disk_usage_bytes,
+        max_storage_bytes: cfg.storage.max_storage_bytes,
         dedup_ratio: stats.dedup_ratio,
         uptime_secs,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -108,7 +126,11 @@ pub async fn get_status(State(engine): State<Arc<Engine>>) -> Result<Json<Status
 }
 
 /// POST /api/gc/trigger
-pub async fn trigger_gc(State(engine): State<Arc<Engine>>) -> Result<Json<GcResponse>, AppError> {
+pub async fn trigger_gc(
+    State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
+) -> Result<Json<GcResponse>, AppError> {
+    require_scope(&caller, "admin")?;
     let stats = engine
         .trigger_gc()
         .await
@@ -126,23 +148,42 @@ pub async fn trigger_gc(State(engine): State<Arc<Engine>>) -> Result<Json<GcResp
 /// GET /api/block/list
 pub async fn list_blocks(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
 ) -> Result<Json<BlockListResponse>, AppError> {
+    require_scope(&caller, "read")?;
     let blocks = tokio::task::spawn_blocking(move || engine.metadata().list_all_blocks())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(|e| AppError::internal(e.to_string()))?;
 
-    let dtos: Vec<BlockInfoDto> = blocks
-        .into_iter()
-        .map(|b| BlockInfoDto {
-            sealed: b.size > 0,
-            block_id: b.block_id,
-            size: b.size,
-            ref_count: b.ref_count,
-            create_time: b.create_time,
-            path: b.path,
-        })
-        .collect();
+    // Compute display size for each block:
+    //   • sealed (meta.size > 0) → trust the metadata
+    //   • unsealed (meta.size == 0, e.g. the active writer) → fall back to
+    //     `fs::metadata(path).len()` so the UI/CLI doesn't show 0 B while the
+    //     block is still being filled.
+    let dtos: Vec<BlockInfoDto> = tokio::task::spawn_blocking(move || {
+        blocks
+            .into_iter()
+            .map(|b| {
+                let sealed = b.size > 0;
+                let size = if sealed {
+                    b.size
+                } else {
+                    std::fs::metadata(&b.path).map(|m| m.len()).unwrap_or(0)
+                };
+                BlockInfoDto {
+                    sealed,
+                    block_id: b.block_id,
+                    size,
+                    ref_count: b.ref_count,
+                    create_time: b.create_time,
+                    path: b.path,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
 
     let count = dtos.len();
     Ok(Json(BlockListResponse {
@@ -154,8 +195,10 @@ pub async fn list_blocks(
 /// GET /api/block/:id
 pub async fn get_block_detail(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Path(block_id): Path<String>,
 ) -> Result<Json<BlockDetailResponse>, AppError> {
+    require_scope(&caller, "read")?;
     let e = engine.clone();
     let bid = block_id.clone();
     let (block, files) = tokio::task::spawn_blocking(move || -> jihuan_core::error::Result<_> {
@@ -168,6 +211,18 @@ pub async fn get_block_detail(
     .map_err(|e| AppError::internal(e.to_string()))?;
 
     let block = block.ok_or_else(|| AppError::not_found(&block_id))?;
+
+    // Resolve display size the same way as list_blocks: stat the file when the
+    // block is still unsealed (meta.size == 0).
+    let sealed = block.size > 0;
+    let size = if sealed {
+        block.size
+    } else {
+        let path = block.path.clone();
+        tokio::task::spawn_blocking(move || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+    };
 
     let referencing_files: Vec<ReferencingFileDto> = files
         .into_iter()
@@ -187,9 +242,9 @@ pub async fn get_block_detail(
         .collect();
 
     Ok(Json(BlockDetailResponse {
-        sealed: block.size > 0,
+        sealed,
         block_id: block.block_id,
-        size: block.size,
+        size,
         ref_count: block.ref_count,
         create_time: block.create_time,
         path: block.path,
@@ -199,10 +254,13 @@ pub async fn get_block_detail(
 
 /// DELETE /api/block/:id
 /// Only allowed when ref_count == 0. Removes the block file and metadata entry.
+/// admin only.
 pub async fn delete_block(
     State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
     Path(block_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    require_scope(&caller, "admin")?;
     let e = engine.clone();
     let bid = block_id.clone();
     let result = tokio::task::spawn_blocking(move || -> jihuan_core::error::Result<Result<(), String>> {
@@ -234,8 +292,33 @@ pub async fn delete_block(
 
 /// GET /api/config
 /// Returns the currently-loaded AppConfig as JSON (read-only view).
-pub async fn get_config(State(engine): State<Arc<Engine>>) -> Result<Json<Value>, AppError> {
+pub async fn get_config(
+    State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
+) -> Result<Json<Value>, AppError> {
+    require_scope(&caller, "read")?;
     let cfg = engine.config();
     let v = serde_json::to_value(cfg).map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(v))
+}
+
+/// GET /api/metrics
+/// Same-origin proxy for the Prometheus exposition format. Returns the text
+/// produced by the in-process recorder handle — no cross-origin call to
+/// `:9090/metrics` is required. Returns 503 if the recorder failed to install.
+pub async fn render_metrics(Extension(handle): Extension<MetricsHandle>) -> Response {
+    let Some(h) = handle.0 else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics recorder not installed",
+        )
+            .into_response();
+    };
+    let body = h.render();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
+    );
+    (StatusCode::OK, headers, body).into_response()
 }

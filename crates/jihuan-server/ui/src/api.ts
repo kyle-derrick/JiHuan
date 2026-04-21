@@ -8,11 +8,28 @@ export function setStoredApiKey(key: string) {
   localStorage.setItem(API_KEY_STORAGE, key)
 }
 
+/** Paths that must never trigger a redirect-to-login on 401, because
+ *  they're the auth endpoints themselves or the login page is already showing. */
+const AUTH_PATHS = ['/api/auth/login', '/api/auth/logout', '/api/auth/me']
+
+/** Centralized 401 handler: jump to /ui/login while preserving the current
+ *  path so we can return there after successful login. Called by apiJSON. */
+function redirectToLogin() {
+  if (typeof window === 'undefined') return
+  if (window.location.pathname === '/ui/login') return
+  const next = encodeURIComponent(window.location.pathname + window.location.search)
+  window.location.replace(`/ui/login?next=${next}`)
+}
+
 async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const key = getStoredApiKey()
   const headers: Record<string, string> = { ...(init.headers as Record<string, string>) }
+  // Send the raw API key header *only* when the user has explicitly pasted
+  // one into localStorage. In the cookie-login flow this stays empty and the
+  // browser attaches `jh_session` automatically (credentials: 'same-origin'
+  // is the default for same-origin fetch).
   if (key) headers['X-API-Key'] = key
-  const resp = await fetch(path, { ...init, headers })
+  const resp = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   return resp
 }
 
@@ -22,6 +39,15 @@ async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
     const text = await resp.text()
     let msg = text
     try { msg = JSON.parse(text).error ?? text } catch {}
+    if (resp.status === 401 && !AUTH_PATHS.some((p) => path.startsWith(p))) {
+      // Trigger navigation to /ui/login and park this request. If we threw
+      // here the calling component would briefly render a scary
+      // "HTTP 401: Missing or invalid credentials…" message before the
+      // browser actually navigates. A pending promise that never resolves
+      // keeps the component in its loading state until the redirect wins.
+      redirectToLogin()
+      return new Promise<T>(() => {})
+    }
     throw new Error(`HTTP ${resp.status}: ${msg}`)
   }
   return resp.json() as Promise<T>
@@ -32,7 +58,12 @@ async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
 export interface StatusResponse {
   file_count: number
   block_count: number
+  /** Sum of user-uploaded file sizes (pre-compression, pre-dedup). */
+  logical_bytes: number
+  /** Actual bytes on disk under data_dir (compressed + dedup + block overhead). */
   disk_usage_bytes: number
+  /** Configured storage cap; null = unlimited. */
+  max_storage_bytes: number | null
   dedup_ratio: number
   uptime_secs: number
   version: string
@@ -195,14 +226,14 @@ export const getConfig = () => apiJSON<Record<string, unknown>>('/api/config')
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
 
-/** Fetch raw Prometheus metrics text from the metrics endpoint (port 9090 by default).
- * In dev we go through vite proxy; in prod UI is served on HTTP port while metrics
- * are on a separate port — use absolute URL derived from host. */
+/** Fetch raw Prometheus metrics text via the same-origin proxy endpoint.
+ *
+ * The server re-exposes the Prometheus exposition format at `/api/metrics`
+ * (in addition to the standalone `:9090/metrics` listener used by Prometheus
+ * scraping). Using the same origin avoids CORS/firewall issues for the UI. */
 export async function fetchMetricsText(): Promise<string> {
-  // Try same host, port 9090 (default metrics port)
-  const url = `${window.location.protocol}//${window.location.hostname}:9090/metrics`
-  const resp = await fetch(url).catch(() => null)
-  if (!resp || !resp.ok) throw new Error('Metrics endpoint unreachable (port 9090)')
+  const resp = await apiFetch('/api/metrics')
+  if (!resp.ok) throw new Error(`Metrics endpoint returned HTTP ${resp.status}`)
   return resp.text()
 }
 
@@ -263,6 +294,7 @@ export interface KeyInfo {
   created_at: number
   last_used_at: number
   enabled: boolean
+  scopes: string[]
 }
 
 export interface KeyListResponse {
@@ -276,11 +308,11 @@ export interface CreateKeyResponse extends KeyInfo {
 
 export const listKeys = () => apiJSON<KeyListResponse>('/api/keys')
 
-export const createKey = (name: string) =>
+export const createKey = (name: string, scopes?: string[]) =>
   apiJSON<CreateKeyResponse>('/api/keys', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, scopes }),
   })
 
 export async function deleteKey(keyId: string) {
@@ -291,4 +323,47 @@ export async function deleteKey(keyId: string) {
     try { msg = JSON.parse(text).error ?? text } catch {}
     throw new Error(`HTTP ${resp.status}: ${msg}`)
   }
+}
+
+// ── Session auth (cookie-based) ─────────────────────────────────────────────
+
+export interface LoginResponse {
+  key_id: string
+  name: string
+  scopes: string[]
+  expires_in: number
+}
+
+/** Exchange an API key for an HttpOnly `jh_session` cookie. */
+export const login = (key: string) =>
+  apiJSON<LoginResponse>('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  })
+
+/** Clear the session cookie. Always resolves (204 is expected). */
+export async function logout() {
+  await apiFetch('/api/auth/logout', { method: 'POST' })
+}
+
+/** Returns the authenticated caller's `KeyInfo`, or throws on 401.
+ *  Unlike other calls, this one does NOT auto-redirect on 401 — the caller
+ *  (AuthGuard) uses the thrown error to decide. */
+export const getMe = () => apiJSON<KeyInfo>('/api/auth/me')
+
+/** Rotate the caller's own credential. Returns on 204; throws on error.
+ *  The existing session cookie remains valid afterwards (session is bound
+ *  to key_id, not to the hash). */
+export async function changePassword(newPassword: string) {
+  const resp = await apiFetch('/api/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ new_password: newPassword }),
+  })
+  if (resp.status === 204) return
+  const text = await resp.text()
+  let msg = text
+  try { msg = JSON.parse(text).error ?? text } catch {}
+  throw new Error(`HTTP ${resp.status}: ${msg}`)
 }

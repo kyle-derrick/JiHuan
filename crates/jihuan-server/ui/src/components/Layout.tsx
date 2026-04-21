@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard,
   Files,
@@ -8,8 +8,10 @@ import {
   Settings,
   HardDrive,
   Activity,
+  LogOut,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { logout } from '@/api'
 
 const nav = [
   { to: '/ui/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -22,6 +24,17 @@ const nav = [
 ]
 
 export default function Layout({ children }: { children: React.ReactNode }) {
+  const navigate = useNavigate()
+
+  const handleLogout = async () => {
+    try {
+      await logout()
+    } finally {
+      // Even if the server call fails we still want to leave this page.
+      navigate('/ui/login', { replace: true })
+    }
+  }
+
   return (
     <div className="flex h-screen bg-gray-50 text-gray-800 font-sans">
       {/* Sidebar */}
@@ -50,6 +63,15 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </NavLink>
           ))}
         </nav>
+        <div className="px-2 pb-3">
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-gray-100 hover:text-gray-900 transition-colors"
+          >
+            <LogOut size={16} />
+            退出登录
+          </button>
+        </div>
         <div className="px-5 py-3 border-t border-gray-200 text-xs text-gray-400">
           JiHuan Storage
         </div>

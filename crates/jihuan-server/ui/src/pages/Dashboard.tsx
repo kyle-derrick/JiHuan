@@ -45,9 +45,16 @@ export default function Dashboard() {
 
   useEffect(() => { load() }, [])
 
+  const logicalBytes = status?.logical_bytes ?? 0
   const diskBytes = status?.disk_usage_bytes ?? 0
+  // When /api/status is not yet loaded, fall back to summing per-block sizes
+  // so the dashboard is never blank between refreshes.
   const totalBlockSize = blocks?.blocks.reduce((acc, b) => acc + b.size, 0) ?? 0
   const displayDisk = diskBytes > 0 ? diskBytes : totalBlockSize
+  // Headroom = how much bigger raw uploads are than what's actually on disk.
+  // Can be negative on tiny datasets where block overhead dominates; we clip
+  // to >= 0 for display but annotate the case below.
+  const saved = logicalBytes - displayDisk
 
   return (
     <div>
@@ -81,16 +88,24 @@ export default function Dashboard() {
           icon={<Database size={20} />}
         />
         <StatCard
-          label="磁盘占用"
-          value={formatBytes(displayDisk)}
-          icon={<HardDrive size={20} />}
-          sub={diskBytes === 0 && totalBlockSize > 0 ? '（含未 seal）' : undefined}
+          label="文件逻辑总大小"
+          value={formatBytes(logicalBytes)}
+          icon={<Files size={20} />}
+          sub="上传的原始字节（压缩/去重前）"
         />
         <StatCard
-          label="去重比"
-          value={status ? `${status.dedup_ratio.toFixed(2)}x` : '—'}
-          icon={<Layers size={20} />}
-          sub={status && status.dedup_ratio > 1 ? `节省 ${((1 - 1/status.dedup_ratio) * 100).toFixed(1)}%` : undefined}
+          label="实际磁盘占用"
+          value={formatBytes(displayDisk)}
+          icon={<HardDrive size={20} />}
+          sub={
+            diskBytes === 0 && totalBlockSize > 0
+              ? '（含未 seal）'
+              : saved > 0
+                ? `节省 ${formatBytes(saved)}`
+                : saved < 0
+                  ? '< 文件大小：块开销占主导'
+                  : '含 block 头/尾 + 压缩'
+          }
         />
       </div>
 
@@ -107,9 +122,14 @@ export default function Dashboard() {
           sub={`压缩: ${status?.compression_algorithm ?? '—'} L${status?.compression_level ?? ''}`}
         />
         <StatCard
-          label="版本"
-          value={status?.version ?? '—'}
-          icon={<Database size={20} />}
+          label="去重比"
+          value={status ? `${status.dedup_ratio.toFixed(2)}x` : '—'}
+          icon={<Layers size={20} />}
+          sub={
+            status && status.dedup_ratio > 1
+              ? `节省 ${((1 - 1 / status.dedup_ratio) * 100).toFixed(1)}%`
+              : '逻辑 / 实际'
+          }
         />
         <StatCard
           label="Active / Sealed"
@@ -118,6 +138,44 @@ export default function Dashboard() {
           sub="未 seal / 已 seal"
         />
       </div>
+
+      {status && status.max_storage_bytes != null && (() => {
+        const cap = status.max_storage_bytes!
+        const used = displayDisk
+        const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0
+        // Color switches based on fill: green < 70%, amber < 90%, red otherwise.
+        const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
+        return (
+          <div className="bg-white rounded-xl border border-gray-200 p-5 mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-base font-semibold text-gray-800">存储配额</h2>
+              <span className="text-xs text-gray-500 font-mono">
+                {formatBytes(used)} / {formatBytes(cap)} ({pct.toFixed(1)}%)
+              </span>
+            </div>
+            <div className="h-2.5 bg-gray-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full ${barColor} rounded-full transition-all`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            {pct >= 90 && (
+              <p className="mt-2 text-xs text-red-600">
+                已接近上限，新上传将被拒绝并返回 507 Insufficient Storage。
+              </p>
+            )}
+          </div>
+        )
+      })()}
+
+      {status && status.max_storage_bytes == null && (
+        <div className="bg-white rounded-xl border border-gray-200 p-4 mb-4 text-xs text-gray-500">
+          <span className="font-semibold text-gray-700">存储配额：</span>未配置（无限制）。
+          可在 <code className="font-mono">config/*.toml</code> 的
+          <code className="font-mono">[storage]</code> 下设置
+          <code className="font-mono"> max_storage_bytes = …</code>
+        </div>
+      )}
 
       {status && (
         <div className="bg-white rounded-xl border border-gray-200 p-5">

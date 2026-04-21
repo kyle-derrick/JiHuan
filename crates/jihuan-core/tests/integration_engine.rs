@@ -129,6 +129,65 @@ fn test_large_multi_chunk_file() {
 }
 
 #[test]
+fn test_get_range_matches_full_read() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+    cfg.storage.chunk_size = 4096; // 4KB chunks → many boundaries to stress
+    let engine = Engine::open(cfg).unwrap();
+
+    // ~100KB of deterministic non-repeating-per-chunk content
+    let data: Vec<u8> = (0..100u32 * 1024)
+        .map(|i| ((i * 31) % 251) as u8)
+        .collect();
+    let id = engine.put_bytes(&data, "range.bin", None).unwrap();
+
+    // Full range
+    assert_eq!(engine.get_range(&id, 0, data.len() as u64 - 1).unwrap(), data);
+
+    // Head — first chunk only
+    assert_eq!(
+        engine.get_range(&id, 0, 1023).unwrap(),
+        data[0..1024].to_vec()
+    );
+
+    // Tail — last 500 bytes
+    let start = data.len() as u64 - 500;
+    let end = data.len() as u64 - 1;
+    assert_eq!(
+        engine.get_range(&id, start, end).unwrap(),
+        data[start as usize..=end as usize].to_vec()
+    );
+
+    // Spanning multiple chunks with non-aligned bounds
+    let start = 4096 - 37;
+    let end = 4096 * 5 + 19;
+    assert_eq!(
+        engine.get_range(&id, start as u64, end as u64).unwrap(),
+        data[start..=end].to_vec()
+    );
+
+    // End clamped to file size
+    let end_request = (data.len() as u64) + 10_000;
+    assert_eq!(
+        engine.get_range(&id, 0, end_request).unwrap(),
+        data,
+        "end past EOF should be clamped, not error"
+    );
+
+    // Invalid: start >= file_size
+    assert!(matches!(
+        engine.get_range(&id, data.len() as u64, data.len() as u64 + 100),
+        Err(JiHuanError::InvalidArgument(_))
+    ));
+
+    // Invalid: start > end
+    assert!(matches!(
+        engine.get_range(&id, 100, 50),
+        Err(JiHuanError::InvalidArgument(_))
+    ));
+}
+
+#[test]
 fn test_chunk_count_metadata() {
     let tmp = tempdir().unwrap();
     let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());

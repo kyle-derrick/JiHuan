@@ -15,6 +15,9 @@ gc_threshold       = 0.7
 gc_interval_secs   = 300
 max_open_block_files = 64
 verify_on_read     = true
+# Hard cap on total on-disk bytes. Uncomment to enable; omit for unlimited.
+# Uploads that would exceed this are rejected with HTTP 507.
+# max_storage_bytes  = 10737418240  # e.g. 10 GB
 
 [server]
 http_addr    = "0.0.0.0:8080"
@@ -24,6 +27,6 @@ enable_access_log = true
 
 [auth]
 # Set enabled = true to require API keys for all requests (except /api/status and /ui)
-enabled = false
+enabled = true
 # Routes exempt from authentication (prefix match)
 exempt_routes = ["/api/status", "/ui"]

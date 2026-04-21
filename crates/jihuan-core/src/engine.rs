@@ -165,6 +165,19 @@ impl Engine {
     ) -> Result<String> {
         let t0 = std::time::Instant::now();
 
+        // Quota check (see `put_stream` for rationale). Here we do know the
+        // incoming size so we can compare `used + file_size > cap` and
+        // populate the `needed` field of the error.
+        if let Some(cap) = self.config.storage.max_storage_bytes {
+            let used = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
+            if used.saturating_add(file_size) > cap {
+                return Err(JiHuanError::StorageFull {
+                    available: cap.saturating_sub(used),
+                    needed: file_size,
+                });
+            }
+        }
+
         // Read entire content into memory.
         let mut buf = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
         reader.read_to_end(&mut buf).map_err(JiHuanError::Io)?;
@@ -222,6 +235,25 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let chunk_size = self.config.storage.chunk_size as usize;
         let algo = self.config.storage.hash_algorithm;
+
+        // Pre-upload quota check. Performed once per call: we measure current
+        // on-disk bytes and reject when already at/over the configured cap.
+        // We don't know the incoming stream length here (it may come from an
+        // axum body), so "needed" is reported as 0 — the `available` figure
+        // still gives the operator actionable context in the error.
+        //
+        // Known limitation: concurrent uploads can each observe the same
+        // `available` and all proceed. This is acceptable for a single-tenant
+        // deployment; a precise enforcer would use an atomic reservation.
+        if let Some(cap) = self.config.storage.max_storage_bytes {
+            let used = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
+            if used >= cap {
+                return Err(JiHuanError::StorageFull {
+                    available: 0,
+                    needed: 0,
+                });
+            }
+        }
 
         let file_id = new_id();
         let create_time = now_secs();
@@ -596,6 +628,132 @@ impl Engine {
         self.meta.get_file(file_id)
     }
 
+    /// Retrieve a byte range `[start, end]` (inclusive on both ends) of a file.
+    ///
+    /// Only the chunks that overlap the requested range are fetched and
+    /// decompressed; chunks outside the range are skipped entirely. This is
+    /// the primitive backing HTTP `Range: bytes=…` / `curl -C -` / `aria2c -s`.
+    ///
+    /// Returns `InvalidArgument` if the range is unsatisfiable (`start > end`,
+    /// or `start >= file_size`).
+    pub fn get_range(&self, file_id: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        if start > end {
+            return Err(JiHuanError::InvalidArgument(format!(
+                "range start {} > end {}",
+                start, end
+            )));
+        }
+
+        let t0 = std::time::Instant::now();
+
+        let file_meta = self
+            .meta
+            .get_file(file_id)?
+            .ok_or_else(|| JiHuanError::NotFound(format!("File '{}' not found", file_id)))?;
+
+        if file_meta.file_size == 0 || start >= file_meta.file_size {
+            return Err(JiHuanError::InvalidArgument(format!(
+                "range start {} is beyond file size {}",
+                start, file_meta.file_size
+            )));
+        }
+        // Clamp end to last valid byte
+        let end = end.min(file_meta.file_size - 1);
+        let wanted_len = (end - start + 1) as usize;
+
+        let verify = self.config.storage.verify_on_read;
+
+        // Chunks are ordered by index
+        let mut sorted_chunks = file_meta.chunks.clone();
+        sorted_chunks.sort_by_key(|c| c.index);
+
+        let mut result = Vec::with_capacity(wanted_len);
+        let mut cursor: u64 = 0; // byte position of the first byte in the current chunk
+
+        for chunk_meta in &sorted_chunks {
+            let chunk_start = cursor;
+            let chunk_end = cursor + chunk_meta.original_size; // exclusive
+            cursor = chunk_end;
+
+            if chunk_end <= start {
+                continue; // entirely before requested range
+            }
+            if chunk_start > end {
+                break; // entirely after requested range
+            }
+
+            // Fetch the full chunk bytes (active cache or sealed block)
+            let chunk_data = self.read_chunk_bytes(chunk_meta, verify)?;
+
+            // Slice the overlap
+            let lo = start.saturating_sub(chunk_start) as usize;
+            let hi = ((end + 1).min(chunk_end) - chunk_start) as usize;
+            result.extend_from_slice(&chunk_data[lo..hi]);
+        }
+
+        metrics::counter!("jihuan_gets_total").increment(1);
+        metrics::counter!("jihuan_bytes_read_total").increment(result.len() as u64);
+        metrics::histogram!("jihuan_get_duration_seconds").record(t0.elapsed().as_secs_f64());
+
+        Ok(result)
+    }
+
+    /// Helper: fetch the full bytes of a single chunk, honoring the active-block
+    /// chunk cache and the sealed-block reader cache. Used by both `get_bytes`
+    /// and `get_range`.
+    fn read_chunk_bytes(
+        &self,
+        chunk_meta: &crate::metadata::types::ChunkMeta,
+        verify: bool,
+    ) -> Result<Vec<u8>> {
+        // Fast path: active (unsealed) block's in-memory cache
+        {
+            let guard = self.active_writer.lock();
+            if let Some(ab) = guard.as_ref() {
+                if ab.writer.block_id() == chunk_meta.block_id {
+                    if let Some(cached) = ab.chunk_cache.get(&chunk_meta.offset) {
+                        if verify && !chunk_meta.hash.is_empty() {
+                            let actual =
+                                hash_chunk(&cached.data, self.config.storage.hash_algorithm);
+                            if actual != chunk_meta.hash {
+                                return Err(JiHuanError::ChecksumMismatch {
+                                    expected: chunk_meta.hash.clone(),
+                                    actual,
+                                });
+                            }
+                        }
+                        return Ok(cached.data.clone());
+                    }
+                }
+            }
+        }
+
+        // Slow path: sealed block via reader cache
+        let block_info = self.meta.get_block(&chunk_meta.block_id)?.ok_or_else(|| {
+            JiHuanError::NotFound(format!(
+                "Block '{}' not found for chunk at offset {}",
+                chunk_meta.block_id, chunk_meta.offset
+            ))
+        })?;
+
+        let data = self.read_chunk_from_block(
+            std::path::Path::new(&block_info.path),
+            chunk_meta.offset,
+            verify,
+        )?;
+
+        if verify && !chunk_meta.hash.is_empty() {
+            let actual = hash_chunk(&data, self.config.storage.hash_algorithm);
+            if actual != chunk_meta.hash {
+                return Err(JiHuanError::ChecksumMismatch {
+                    expected: chunk_meta.hash.clone(),
+                    actual,
+                });
+            }
+        }
+        Ok(data)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Delete path
     // ─────────────────────────────────────────────────────────────────────────
@@ -659,18 +817,28 @@ impl Engine {
 
         let disk_usage_bytes = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
 
-        // Rough dedup ratio: if disk is 0 treat as 1x
+        // Logical bytes = sum of user-visible file sizes. Using file metadata
+        // (not block sizes) because that's the number operators expect to see
+        // — "how much data have I uploaded" — and it's also the correct
+        // numerator for the dedup ratio: identical files contribute their
+        // full size to `logical` but share a single set of on-disk chunks.
+        let logical_bytes: u64 = self
+            .meta
+            .list_all_files()?
+            .iter()
+            .map(|f| f.file_size)
+            .sum();
+
         let dedup_ratio = if disk_usage_bytes == 0 {
             1.0
         } else {
-            // Sum original sizes of all blocks as a proxy for logical bytes
-            let logical: u64 = self.meta.list_all_blocks()?.iter().map(|b| b.size).sum();
-            (logical as f64 / disk_usage_bytes as f64).max(1.0)
+            (logical_bytes as f64 / disk_usage_bytes as f64).max(1.0)
         };
 
         Ok(crate::metrics::EngineStats {
             file_count,
             block_count,
+            logical_bytes,
             disk_usage_bytes,
             dedup_ratio,
         })

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Settings2, RefreshCw, Eye, EyeOff } from 'lucide-react'
-import { getStatus, getStoredApiKey, setStoredApiKey, getConfig } from '@/api'
+import { Settings2, RefreshCw, Eye, EyeOff, Lock } from 'lucide-react'
+import { getStatus, getStoredApiKey, setStoredApiKey, getConfig, changePassword } from '@/api'
 import { formatBytes } from '@/lib/utils'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -40,6 +40,35 @@ export default function Settings() {
   const [config, setConfig] = useState<AnyObj | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+
+  // Password change state — rotates the authenticated caller's own credential.
+  const [pw1, setPw1] = useState('')
+  const [pw2, setPw2] = useState('')
+  const [pwBusy, setPwBusy] = useState(false)
+  const [pwMsg, setPwMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+
+  const submitPassword = async () => {
+    setPwMsg(null)
+    if (pw1.length < 8) {
+      setPwMsg({ kind: 'err', text: '密码至少 8 个字符' })
+      return
+    }
+    if (pw1 !== pw2) {
+      setPwMsg({ kind: 'err', text: '两次输入不一致' })
+      return
+    }
+    setPwBusy(true)
+    try {
+      await changePassword(pw1)
+      setPw1('')
+      setPw2('')
+      setPwMsg({ kind: 'ok', text: '密码已更新。下次登录使用新密码（当前会话继续有效）。' })
+    } catch (e) {
+      setPwMsg({ kind: 'err', text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setPwBusy(false)
+    }
+  }
 
   const loadAll = async () => {
     setLoading(true)
@@ -140,6 +169,54 @@ export default function Settings() {
             className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700"
           >
             {saved ? '已保存 ✓' : '保存'}
+          </button>
+        </div>
+      </div>
+
+      {/* Change password */}
+      <div className="bg-white rounded-xl border border-gray-200 p-5 mb-5 max-w-2xl">
+        <div className="flex items-center gap-2 mb-3">
+          <Lock size={14} className="text-gray-500" />
+          <h2 className="text-sm font-semibold text-gray-800">修改登录密码</h2>
+        </div>
+        <p className="text-xs text-gray-500 mb-3">
+          轮换当前登录账户的凭证。保存后，启动时打印的 bootstrap key（或旧密码）立即失效；
+          当前浏览器会话保留，下次登录需使用新密码。
+        </p>
+        <div className="space-y-2.5">
+          <input
+            type="password"
+            value={pw1}
+            onChange={(e) => setPw1(e.target.value)}
+            placeholder="新密码（≥8 字符）"
+            autoComplete="new-password"
+            className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 font-mono"
+          />
+          <input
+            type="password"
+            value={pw2}
+            onChange={(e) => setPw2(e.target.value)}
+            placeholder="再次输入新密码"
+            autoComplete="new-password"
+            className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 font-mono"
+          />
+          {pwMsg && (
+            <div
+              className={
+                pwMsg.kind === 'ok'
+                  ? 'text-xs px-3 py-2 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200'
+                  : 'text-xs px-3 py-2 rounded-md bg-red-50 text-red-700 border border-red-200 break-all'
+              }
+            >
+              {pwMsg.text}
+            </div>
+          )}
+          <button
+            onClick={submitPassword}
+            disabled={pwBusy}
+            className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {pwBusy ? '保存中…' : '保存新密码'}
           </button>
         </div>
       </div>

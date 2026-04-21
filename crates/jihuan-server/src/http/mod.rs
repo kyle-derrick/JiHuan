@@ -4,8 +4,9 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post},
-    Router,
+    Extension, Router,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 
 use jihuan_core::Engine;
 
@@ -14,10 +15,11 @@ pub mod auth;
 pub mod files;
 pub mod ui;
 
-pub fn router(engine: Arc<Engine>) -> Router {
+pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> Router {
     let auth_state = auth::AuthState {
         engine: engine.clone(),
         config: engine.config().auth.clone(),
+        sessions: auth::SessionStore::new(),
     };
 
     // Body limit for uploads: None in config ⇒ unlimited (disable).
@@ -36,7 +38,22 @@ pub fn router(engine: Arc<Engine>) -> Router {
         )
         .layer(upload_limit_layer);
 
-    Router::new()
+    // `/api/auth/*` endpoints use `State<AuthState>`, unlike the rest of the
+    // app which uses `State<Arc<Engine>>`. Build them as a self-contained
+    // router (middleware applied, state reduced to `Router<()>`) and merge at
+    // the top level alongside the main engine-stated router.
+    let auth_router: Router = Router::new()
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/change-password", post(auth::change_password))
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::auth_middleware,
+        ))
+        .with_state(auth_state.clone());
+
+    let main_router: Router = Router::new()
         .merge(upload_router)
         .route("/api/v1/files/:file_id/meta", get(files::get_file_meta))
         .route(
@@ -52,6 +69,9 @@ pub fn router(engine: Arc<Engine>) -> Router {
             get(admin::get_block_detail).delete(admin::delete_block),
         )
         .route("/api/config", get(admin::get_config))
+        // Same-origin Prometheus metrics proxy for UI and integrations that
+        // cannot reach the standalone `:9090/metrics` port (CORS / firewall).
+        .route("/api/metrics", get(admin::render_metrics))
         // Key management routes
         .route("/api/keys", post(auth::create_key).get(auth::list_keys))
         .route("/api/keys/:key_id", delete(auth::delete_key))
@@ -65,5 +85,9 @@ pub fn router(engine: Arc<Engine>) -> Router {
             auth_state,
             auth::auth_middleware,
         ))
-        .with_state(engine)
+        // Share the Prometheus handle (if available) with handlers via Extension
+        .layer(Extension(admin::MetricsHandle(metrics_handle)))
+        .with_state(engine);
+
+    Router::new().merge(auth_router).merge(main_router)
 }

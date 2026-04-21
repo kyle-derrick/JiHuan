@@ -148,6 +148,18 @@ pub struct StorageConfig {
     /// Enable data integrity verification on read
     #[serde(default = "default_true")]
     pub verify_on_read: bool,
+
+    /// Hard quota on total bytes stored under `data_dir`. `None` (the TOML
+    /// default when the key is omitted) means unlimited — the engine will
+    /// keep accepting uploads until the underlying filesystem runs out of
+    /// space. When set, uploads that would push the current disk usage
+    /// above this value are rejected up-front with `StorageFull`.
+    ///
+    /// Tip: this is a soft cap — the check runs once at the start of each
+    /// upload. Concurrent uploads can each see the same "available" number
+    /// and all succeed, so leave headroom below the real filesystem limit.
+    #[serde(default)]
+    pub max_storage_bytes: Option<u64>,
 }
 
 /// Server configuration
@@ -176,23 +188,56 @@ pub struct ServerConfig {
     /// Enable request/response logging
     #[serde(default = "default_true")]
     pub enable_access_log: bool,
+
+    /// Allowed CORS origins. Empty (default) = same-origin only; in that
+    /// mode no `Access-Control-Allow-Origin` header is emitted. Use
+    /// explicit origins like `https://ui.example.com` for cross-site UIs.
+    /// The sentinel `"*"` enables `Any` (dev only — never combine with
+    /// credentials).
+    #[serde(default = "default_cors_origins")]
+    pub cors_origins: Vec<String>,
 }
 
 /// Authentication configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Whether API key authentication is required
-    #[serde(default = "default_false")]
+    /// Whether API key authentication is required.
+    /// Default: **true**. On first boot with no keys, the server generates a
+    /// bootstrap admin key and prints it once to stdout.
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Routes that are exempt from authentication (prefix match)
-    /// Default: ["/api/status", "/ui"]
+    /// Routes that are exempt from authentication (prefix match).
+    /// Defaults to the endpoints strictly needed before the user can
+    /// authenticate: `/healthz`, `/readyz`, `/api/auth/login`, `/api/metrics`,
+    /// plus the SPA bundle at `/ui` and the public status page.
     #[serde(default = "default_exempt_routes")]
     pub exempt_routes: Vec<String>,
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            exempt_routes: default_exempt_routes(),
+        }
+    }
+}
+
 fn default_exempt_routes() -> Vec<String> {
-    vec!["/api/status".to_string(), "/ui".to_string()]
+    vec![
+        "/healthz".to_string(),
+        "/readyz".to_string(),
+        "/api/auth/login".to_string(),
+        "/api/metrics".to_string(),
+        "/api/status".to_string(),
+        "/ui".to_string(),
+    ]
+}
+
+/// Default for [`ServerConfig::cors_origins`]: empty = same-origin only.
+fn default_cors_origins() -> Vec<String> {
+    Vec::new()
 }
 
 /// Top-level application configuration
@@ -341,6 +386,7 @@ impl ConfigTemplate {
                 gc_interval_secs: 300,
                 max_open_block_files: 64,
                 verify_on_read: true,
+                max_storage_bytes: None,
             },
             server: ServerConfig {
                 http_addr: default_http_addr(),
@@ -349,6 +395,7 @@ impl ConfigTemplate {
                 worker_threads: default_worker_threads(),
                 max_body_size: None,
                 enable_access_log: true,
+                cors_origins: default_cors_origins(),
             },
             auth: AuthConfig::default(),
         }
