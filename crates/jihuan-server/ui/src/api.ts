@@ -367,3 +367,50 @@ export async function changePassword(newPassword: string) {
   try { msg = JSON.parse(text).error ?? text } catch {}
   throw new Error(`HTTP ${resp.status}: ${msg}`)
 }
+
+// ── Audit log (Phase 2.6) ────────────────────────────────────────────────────
+
+/** Matches `jihuan_core::metadata::types::AuditResult`.
+ *  Serde serializes this enum with `#[serde(tag = "kind", rename_all = "snake_case")]`. */
+export type AuditResult =
+  | { kind: 'ok' }
+  | { kind: 'denied'; reason: string }
+  | { kind: 'error'; message: string }
+
+/** Matches `jihuan_core::metadata::types::AuditEvent`. */
+export interface AuditEvent {
+  ts: number
+  actor_key_id: string | null
+  actor_ip: string | null
+  action: string
+  target: string | null
+  result: AuditResult
+  http_status: number | null
+}
+
+export interface AuditListResponse {
+  events: AuditEvent[]
+  count: number
+}
+
+export interface AuditQuery {
+  since?: number
+  until?: number
+  /** Exact match against `actor_key_id`. */
+  actor?: string
+  /** Prefix match on `action` (e.g. `auth.` returns every auth event). */
+  action?: string
+  /** Page size cap. Default 200, max 1000 (server-enforced). */
+  limit?: number
+}
+
+export function listAudit(q: AuditQuery = {}): Promise<AuditListResponse> {
+  const params = new URLSearchParams()
+  if (q.since != null) params.set('since', String(q.since))
+  if (q.until != null) params.set('until', String(q.until))
+  if (q.actor) params.set('actor', q.actor)
+  if (q.action) params.set('action', q.action)
+  if (q.limit != null) params.set('limit', String(q.limit))
+  const qs = params.toString()
+  return apiJSON<AuditListResponse>(`/api/admin/audit${qs ? `?${qs}` : ''}`)
+}

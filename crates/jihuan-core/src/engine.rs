@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use crate::block::format::ChunkEntry;
 use crate::block::reader::BlockReader;
 use crate::block::writer::{BlockSummary, BlockWriter};
-use crate::chunking::{chunk_data, RawChunk};
+use crate::chunking::RawChunk;
 use crate::config::AppConfig;
 use crate::dedup::hash_chunk;
 use crate::error::{JiHuanError, Result};
@@ -75,11 +75,93 @@ struct CachedChunk {
     data: Vec<u8>,
 }
 
+/// Default byte budget for the per-active-block chunk cache. Phase 6b-P6:
+/// previously this was unbounded, which meant a 1 GB active block held
+/// 1 GB of uncompressed chunk data in RAM until seal. 64 MB keeps the
+/// common "read-your-write" case O(1) while capping worst-case RSS.
+const DEFAULT_ACTIVE_CHUNK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Resolve the active chunk-cache budget. Tests set `JIHUAN_ACTIVE_CHUNK_CACHE_BYTES`
+/// to a small value to exercise the eviction + pread-fallback path without
+/// having to write tens of MB per assertion. Production callers never set it.
+fn active_chunk_cache_budget() -> usize {
+    std::env::var("JIHUAN_ACTIVE_CHUNK_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_ACTIVE_CHUNK_CACHE_BYTES)
+}
+
+/// LRU-ordered, byte-budgeted cache of recently-written chunks for the
+/// active (unsealed) block. On eviction the chunk data is **not** lost —
+/// reads just fall through to a direct pread against the active block
+/// file (see [`Engine::read_active_chunk_from_disk`]).
+struct BoundedChunkCache {
+    inner: lru::LruCache<u64, CachedChunk>,
+    bytes_used: usize,
+    max_bytes: usize,
+}
+
+impl BoundedChunkCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: lru::LruCache::unbounded(),
+            bytes_used: 0,
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn insert(&mut self, offset: u64, chunk: CachedChunk) {
+        let sz = chunk.data.len();
+        if sz == 0 {
+            // Empty-chunk case (empty files) — record presence without
+            // consuming byte budget. Useful for the `put_stream` empty-file
+            // path which still emits one zero-byte chunk.
+            self.inner.put(offset, chunk);
+            return;
+        }
+        if sz > self.max_bytes {
+            // A single chunk bigger than the whole budget — we refuse to
+            // cache it rather than evict everything. Reads will fall back
+            // to pread on the active block file.
+            return;
+        }
+        // Evict until there's room for the new entry.
+        while self.bytes_used + sz > self.max_bytes {
+            match self.inner.pop_lru() {
+                Some((_, c)) => {
+                    self.bytes_used = self.bytes_used.saturating_sub(c.data.len());
+                }
+                None => break,
+            }
+        }
+        if let Some(old) = self.inner.put(offset, chunk) {
+            self.bytes_used = self.bytes_used.saturating_sub(old.data.len());
+        }
+        self.bytes_used += sz;
+    }
+
+    fn get(&mut self, offset: &u64) -> Option<&CachedChunk> {
+        self.inner.get(offset)
+    }
+
+    #[cfg(test)]
+    fn bytes_used(&self) -> usize {
+        self.bytes_used
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 struct ActiveBlock {
     writer: BlockWriter,
-    /// In-memory copy of every chunk written to this block so far.
-    /// Keyed by `data_offset` (same key used in ChunkMeta).
-    chunk_cache: std::collections::HashMap<u64, CachedChunk>,
+    /// Byte-budgeted cache of chunks written to this block. Eviction
+    /// falls through to a pread on the block file — see
+    /// [`Engine::read_active_chunk_from_disk`].
+    chunk_cache: BoundedChunkCache,
 }
 
 impl Engine {
@@ -194,86 +276,30 @@ impl Engine {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Store a file from a byte slice. Returns the assigned file_id.
+    ///
+    /// Phase 6b-P1: this now delegates to [`put_stream`] so the in-RAM
+    /// footprint is bounded to one `chunk_size` regardless of `data.len()`,
+    /// unifying the historical `put_reader` / `put_stream` paths that both
+    /// used to chunk-then-write. The byte-slice variant keeps its precise
+    /// quota check (we know the exact size, unlike a live `Read`).
     pub fn put_bytes(
         &self,
         data: &[u8],
         file_name: &str,
         content_type: Option<&str>,
     ) -> Result<String> {
-        self.put_reader(
-            &mut std::io::Cursor::new(data),
-            data.len() as u64,
-            file_name,
-            content_type,
-        )
-    }
-
-    /// Store a file from a reader. Returns the assigned file_id.
-    pub fn put_reader<R: Read>(
-        &self,
-        reader: &mut R,
-        file_size: u64,
-        file_name: &str,
-        content_type: Option<&str>,
-    ) -> Result<String> {
-        let t0 = std::time::Instant::now();
-
-        // Quota check (see `put_stream` for rationale). Here we do know the
-        // incoming size so we can compare `used + file_size > cap` and
-        // populate the `needed` field of the error.
+        // Precise quota check — we know the exact payload size here.
         if let Some(cap) = self.config.storage.max_storage_bytes {
             let used = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
-            if used.saturating_add(file_size) > cap {
+            let needed = data.len() as u64;
+            if used.saturating_add(needed) > cap {
                 return Err(JiHuanError::StorageFull {
                     available: cap.saturating_sub(used),
-                    needed: file_size,
+                    needed,
                 });
             }
         }
-
-        // Read entire content into memory.
-        let mut buf = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
-        reader.read_to_end(&mut buf).map_err(JiHuanError::Io)?;
-        let buf_len = buf.len() as u64;
-
-        let file_id = new_id();
-        let create_time = now_secs();
-        let partition_id = current_partition_id(self.config.storage.time_partition_hours);
-
-        let chunks = chunk_data(
-            &buf,
-            self.config.storage.chunk_size as usize,
-            self.config.storage.hash_algorithm,
-        );
-
-        let mut chunk_metas = Vec::with_capacity(chunks.len());
-        for raw_chunk in &chunks {
-            let cm = self.store_chunk(raw_chunk)?;
-            chunk_metas.push(cm);
-        }
-
-        let file_meta = FileMeta {
-            file_id: file_id.clone(),
-            file_name: file_name.to_string(),
-            file_size: buf_len,
-            create_time,
-            partition_id,
-            chunks: chunk_metas,
-            content_type: content_type.map(|s| s.to_string()),
-        };
-
-        // WAL before metadata commit
-        self.wal.lock().append(WalOperation::InsertFile {
-            file_id: file_id.clone(),
-        })?;
-        self.meta.insert_file(&file_meta)?;
-
-        // Metrics
-        metrics::counter!("jihuan_puts_total").increment(1);
-        metrics::counter!("jihuan_bytes_written_total").increment(buf_len);
-        metrics::histogram!("jihuan_put_duration_seconds").record(t0.elapsed().as_secs_f64());
-
-        Ok(file_id)
+        self.put_stream(std::io::Cursor::new(data), file_name, content_type)
     }
 
     /// Store a file from a streaming reader. Memory usage is bounded to
@@ -482,7 +508,7 @@ impl Engine {
 
             *guard = Some(ActiveBlock {
                 writer,
-                chunk_cache: std::collections::HashMap::new(),
+                chunk_cache: BoundedChunkCache::new(active_chunk_cache_budget()),
             });
         }
 
@@ -677,6 +703,19 @@ impl Engine {
         Self::repair_static(&self.meta, &self.config.storage.data_dir)
     }
 
+    /// Test-only: wipe the active block's chunk cache to force the next read
+    /// through the disk-fallback path. Used by Phase 6b-P6 eviction tests so
+    /// we don't need to write tens of MB to trigger eviction organically.
+    #[cfg(test)]
+    pub(crate) fn clear_active_chunk_cache_for_test(&self) {
+        let mut guard = self.active_writer.lock();
+        if let Some(ab) = guard.as_mut() {
+            ab.chunk_cache = BoundedChunkCache::new(
+                ab.chunk_cache.max_bytes.max(DEFAULT_ACTIVE_CHUNK_CACHE_BYTES),
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Read path
     // ─────────────────────────────────────────────────────────────────────────
@@ -697,69 +736,48 @@ impl Engine {
         let mut result = Vec::with_capacity(file_meta.file_size as usize);
         let verify = self.config.storage.verify_on_read;
 
-        // Chunks are ordered by index; read them in order
+        // Chunks are ordered by index; read them in order.
         let mut sorted_chunks = file_meta.chunks.clone();
         sorted_chunks.sort_by_key(|c| c.index);
 
         for chunk_meta in &sorted_chunks {
-            // ── Fast path: chunk is in the active (unsealed) block ──────────
-            {
-                let guard = self.active_writer.lock();
-                if let Some(ab) = guard.as_ref() {
-                    if ab.writer.block_id() == chunk_meta.block_id {
-                        if let Some(cached) = ab.chunk_cache.get(&chunk_meta.offset) {
-                            // Verify hash if needed
-                            if verify && !chunk_meta.hash.is_empty() {
-                                let actual =
-                                    hash_chunk(&cached.data, self.config.storage.hash_algorithm);
-                                if actual != chunk_meta.hash {
-                                    return Err(JiHuanError::ChecksumMismatch {
-                                        expected: chunk_meta.hash.clone(),
-                                        actual,
-                                    });
-                                }
-                            }
-                            result.extend_from_slice(&cached.data);
-                            continue; // next chunk
-                        }
-                    }
-                }
-            } // drop active_writer lock before taking reader_cache lock
-
-            // ── Slow path: chunk is in a sealed block ────────────────────────
-            let block_info = self.meta.get_block(&chunk_meta.block_id)?.ok_or_else(|| {
-                JiHuanError::NotFound(format!(
-                    "Block '{}' not found for file '{}'",
-                    chunk_meta.block_id, file_id
-                ))
-            })?;
-
-            let chunk_data = self.read_chunk_from_block(
-                std::path::Path::new(&block_info.path),
-                chunk_meta.offset,
-                verify,
-            )?;
-
-            // Verify content hash
-            if verify && !chunk_meta.hash.is_empty() {
-                let actual_hash = hash_chunk(&chunk_data, self.config.storage.hash_algorithm);
-                if actual_hash != chunk_meta.hash {
-                    return Err(JiHuanError::ChecksumMismatch {
-                        expected: chunk_meta.hash.clone(),
-                        actual: actual_hash,
-                    });
-                }
-            }
-
-            result.extend_from_slice(&chunk_data);
+            let data = self.read_chunk_bytes(chunk_meta, verify)?;
+            result.extend_from_slice(&data);
         }
 
-        // Metrics
         metrics::counter!("jihuan_gets_total").increment(1);
         metrics::counter!("jihuan_bytes_read_total").increment(result.len() as u64);
         metrics::histogram!("jihuan_get_duration_seconds").record(t0.elapsed().as_secs_f64());
 
         Ok(result)
+    }
+
+    /// Read a single chunk directly from the **active (unsealed)** block file.
+    ///
+    /// Used when the in-memory chunk cache has evicted this chunk to respect
+    /// the byte budget (Phase 6b-P6). Because the block has no footer yet we
+    /// can't go through `BlockReader`; instead we open a fresh read handle,
+    /// seek to the known offset, read exactly `compressed_size` bytes, and
+    /// decompress using the engine's configured algorithm.
+    ///
+    /// The writer must have been flushed before this runs — the caller in
+    /// `read_chunk_bytes` takes care of that under the `active_writer` lock.
+    fn read_active_chunk_from_disk(
+        &self,
+        block_path: &std::path::Path,
+        chunk_meta: &crate::metadata::types::ChunkMeta,
+    ) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(block_path).map_err(JiHuanError::Io)?;
+        f.seek(SeekFrom::Start(chunk_meta.offset))
+            .map_err(JiHuanError::Io)?;
+        let mut compressed = vec![0u8; chunk_meta.compressed_size as usize];
+        f.read_exact(&mut compressed).map_err(JiHuanError::Io)?;
+        crate::compression::decompress(
+            &compressed,
+            self.config.storage.compression_algorithm,
+            chunk_meta.original_size as usize,
+        )
     }
 
     /// Read a single chunk from a sealed block file, using the LRU reader cache.
@@ -897,11 +915,17 @@ impl Engine {
         chunk_meta: &crate::metadata::types::ChunkMeta,
         verify: bool,
     ) -> Result<Vec<u8>> {
-        // Fast path: active (unsealed) block's in-memory cache
-        {
-            let guard = self.active_writer.lock();
-            if let Some(ab) = guard.as_ref() {
-                if ab.writer.block_id() == chunk_meta.block_id {
+        // ── Fast path: active (unsealed) block's in-memory cache ────────────
+        //
+        // We also capture the on-disk path under the same lock so that, on a
+        // cache miss, we can fall through to a direct pread without sealing
+        // the block (Phase 6b-P6). Capturing the path + flushing the writer
+        // under the same lock is critical: it guarantees every cached byte
+        // is durable on disk by the time we open a fresh read handle.
+        let active_miss: Option<std::path::PathBuf> = {
+            let mut guard = self.active_writer.lock();
+            match guard.as_mut() {
+                Some(ab) if ab.writer.block_id() == chunk_meta.block_id => {
                     if let Some(cached) = ab.chunk_cache.get(&chunk_meta.offset) {
                         if verify && !chunk_meta.hash.is_empty() {
                             let actual =
@@ -915,11 +939,29 @@ impl Engine {
                         }
                         return Ok(cached.data.clone());
                     }
+                    // Cache miss: flush and hand back the path for a pread.
+                    ab.writer.flush()?;
+                    Some(ab.writer.path().to_path_buf())
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(active_path) = active_miss {
+            let data = self.read_active_chunk_from_disk(&active_path, chunk_meta)?;
+            if verify && !chunk_meta.hash.is_empty() {
+                let actual = hash_chunk(&data, self.config.storage.hash_algorithm);
+                if actual != chunk_meta.hash {
+                    return Err(JiHuanError::ChecksumMismatch {
+                        expected: chunk_meta.hash.clone(),
+                        actual,
+                    });
                 }
             }
+            return Ok(data);
         }
 
-        // Slow path: sealed block via reader cache
+        // ── Slow path: sealed block via reader cache ────────────────────────
         let block_info = self.meta.get_block(&chunk_meta.block_id)?.ok_or_else(|| {
             JiHuanError::NotFound(format!(
                 "Block '{}' not found for chunk at offset {}",
@@ -1128,6 +1170,57 @@ mod tests {
         assert_eq!(first.file_count, second.file_count);
         assert_eq!(first.disk_usage_bytes, second.disk_usage_bytes);
         assert_eq!(first.logical_bytes, second.logical_bytes);
+    }
+
+    // ── Phase 6b-P6: bounded active-block chunk cache ─────────────────────
+
+    #[test]
+    fn test_bounded_cache_respects_byte_budget() {
+        let mut cache = BoundedChunkCache::new(100);
+        cache.insert(0, CachedChunk { data: vec![1u8; 40] });
+        cache.insert(40, CachedChunk { data: vec![2u8; 40] });
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes_used(), 80);
+
+        // This pushes over 100 → oldest (offset 0) must be evicted.
+        cache.insert(80, CachedChunk { data: vec![3u8; 40] });
+        assert_eq!(cache.len(), 2);
+        assert!(cache.bytes_used() <= 100);
+        assert!(cache.get(&0).is_none(), "LRU should have evicted offset 0");
+        assert!(cache.get(&40).is_some());
+        assert!(cache.get(&80).is_some());
+    }
+
+    #[test]
+    fn test_bounded_cache_skips_oversized_chunk() {
+        // A single chunk bigger than the whole budget: never cached,
+        // existing entries preserved.
+        let mut cache = BoundedChunkCache::new(50);
+        cache.insert(0, CachedChunk { data: vec![1u8; 30] });
+        cache.insert(30, CachedChunk { data: vec![2u8; 200] }); // oversized
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&0).is_some());
+        assert!(cache.get(&30).is_none());
+    }
+
+    #[test]
+    fn test_read_active_block_via_disk_fallback_after_cache_eviction() {
+        // Phase 6b-P6 regression: a chunk evicted from the in-memory cache
+        // must still be readable from the unsealed on-disk block via the
+        // pread fallback. The file we query is still in the active block
+        // (never sealed), so this exercises `read_active_chunk_from_disk`.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        let payload: Vec<u8> = (0..4096u16).flat_map(|i| i.to_le_bytes()).collect();
+        let file_id = engine.put_bytes(&payload, "evicted.bin", None).unwrap();
+
+        // Simulate eviction without actually pushing past the 64 MB budget.
+        engine.clear_active_chunk_cache_for_test();
+
+        // get_bytes() must now round-trip via pread, not the cache.
+        let got = engine.get_bytes(&file_id).unwrap();
+        assert_eq!(got, payload);
     }
 
     #[test]

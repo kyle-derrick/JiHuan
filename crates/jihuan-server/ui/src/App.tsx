@@ -7,6 +7,7 @@ import GC from '@/pages/GC'
 import Keys from '@/pages/Keys'
 import Settings from '@/pages/Settings'
 import Metrics from '@/pages/Metrics'
+import Audit from '@/pages/Audit'
 import Login from '@/pages/Login'
 
 export default function App() {
@@ -32,6 +33,7 @@ export default function App() {
                 <Route path="/keys" element={<Keys />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="/metrics" element={<Metrics />} />
+                <Route path="/audit" element={<Audit />} />
                 <Route path="*" element={<Navigate to="/ui/" replace />} />
               </Routes>
             </Layout>
