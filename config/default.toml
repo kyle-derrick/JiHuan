@@ -30,3 +30,6 @@ enable_access_log = true
 enabled = true
 # Routes exempt from authentication (prefix match)
 exempt_routes = ["/api/status", "/ui"]
+# Retention window for audit-log rows. 0 = keep forever. The background GC
+# loop purges events older than (now - audit_retention_days * 86400s).
+audit_retention_days = 90

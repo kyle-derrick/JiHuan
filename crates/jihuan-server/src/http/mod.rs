@@ -64,6 +64,7 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         // Admin routes
         .route("/api/status", get(admin::get_status))
         .route("/api/gc/trigger", post(admin::trigger_gc))
+        .route("/api/admin/compact", post(admin::compact))
         .route("/api/block/list", get(admin::list_blocks))
         .route(
             "/api/block/:block_id",
@@ -92,5 +93,16 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         .layer(Extension(admin::MetricsHandle(metrics_handle)))
         .with_state(engine);
 
-    Router::new().merge(auth_router).merge(main_router)
+    // Liveness / readiness probes (k8s-compatible). Served outside the auth
+    // and CORS layers so orchestrators can hit them without a credential
+    // and without worrying about preflight headers. They must stay cheap
+    // — no engine access, no allocations beyond the static body.
+    let probe_router: Router = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ready" }));
+
+    Router::new()
+        .merge(probe_router)
+        .merge(auth_router)
+        .merge(main_router)
 }

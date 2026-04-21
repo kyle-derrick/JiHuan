@@ -87,28 +87,47 @@ impl BlockWriter {
     }
 
     /// Write a chunk into the block.
-    /// Returns the `ChunkEntry` that was appended.
+    ///
+    /// Convenience wrapper that compresses `data` inline and delegates to
+    /// [`append_precompressed_chunk`]. Keeps existing call sites and tests
+    /// working; hot paths should prefer the pre-compressed variant so the
+    /// CPU-bound compression runs **outside** any shared lock (Phase 6b-P3).
     pub fn write_chunk(&mut self, data: &[u8], hash: &str) -> Result<ChunkEntry> {
+        let original_size = data.len() as u32;
+        let compressed = compress(data, self.compression, self.compression_level)?;
+        self.append_precompressed_chunk(&compressed, original_size, hash)
+    }
+
+    /// Append an already-compressed chunk to the block. The caller is
+    /// responsible for having compressed `compressed` with the same algorithm
+    /// + level this writer was configured with — the algorithm byte stored
+    /// in the [`ChunkEntry`] is derived from `self.compression`, not from
+    /// the payload.
+    ///
+    /// Phase 6b-P3: by exposing this path we let `Engine::store_chunk`
+    /// compress each chunk *before* acquiring `active_writer`, so concurrent
+    /// writers run their compressors in parallel on separate cores instead
+    /// of serialising on one Mutex.
+    pub fn append_precompressed_chunk(
+        &mut self,
+        compressed: &[u8],
+        original_size: u32,
+        hash: &str,
+    ) -> Result<ChunkEntry> {
         if self.finished {
             return Err(JiHuanError::Block(
-                "write_chunk called on a finished BlockWriter".into(),
+                "append_precompressed_chunk called on a finished BlockWriter".into(),
             ));
         }
 
-        let original_size = data.len() as u32;
-
-        // Compress the chunk
-        let compressed = compress(data, self.compression, self.compression_level)?;
         let compressed_size = compressed.len() as u32;
 
         // CRC32 of the compressed data
-        let data_crc32 = crc32(&compressed);
-        self.cumulative_crc.update(&compressed);
+        let data_crc32 = crc32(compressed);
+        self.cumulative_crc.update(compressed);
 
         // Write compressed data
-        self.writer
-            .write_all(&compressed)
-            .map_err(JiHuanError::Io)?;
+        self.writer.write_all(compressed).map_err(JiHuanError::Io)?;
 
         let algo_byte = match self.compression {
             crate::config::CompressionAlgorithm::None => 0u8,
@@ -129,6 +148,17 @@ impl BlockWriter {
         self.entries.push(entry.clone());
 
         Ok(entry)
+    }
+
+    /// Accessor used by callers that need to compress payload outside of
+    /// the writer's critical section (Phase 6b-P3).
+    pub fn compression(&self) -> CompressionAlgorithm {
+        self.compression
+    }
+
+    /// See [`BlockWriter::compression`].
+    pub fn compression_level(&self) -> i32 {
+        self.compression_level
     }
 
     /// Flush, write the index table and footer, then close the file.

@@ -145,6 +145,61 @@ pub async fn trigger_gc(
     }))
 }
 
+/// POST `/api/admin/compact` — v0.4.3 block compaction.
+///
+/// Body is a JSON object with the following optional fields:
+///   * `block_id`        — compact exactly this one block. Takes priority
+///                         over the threshold-based scan when present.
+///   * `threshold`       — `[0.0, 1.0]`, default `0.5`. Blocks whose
+///                         `live_bytes / size` is below this ratio are
+///                         compacted. Ignored when `block_id` is set.
+///   * `min_size_bytes`  — blocks smaller than this are skipped even when
+///                         below the threshold, to avoid spending I/O on
+///                         tiny blocks. Default `4 MiB`.
+///
+/// Returns an array of per-block stats. The active (unsealed) block is
+/// never compacted regardless of parameters.
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct CompactRequest {
+    pub block_id: Option<String>,
+    pub threshold: Option<f64>,
+    pub min_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactResponse {
+    pub compacted: Vec<jihuan_core::CompactionBlockStats>,
+    pub total_bytes_saved: i64,
+}
+
+pub async fn compact(
+    State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
+    Json(req): Json<CompactRequest>,
+) -> Result<Json<CompactResponse>, AppError> {
+    require_scope(&caller, "admin")?;
+    let threshold = req.threshold.unwrap_or(0.5);
+    let min_size_bytes = req.min_size_bytes.unwrap_or(4 * 1024 * 1024);
+
+    let compacted = tokio::task::spawn_blocking(move || -> Result<Vec<_>, _> {
+        if let Some(id) = req.block_id {
+            engine.compact_block(&id).map(|s| vec![s])
+        } else {
+            engine.compact_low_utilization(threshold, min_size_bytes)
+        }
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let total_bytes_saved = compacted.iter().map(|s| s.bytes_saved).sum();
+    Ok(Json(CompactResponse {
+        compacted,
+        total_bytes_saved,
+    }))
+}
+
 /// GET /api/block/list
 pub async fn list_blocks(
     State(engine): State<Arc<Engine>>,

@@ -23,3 +23,5 @@ target
 jihuan-data
 *.log
 *.err
+
+tests/**/__pycache__

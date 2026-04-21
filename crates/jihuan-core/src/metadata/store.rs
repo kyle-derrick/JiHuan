@@ -133,6 +133,131 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Atomic per-file commit (v0.4.2 P5).
+    ///
+    /// Commits the file record, its partition-index update, a batch of
+    /// block ref-count deltas, and a batch of new dedup entries in **one**
+    /// redb write transaction. This replaces the old pattern of N inline
+    /// `update_block_ref_count` + N `insert_dedup_entry` + 1 `insert_file`
+    /// commits (≈ 2N+1 fsyncs for an N-chunk file) with exactly one fsync.
+    ///
+    /// Semantics:
+    ///  - `ref_count_deltas` contains `(block_id, delta)` pairs. Missing
+    ///    blocks are ignored with a warning trace; this matches
+    ///    `update_block_ref_count`'s historical tolerance for the
+    ///    `NotFound` case.
+    ///  - `new_dedup_entries` are inserted unconditionally; callers must
+    ///    not include entries that are already present.
+    ///  - The file record is inserted with duplicate-detection (errors
+    ///    on collision, same as `insert_file`).
+    ///
+    /// Atomicity guarantee: on commit success every caller-visible state
+    /// change lands together; on failure, none does.
+    pub fn commit_file_batch(
+        &self,
+        file: &FileMeta,
+        ref_count_deltas: &std::collections::HashMap<String, i64>,
+        new_dedup_entries: &[DedupEntry],
+    ) -> Result<()> {
+        tracing::debug!(
+            file_id = %file.file_id,
+            deltas = ref_count_deltas.len(),
+            new_dedups = new_dedup_entries.len(),
+            "MetadataStore::commit_file_batch"
+        );
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            // 1) Insert the file record (error on duplicate)
+            let mut files = tx
+                .open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            if files
+                .get(file.file_id.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+                .is_some()
+            {
+                return Err(JiHuanError::AlreadyExists(format!(
+                    "File '{}' already exists",
+                    file.file_id
+                )));
+            }
+            let file_bytes = encode(file)?;
+            files
+                .insert(file.file_id.as_str(), file_bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        {
+            // 2) Partition → file_ids index
+            let mut pt = tx
+                .open_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let pid = file.partition_id.to_string();
+            let mut ids: Vec<String> = pt
+                .get(pid.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            ids.push(file.file_id.clone());
+            let bytes = encode(&ids)?;
+            pt.insert(pid.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        {
+            // 3) Block ref-count deltas
+            let mut blocks = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            for (block_id, delta) in ref_count_deltas {
+                // Decode-then-drop the read guard before re-inserting so
+                // redb's borrow checker sees sequential borrows.
+                let current: Option<BlockMeta> = {
+                    let guard = blocks
+                        .get(block_id.as_str())
+                        .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    match guard {
+                        Some(v) => Some(decode(v.value())?),
+                        None => None,
+                    }
+                };
+                match current {
+                    Some(mut meta) => {
+                        let new_count = (meta.ref_count as i64 + delta).max(0) as u64;
+                        meta.ref_count = new_count;
+                        let bytes = encode(&meta)?;
+                        blocks
+                            .insert(block_id.as_str(), bytes.as_slice())
+                            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    }
+                    None => {
+                        tracing::warn!(
+                            block_id = %block_id,
+                            delta = delta,
+                            "commit_file_batch: block missing for ref-count delta"
+                        );
+                    }
+                }
+            }
+        }
+        {
+            // 4) Dedup entries (caller filters out duplicates beforehand)
+            let mut dedup = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            for entry in new_dedup_entries {
+                let bytes = encode(entry)?;
+                dedup
+                    .insert(entry.hash.as_str(), bytes.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Get a file by its ID
     pub fn get_file(&self, file_id: &str) -> Result<Option<FileMeta>> {
         tracing::debug!(file_id = %file_id, "MetadataStore::get_file");
@@ -391,6 +516,202 @@ impl MetadataStore {
             result.push(block);
         }
         Ok(result)
+    }
+
+    /// v0.4.3 compaction: atomically rewrite every reference to `old_block_id`.
+    ///
+    /// This is the metadata-side half of block compaction. The caller has
+    /// already built a new block file containing the *live* chunks copied
+    /// from the old one; this function flips every on-disk reference from
+    /// the old location to the new in a single redb transaction:
+    ///
+    ///   1. Delete the old `BlockMeta` row.
+    ///   2. Insert `new_block` (its `ref_count` must already equal the total
+    ///      number of live chunk references — caller's responsibility).
+    ///   3. Scan `FILES_TABLE`. For each `FileMeta` that has any chunk in
+    ///      `old_block_id`, remap those chunks to the new `(block_id,
+    ///      offset, compressed_size, original_size)` from `chunk_remap`
+    ///      (keyed by content hash). Unaffected chunks are left alone.
+    ///   4. Scan `DEDUP_TABLE`. Entries whose `block_id == old_block_id`
+    ///      are either rewritten (if their hash is in `chunk_remap`) or
+    ///      dropped (if they'd otherwise point at a chunk no longer on
+    ///      disk — this also cleans up the stale-dedup class of bug).
+    ///
+    /// Atomicity guarantee: the caller sees the world before the call
+    /// **or** the world after; never an in-between.
+    pub fn rewrite_block_references(
+        &self,
+        old_block_id: &str,
+        new_block: &BlockMeta,
+        chunk_remap: &std::collections::HashMap<String, (String, u64, u64, u64)>,
+    ) -> Result<u64> {
+        // chunk_remap value = (new_block_id, new_offset, new_original_size, new_compressed_size)
+        // Returns: the number of chunk references that were rewritten (i.e. the
+        // ref_count that was actually persisted onto the new block).
+        tracing::info!(
+            old = %old_block_id,
+            new = %new_block.block_id,
+            remap_entries = chunk_remap.len(),
+            "MetadataStore::rewrite_block_references"
+        );
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        // 1) Rewrite affected FileMeta rows and count references in one pass.
+        //
+        // Counting inside the same write tx (instead of trusting a pre-scan
+        // passed in by the caller) avoids a race window: a dedup-hit upload
+        // that slipped in between a pre-scan and this commit would otherwise
+        // yield a ref_count that under-counts the true references.
+        let mut new_ref_count: u64 = 0;
+        {
+            let mut files = tx
+                .open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut to_rewrite: Vec<(String, FileMeta)> = Vec::new();
+            {
+                for entry in files
+                    .iter()
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?
+                {
+                    let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    let file: FileMeta = decode(v.value())?;
+                    if file.chunks.iter().any(|c| c.block_id == old_block_id) {
+                        to_rewrite.push((k.value().to_string(), file));
+                    }
+                }
+            }
+            for (k, mut file) in to_rewrite {
+                for chunk in &mut file.chunks {
+                    if chunk.block_id == old_block_id {
+                        if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&chunk.hash) {
+                            chunk.block_id = nb.clone();
+                            chunk.offset = *no;
+                            chunk.original_size = *norig;
+                            chunk.compressed_size = *ncomp;
+                            new_ref_count += 1;
+                        } else {
+                            return Err(JiHuanError::Internal(format!(
+                                "rewrite_block_references: hash {} not in remap for file {}",
+                                chunk.hash, file.file_id
+                            )));
+                        }
+                    }
+                }
+                let bytes = encode(&file)?;
+                files
+                    .insert(k.as_str(), bytes.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+        }
+
+        // 2) Block metadata flip. ref_count comes from the scan above.
+        {
+            let mut blocks = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            blocks
+                .remove(old_block_id)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut persisted = new_block.clone();
+            persisted.ref_count = new_ref_count;
+            let bytes = encode(&persisted)?;
+            blocks
+                .insert(persisted.block_id.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+
+        // 4) Rewrite / drop affected DedupEntry rows.
+        {
+            let mut dedup = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut to_update: Vec<(String, DedupEntry)> = Vec::new();
+            let mut to_drop: Vec<String> = Vec::new();
+            {
+                for entry in dedup
+                    .iter()
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?
+                {
+                    let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    let de: DedupEntry = decode(v.value())?;
+                    if de.block_id == old_block_id {
+                        let hash = k.value().to_string();
+                        if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&hash) {
+                            let mut updated = de;
+                            updated.block_id = nb.clone();
+                            updated.offset = *no;
+                            updated.original_size = *norig;
+                            updated.compressed_size = *ncomp;
+                            to_update.push((hash, updated));
+                        } else {
+                            // Dedup entry points at a hash no longer on disk —
+                            // drop it to prevent future reads from following
+                            // a stale pointer.
+                            to_drop.push(hash);
+                        }
+                    }
+                }
+            }
+            for (hash, updated) in to_update {
+                let bytes = encode(&updated)?;
+                dedup
+                    .insert(hash.as_str(), bytes.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+            for hash in to_drop {
+                dedup
+                    .remove(hash.as_str())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(new_ref_count)
+    }
+
+    /// Remove every dedup entry whose `block_id` equals the given id.
+    ///
+    /// Called by GC after it reaps a ref_count == 0 block: otherwise the
+    /// dedup index retains a pointer at disk space that's been freed and
+    /// the next upload of an identical chunk would short-circuit into a
+    /// non-existent location.
+    pub fn purge_dedup_for_block(&self, block_id: &str) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut count: u64 = 0;
+        {
+            let mut dedup = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut to_drop: Vec<String> = Vec::new();
+            {
+                for entry in dedup
+                    .iter()
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?
+                {
+                    let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    let de: DedupEntry = decode(v.value())?;
+                    if de.block_id == block_id {
+                        to_drop.push(k.value().to_string());
+                    }
+                }
+            }
+            for hash in to_drop {
+                dedup
+                    .remove(hash.as_str())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                count += 1;
+            }
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(count)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -17,6 +17,9 @@ pub struct GcStats {
     pub bytes_reclaimed: u64,
     pub partitions_deleted: u64,
     pub files_deleted: u64,
+    /// Audit-log rows purged because they were older than the configured
+    /// retention window. `0` when `audit_retention_days == 0` (disabled).
+    pub audit_events_purged: u64,
     pub duration_ms: u64,
 }
 
@@ -27,6 +30,32 @@ pub struct GcConfig {
     pub gc_interval_secs: u64,
     pub time_partition_hours: u32,
     pub data_dir: PathBuf,
+    /// Audit-log retention in days. `0` disables the purge step entirely
+    /// (events are retained forever). Default 90 via `AuthConfig`.
+    pub audit_retention_days: u64,
+}
+
+/// A concurrent set of block IDs that the engine has declared "in use".
+///
+/// Phase v0.4.2: solves a latent data-loss race. Between `insert_block`
+/// (ref_count = 0) and the first `update_block_ref_count(+1)` — or in the
+/// P5 world, between `insert_block` and the end-of-file batch commit — a
+/// concurrent GC tick that scans `list_unreferenced_blocks` will see the
+/// fresh block with ref_count == 0 and happily delete it.
+///
+/// The engine registers every block it's actively writing to into this
+/// set before calling `insert_block`, and only removes it once the block
+/// is sealed (or the upload commits). GC consults the set and unconditionally
+/// skips pinned blocks regardless of their ref_count.
+///
+/// `parking_lot::Mutex` keeps the critical section microsecond-scoped; the
+/// set is expected to hold at most 1–2 entries in typical workloads.
+pub type PinnedBlocks = Arc<parking_lot::Mutex<std::collections::HashSet<String>>>;
+
+/// Construct a fresh empty pin set. Callers share a single instance between
+/// the `Engine` and the `GcService` so both observe the same membership.
+pub fn new_pinned_blocks() -> PinnedBlocks {
+    Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Background GC service
@@ -35,15 +64,22 @@ pub struct GcService {
     config: GcConfig,
     running: Arc<AtomicBool>,
     last_stats: Arc<Mutex<Option<GcStats>>>,
+    pinned_blocks: PinnedBlocks,
 }
 
 impl GcService {
-    pub fn new(meta: Arc<MetadataStore>, config: GcConfig) -> Self {
+    /// Construct a GC service that shares `pinned_blocks` with the engine.
+    pub fn new(
+        meta: Arc<MetadataStore>,
+        config: GcConfig,
+        pinned_blocks: PinnedBlocks,
+    ) -> Self {
         Self {
             meta,
             config,
             running: Arc::new(AtomicBool::new(false)),
             last_stats: Arc::new(Mutex::new(None)),
+            pinned_blocks,
         }
     }
 
@@ -122,8 +158,24 @@ impl GcService {
         }
 
         // Step 2: Delete block files with ref_count == 0
+        //
+        // v0.4.2: skip blocks the engine is currently writing to. Without
+        // this guard a fresh block whose metadata has been inserted but
+        // whose first chunk hasn't yet incremented ref_count would be
+        // eligible for deletion — and we'd lose every chunk written
+        // before the first ref_count commit.
         let unreferenced = self.meta.list_unreferenced_blocks()?;
+        // Clone the pin set once per tick so the Mutex is only held for
+        // microseconds. HashSet::clone is O(n) but n ≤ active writer count.
+        let pinned: std::collections::HashSet<String> = self.pinned_blocks.lock().clone();
         for block in unreferenced {
+            if pinned.contains(&block.block_id) {
+                tracing::debug!(
+                    block_id = %block.block_id,
+                    "GC: skipping pinned active block"
+                );
+                continue;
+            }
             let path = PathBuf::from(&block.path);
             if path.exists() {
                 match std::fs::remove_file(&path) {
@@ -148,6 +200,47 @@ impl GcService {
             }
             // Remove block metadata regardless of file existence
             self.meta.delete_block(&block.block_id)?;
+            // v0.4.3: purge dedup entries that pointed at this now-gone block.
+            // Otherwise a subsequent upload of the same content would short-
+            // circuit to a non-existent (block_id, offset) and break reads.
+            match self.meta.purge_dedup_for_block(&block.block_id) {
+                Ok(n) if n > 0 => tracing::info!(
+                    block_id = %block.block_id,
+                    dedup_entries_removed = n,
+                    "GC: purged stale dedup entries"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    block_id = %block.block_id,
+                    error = %e,
+                    "GC: failed to purge dedup entries for deleted block"
+                ),
+            }
+        }
+
+        // Step 3: Purge audit-log rows older than the retention window.
+        // Runs inline because it's a single bounded redb scan + delete and
+        // piggybacking on the GC tick keeps the scheduler simple.
+        if self.config.audit_retention_days > 0 {
+            let retention_secs = self.config.audit_retention_days.saturating_mul(86_400);
+            let cutoff = now_secs().saturating_sub(retention_secs);
+            match self.meta.purge_audit_events_before(cutoff) {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(
+                            audit_events_purged = n,
+                            cutoff_secs = cutoff,
+                            retention_days = self.config.audit_retention_days,
+                            "GC: purged expired audit events"
+                        );
+                    }
+                    stats.audit_events_purged = n;
+                }
+                Err(e) => {
+                    // Audit retention failures never block reclaim — log and move on.
+                    tracing::warn!(error = %e, "GC: audit event purge failed");
+                }
+            }
         }
 
         stats.duration_ms = t0.elapsed().as_millis() as u64;
@@ -341,8 +434,9 @@ mod tests {
             gc_interval_secs: 60,
             time_partition_hours: 24,
             data_dir: tmp.path().join("data"),
+            audit_retention_days: 0,
         };
-        let svc = GcService::new(meta.clone(), config);
+        let svc = GcService::new(meta.clone(), config, new_pinned_blocks());
         let stats = svc.run_once().await.unwrap();
 
         assert_eq!(stats.blocks_deleted, 1);
@@ -367,12 +461,92 @@ mod tests {
             gc_interval_secs: 60,
             time_partition_hours: 24,
             data_dir: tmp.path().to_path_buf(),
+            audit_retention_days: 0,
         };
-        let svc = GcService::new(meta.clone(), config);
+        let svc = GcService::new(meta.clone(), config, new_pinned_blocks());
         let stats = svc.run_once().await.unwrap();
 
         assert_eq!(stats.blocks_deleted, 0);
         assert!(block_path.exists(), "Active block should NOT be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_gc_purges_expired_audit_events() {
+        // Phase 2.6 retention: a GC tick with audit_retention_days = 1 must
+        // delete events older than 86_400 seconds and leave fresher ones alone.
+        use crate::metadata::types::{AuditEvent, AuditResult};
+        let tmp = tempdir().unwrap();
+        let meta = make_store(&tmp);
+
+        let now = now_secs();
+        // Old event: 10 days ago, must be purged.
+        meta.insert_audit_event(&AuditEvent {
+            ts: now.saturating_sub(10 * 86_400),
+            actor_key_id: Some("k_old".into()),
+            actor_ip: None,
+            action: "auth.login".into(),
+            target: None,
+            result: AuditResult::Ok,
+            http_status: Some(200),
+        })
+        .unwrap();
+        // Fresh event: 5 minutes ago, must survive.
+        meta.insert_audit_event(&AuditEvent {
+            ts: now.saturating_sub(300),
+            actor_key_id: Some("k_new".into()),
+            actor_ip: None,
+            action: "auth.login".into(),
+            target: None,
+            result: AuditResult::Ok,
+            http_status: Some(200),
+        })
+        .unwrap();
+
+        let config = GcConfig {
+            gc_threshold: 0.7,
+            gc_interval_secs: 60,
+            time_partition_hours: 24,
+            data_dir: tmp.path().to_path_buf(),
+            audit_retention_days: 1,
+        };
+        let svc = GcService::new(meta.clone(), config, new_pinned_blocks());
+        let stats = svc.run_once().await.unwrap();
+
+        assert_eq!(stats.audit_events_purged, 1, "the 10-day-old event should be purged");
+        let remaining = meta.list_audit_events(None, None, None, None, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].actor_key_id.as_deref(), Some("k_new"));
+    }
+
+    #[tokio::test]
+    async fn test_gc_skips_audit_purge_when_retention_disabled() {
+        // `audit_retention_days = 0` is the explicit "keep forever" sentinel.
+        use crate::metadata::types::{AuditEvent, AuditResult};
+        let tmp = tempdir().unwrap();
+        let meta = make_store(&tmp);
+        meta.insert_audit_event(&AuditEvent {
+            ts: 1, // Ancient
+            actor_key_id: None,
+            actor_ip: None,
+            action: "auth.login".into(),
+            target: None,
+            result: AuditResult::Ok,
+            http_status: None,
+        })
+        .unwrap();
+
+        let config = GcConfig {
+            gc_threshold: 0.7,
+            gc_interval_secs: 60,
+            time_partition_hours: 24,
+            data_dir: tmp.path().to_path_buf(),
+            audit_retention_days: 0,
+        };
+        let svc = GcService::new(meta.clone(), config, new_pinned_blocks());
+        let stats = svc.run_once().await.unwrap();
+
+        assert_eq!(stats.audit_events_purged, 0);
+        assert_eq!(meta.list_audit_events(None, None, None, None, 10).unwrap().len(), 1);
     }
 
     #[test]

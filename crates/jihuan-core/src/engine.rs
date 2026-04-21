@@ -34,6 +34,11 @@ pub struct Engine {
     /// Avoids re-parsing block headers on every read of a recently-accessed block.
     reader_cache: Arc<Mutex<LruCache<String, BlockReader>>>,
     gc: Arc<GcService>,
+    /// Block IDs currently being written to. Shared with the GC service so
+    /// that GC skips these even when their ref_count momentarily sits at 0
+    /// (between `insert_block` and the first chunk's ref-count increment).
+    /// See [`crate::gc::PinnedBlocks`] for the full rationale.
+    pinned_blocks: crate::gc::PinnedBlocks,
     /// Cached `stats()` snapshot (Phase 6b-P4).
     ///
     /// `stats()` used to walk `data_dir` and sum every file's size on every
@@ -45,6 +50,56 @@ pub struct Engine {
     /// the absolute numbers are inherently approximate (active block bytes,
     /// OS page cache, filesystem metadata overhead).
     stats_cache: Arc<Mutex<Option<CachedStats>>>,
+}
+
+/// v0.4.2 P5 scratch space carried through a single file upload.
+///
+/// Every chunk written or dedup-hit during a `put_stream` call appends
+/// into these collections; the final `MetadataStore::commit_file_batch`
+/// drains them in one redb write transaction. The net effect on a
+/// file-with-N-chunks upload is 1 metadata fsync instead of ~2N+1.
+#[derive(Default)]
+struct FileBatch {
+    /// `block_id → net ref-count delta`. Summed so multiple chunks
+    /// pointing at the same block collapse into a single map entry
+    /// with `delta = #chunks`.
+    ref_count_deltas: std::collections::HashMap<String, i64>,
+    /// New dedup rows that still need to be persisted. Caller guarantees
+    /// none are already in the on-disk DEDUP_TABLE — this matches the
+    /// `commit_file_batch` contract.
+    new_dedup_entries: Vec<DedupEntry>,
+    /// In-flight dedup overlay: content-hash → already-written location
+    /// within **this** upload. Needed because `new_dedup_entries` aren't
+    /// visible via `get_dedup_entry` until commit.
+    overlay: std::collections::HashMap<String, OverlayEntry>,
+}
+
+#[derive(Clone)]
+struct OverlayEntry {
+    block_id: String,
+    offset: u64,
+    original_size: u64,
+    compressed_size: u64,
+}
+
+/// Per-block statistics returned by [`Engine::compact_block`].
+///
+/// Serialisable so that the HTTP admin endpoint can round-trip the value
+/// straight back to the operator/UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompactionBlockStats {
+    pub old_block_id: String,
+    /// `None` when the old block had no live chunks (i.e. it was already
+    /// a GC candidate and we skipped creating a new block).
+    pub new_block_id: Option<String>,
+    pub old_size_bytes: u64,
+    pub new_size_bytes: u64,
+    /// Signed because a tiny block with incompressible content can grow
+    /// slightly after re-encode; the operator should still see the real
+    /// delta.
+    pub bytes_saved: i64,
+    pub live_chunks: u64,
+    pub dropped_chunks: u64,
 }
 
 /// TTL for the `stats()` cache. Five seconds balances Dashboard freshness
@@ -213,8 +268,10 @@ impl Engine {
             gc_interval_secs: config.storage.gc_interval_secs,
             time_partition_hours: config.storage.time_partition_hours,
             data_dir: config.storage.data_dir.clone(),
+            audit_retention_days: config.auth.audit_retention_days,
         };
-        let gc = Arc::new(GcService::new(meta.clone(), gc_config));
+        let pinned_blocks = crate::gc::new_pinned_blocks();
+        let gc = Arc::new(GcService::new(meta.clone(), gc_config, pinned_blocks.clone()));
 
         // LRU reader cache: keep up to max_open_block_files readers open
         let cache_cap = NonZeroUsize::new(config.storage.max_open_block_files.max(4)).unwrap();
@@ -257,6 +314,7 @@ impl Engine {
             active_writer: Arc::new(Mutex::new(None)),
             reader_cache,
             gc,
+            pinned_blocks,
             stats_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -342,6 +400,9 @@ impl Engine {
         let mut file_size: u64 = 0;
         let mut index: u32 = 0;
         let mut buf = vec![0u8; chunk_size];
+        // v0.4.2 P5: accumulate all metadata mutations for one atomic
+        // end-of-file redb commit.
+        let mut batch = FileBatch::default();
 
         loop {
             let mut total_read = 0usize;
@@ -368,7 +429,7 @@ impl Engine {
                         data: bytes::Bytes::new(),
                         digest,
                     };
-                    let cm = self.store_chunk(&raw)?;
+                    let cm = self.store_chunk_batched(&raw, &mut batch)?;
                     chunk_metas.push(cm);
                 }
                 break;
@@ -382,7 +443,7 @@ impl Engine {
                 data: bytes::Bytes::copy_from_slice(slice),
                 digest,
             };
-            let cm = self.store_chunk(&raw)?;
+            let cm = self.store_chunk_batched(&raw, &mut batch)?;
             chunk_metas.push(cm);
 
             index += 1;
@@ -404,7 +465,15 @@ impl Engine {
         self.wal.lock().append(WalOperation::InsertFile {
             file_id: file_id.clone(),
         })?;
-        self.meta.insert_file(&file_meta)?;
+        // v0.4.2 P5: one transaction for file insert + partition index +
+        // block ref-count deltas + new dedup entries. Replaces the old
+        // pattern of `insert_file` + per-chunk `update_block_ref_count` +
+        // per-new-chunk `insert_dedup_entry`.
+        self.meta.commit_file_batch(
+            &file_meta,
+            &batch.ref_count_deltas,
+            &batch.new_dedup_entries,
+        )?;
 
         metrics::counter!("jihuan_puts_total").increment(1);
         metrics::counter!("jihuan_bytes_written_total").increment(file_size);
@@ -413,17 +482,44 @@ impl Engine {
         Ok(file_id)
     }
 
-    fn store_chunk(&self, raw: &RawChunk) -> Result<ChunkMeta> {
+    /// v0.4.2 P5: chunk-processing helper that accumulates pending metadata
+    /// writes into `batch` instead of committing each inline. The single
+    /// end-of-file `commit_file_batch` call collapses N+1 redb transactions
+    /// into exactly one, dramatically reducing fsync pressure on uploads.
+    fn store_chunk_batched(
+        &self,
+        raw: &RawChunk,
+        batch: &mut FileBatch,
+    ) -> Result<ChunkMeta> {
         let hash = &raw.digest.hash;
         let use_dedup = !hash.is_empty();
 
-        // Check for existing dedup entry
+        // 1) Same-upload overlay dedup. A file with repeated chunks (e.g.
+        //    identical 4 MB blocks of zeros) reuses the first-seen location
+        //    without needing a committed dedup entry, because the batch
+        //    hasn't been committed yet so `get_dedup_entry` would miss.
+        if use_dedup {
+            if let Some(o) = batch.overlay.get(hash).cloned() {
+                *batch.ref_count_deltas.entry(o.block_id.clone()).or_insert(0) += 1;
+                metrics::counter!("jihuan_dedup_hits_total").increment(1);
+                return Ok(ChunkMeta {
+                    block_id: o.block_id,
+                    offset: o.offset,
+                    original_size: o.original_size,
+                    compressed_size: o.compressed_size,
+                    hash: hash.clone(),
+                    index: raw.index,
+                });
+            }
+        }
+
+        // 2) Persisted dedup index (hits across uploads).
         if use_dedup {
             if let Some(dedup) = self.meta.get_dedup_entry(hash)? {
-                // Reuse existing chunk – increment block ref count
-                self.meta
-                    .update_block_ref_count(&dedup.block_id, 1)
-                    .unwrap_or(0);
+                *batch
+                    .ref_count_deltas
+                    .entry(dedup.block_id.clone())
+                    .or_insert(0) += 1;
                 metrics::counter!("jihuan_dedup_hits_total").increment(1);
                 return Ok(ChunkMeta {
                     block_id: dedup.block_id,
@@ -436,8 +532,15 @@ impl Engine {
             }
         }
 
-        // Write new chunk to active block
-        let (block_id, entry) = self.write_chunk_to_block(&raw.data, hash)?;
+        // 3) New chunk. Compress outside the active_writer lock (Phase 6b-P3)
+        //    then append. ref-count and dedup-entry bookkeeping is *deferred*
+        //    to the end-of-file batch commit.
+        let compressed = crate::compression::compress(
+            &raw.data,
+            self.config.storage.compression_algorithm,
+            self.config.storage.compression_level,
+        )?;
+        let (block_id, entry) = self.write_chunk_to_block(&raw.data, &compressed, hash)?;
 
         let chunk_meta = ChunkMeta {
             block_id: block_id.clone(),
@@ -448,25 +551,46 @@ impl Engine {
             index: raw.index,
         };
 
-        // Register dedup entry
+        *batch.ref_count_deltas.entry(block_id.clone()).or_insert(0) += 1;
         if use_dedup {
-            let dedup = DedupEntry {
+            batch.new_dedup_entries.push(DedupEntry {
                 hash: hash.clone(),
                 block_id: block_id.clone(),
                 offset: entry.data_offset,
                 original_size: entry.original_size as u64,
                 compressed_size: entry.compressed_size as u64,
-            };
-            self.meta.insert_dedup_entry(&dedup)?;
+            });
+            batch.overlay.insert(
+                hash.clone(),
+                OverlayEntry {
+                    block_id: block_id.clone(),
+                    offset: entry.data_offset,
+                    original_size: entry.original_size as u64,
+                    compressed_size: entry.compressed_size as u64,
+                },
+            );
         }
 
         Ok(chunk_meta)
     }
 
-    fn write_chunk_to_block(&self, data: &[u8], hash: &str) -> Result<(String, ChunkEntry)> {
+    /// Append an already-compressed chunk to the active block.
+    ///
+    /// `data` is the uncompressed payload — retained only so it can seed the
+    /// bounded chunk cache for read-your-write latency. `compressed` is what
+    /// actually gets written to disk. The caller (see `store_chunk`) does the
+    /// compression outside this critical section so concurrent uploads don't
+    /// serialise on a single-threaded compressor (Phase 6b-P3).
+    fn write_chunk_to_block(
+        &self,
+        data: &[u8],
+        compressed: &[u8],
+        hash: &str,
+    ) -> Result<(String, ChunkEntry)> {
         let mut guard = self.active_writer.lock();
 
-        // Check if we need a new block
+        // Check if we need a new block. Rollover uses uncompressed size as
+        // a conservative upper bound — same as the old path.
         let need_new_block = match guard.as_ref() {
             None => true,
             Some(ab) => ab.writer.is_full(data.len()),
@@ -475,6 +599,7 @@ impl Engine {
         if need_new_block {
             // Finish the previous block (if any) and move it into the reader cache
             if let Some(ab) = guard.take() {
+                let sealed_id = ab.writer.block_id().to_string();
                 let summary = ab.writer.finish()?;
                 self.register_block(&summary)?;
                 // Populate the reader cache with the just-sealed block
@@ -482,9 +607,16 @@ impl Engine {
                     let mut cache = self.reader_cache.lock();
                     cache.put(summary.path.to_string_lossy().into_owned(), reader);
                 }
+                // Unpin the sealed block — it's either referenced by at least
+                // one chunk (ref_count > 0 → naturally GC-safe) or was never
+                // written to and will be reaped cleanly on the next tick.
+                self.pinned_blocks.lock().remove(&sealed_id);
             }
-            // Create a new block
+            // Create a new block. **Pin before any metadata commit** so a
+            // concurrent GC tick that snapshots between `insert_block` and
+            // the first ref-count increment still sees this block as active.
             let block_id = new_id();
+            self.pinned_blocks.lock().insert(block_id.clone());
             let block_path = self.block_path(&block_id);
             let writer = BlockWriter::create(
                 &block_path,
@@ -513,7 +645,9 @@ impl Engine {
         }
 
         let ab = guard.as_mut().unwrap();
-        let entry = ab.writer.write_chunk(data, hash)?;
+        let entry = ab
+            .writer
+            .append_precompressed_chunk(compressed, data.len() as u32, hash)?;
         let block_id = ab.writer.block_id().to_string();
 
         // Store a copy of the raw data for in-memory reads of the active block
@@ -524,9 +658,10 @@ impl Engine {
             },
         );
 
-        // Increment ref count for the block
-        self.meta.update_block_ref_count(&block_id, 1)?;
-
+        // v0.4.2 P5: ref-count bookkeeping is now deferred to the
+        // end-of-file batch commit in `put_stream`. The pin in
+        // `pinned_blocks` (inserted above when this block was created)
+        // keeps GC away until the commit lands.
         Ok((block_id, entry))
     }
 
@@ -554,6 +689,7 @@ impl Engine {
     pub fn seal_active_block(&self) -> Result<()> {
         let mut guard = self.active_writer.lock();
         if let Some(ab) = guard.take() {
+            let sealed_id = ab.writer.block_id().to_string();
             let summary = ab.writer.finish()?;
             self.register_block(&summary)?;
             // Add the freshly-sealed block to the reader cache
@@ -561,6 +697,9 @@ impl Engine {
                 let mut cache = self.reader_cache.lock();
                 cache.put(summary.path.to_string_lossy().into_owned(), reader);
             }
+            // Unpin the block now that it's sealed; ref_count is already >0
+            // on any block that had at least one chunk written.
+            self.pinned_blocks.lock().remove(&sealed_id);
         }
         Ok(())
     }
@@ -1121,6 +1260,292 @@ impl Engine {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // v0.4.3: Block compaction
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Compact a single sealed block: read its live chunks, rewrite them into
+    /// a fresh block file, and atomically flip every `FileMeta` / `DedupEntry`
+    /// reference from the old block to the new one. Finally delete the old
+    /// block file from disk.
+    ///
+    /// "Live" is defined as *referenced by at least one `FileMeta.chunks[]`
+    /// entry whose `block_id == old_block_id`*. Chunks whose hash is no
+    /// longer referenced by any file are dropped — this is where the disk
+    /// savings come from.
+    ///
+    /// Returns the per-block statistics. Callers should treat this as an
+    /// administrative maintenance operation: it's safe to run alongside
+    /// normal traffic but holds a read tx (scans `FILES_TABLE` twice) and
+    /// re-compresses the live chunks, so throughput is non-trivial.
+    ///
+    /// Refuses to compact:
+    ///   - a non-existent block (`NotFound`);
+    ///   - the currently-active (pinned) block (`InvalidArgument`);
+    ///   - a block whose on-disk file is missing or incomplete.
+    pub fn compact_block(&self, old_block_id: &str) -> Result<CompactionBlockStats> {
+        use std::collections::HashMap;
+
+        // Refuse to compact an active/unsealed block.
+        if self.pinned_blocks.lock().contains(old_block_id) {
+            return Err(JiHuanError::InvalidArgument(format!(
+                "block {} is currently active — cannot compact",
+                old_block_id
+            )));
+        }
+
+        let old_meta = self.meta.get_block(old_block_id)?.ok_or_else(|| {
+            JiHuanError::NotFound(format!("Block '{}' not found", old_block_id))
+        })?;
+        let old_path = PathBuf::from(&old_meta.path);
+        if !old_path.exists() {
+            return Err(JiHuanError::DataCorruption(format!(
+                "block {} metadata exists but file {} is missing",
+                old_block_id,
+                old_path.display()
+            )));
+        }
+        if !BlockReader::is_complete(&old_path) {
+            return Err(JiHuanError::DataCorruption(format!(
+                "block {} is not sealed — refusing to compact",
+                old_block_id
+            )));
+        }
+
+        // Collect the set of live hashes by scanning FILES_TABLE.
+        //
+        // Pre-scan's only job is to decide which chunks to *copy* into the
+        // new block. The authoritative ref-count is computed inside
+        // `rewrite_block_references` at commit time, so a concurrent upload
+        // that slips in between pre-scan and commit is still counted
+        // correctly.
+        let live_hashes: std::collections::HashSet<String> = {
+            let all_files = self.meta.list_all_files()?;
+            let mut set = std::collections::HashSet::new();
+            for f in &all_files {
+                for c in &f.chunks {
+                    if c.block_id == old_block_id {
+                        set.insert(c.hash.clone());
+                    }
+                }
+            }
+            set
+        };
+
+        // Open the old block and build a hash → entry map.
+        let mut old_reader = BlockReader::open(&old_path)?;
+        let hash_to_entry: HashMap<String, ChunkEntry> = old_reader
+            .entries
+            .iter()
+            .map(|e| (e.hash_str(), e.clone()))
+            .collect();
+        let old_chunks = old_reader.entries.len() as u64;
+
+        // Short-circuit: block has no live chunks → skip straight to GC.
+        // This is exactly the state a ref_count==0 block already covers and
+        // the normal GC path will reclaim it on the next tick. We don't try
+        // to do it here to avoid racing with GC.
+        if live_hashes.is_empty() {
+            return Ok(CompactionBlockStats {
+                old_block_id: old_block_id.to_string(),
+                new_block_id: None,
+                old_size_bytes: old_meta.size,
+                new_size_bytes: 0,
+                bytes_saved: old_meta.size as i64,
+                live_chunks: 0,
+                dropped_chunks: old_chunks,
+            });
+        }
+
+        // Allocate a new block and pin it for the rewrite window.
+        let new_block_id = new_id();
+        self.pinned_blocks.lock().insert(new_block_id.clone());
+        // Guard that always unpins on early return.
+        struct PinGuard<'a> {
+            pins: &'a crate::gc::PinnedBlocks,
+            id: String,
+        }
+        impl<'a> Drop for PinGuard<'a> {
+            fn drop(&mut self) {
+                self.pins.lock().remove(&self.id);
+            }
+        }
+        let _pin_guard = PinGuard {
+            pins: &self.pinned_blocks,
+            id: new_block_id.clone(),
+        };
+
+        let new_path = self.block_path(&new_block_id);
+        if let Some(parent) = new_path.parent() {
+            ensure_dir(parent)?;
+        }
+        let mut writer = BlockWriter::create(
+            &new_path,
+            &new_block_id,
+            self.config.storage.compression_algorithm,
+            self.config.storage.compression_level,
+            self.config.storage.hash_algorithm,
+            // Give the compaction writer a generous cap so a full block can
+            // fit even if the current block_file_size was shrunk after the
+            // old block was sealed.
+            self.config.storage.block_file_size.max(old_meta.size + 4096),
+        )?;
+
+        // Copy each live chunk. Re-compress on write so the new entry's
+        // compressed_size / offset reflect the current algorithm+level.
+        let mut chunk_remap: HashMap<String, (String, u64, u64, u64)> = HashMap::new();
+        let mut live_chunks: u64 = 0;
+        let verify = self.config.storage.verify_on_read;
+        for hash in &live_hashes {
+            let entry = hash_to_entry.get(hash).ok_or_else(|| {
+                JiHuanError::DataCorruption(format!(
+                    "compact: live hash {} missing from block {}'s index",
+                    hash, old_block_id
+                ))
+            })?;
+            let data = old_reader.read_chunk(entry, verify)?;
+            let compressed = crate::compression::compress(
+                &data,
+                self.config.storage.compression_algorithm,
+                self.config.storage.compression_level,
+            )?;
+            let new_entry =
+                writer.append_precompressed_chunk(&compressed, data.len() as u32, hash)?;
+            chunk_remap.insert(
+                hash.clone(),
+                (
+                    new_block_id.clone(),
+                    new_entry.data_offset,
+                    new_entry.original_size as u64,
+                    new_entry.compressed_size as u64,
+                ),
+            );
+            live_chunks += 1;
+        }
+
+        // Seal the new block.
+        let summary = writer.finish()?;
+
+        let new_block_meta = BlockMeta {
+            block_id: new_block_id.clone(),
+            ref_count: 0, // set by rewrite_block_references
+            create_time: now_secs(),
+            path: summary.path.to_string_lossy().into_owned(),
+            size: summary.total_size,
+        };
+
+        // Atomic metadata flip. Returns the ref_count that was actually
+        // persisted; a mismatch with `live_chunks` is evidence of a
+        // concurrent upload that landed extra dedup-hit references during
+        // the rewrite window (still correct, just informational).
+        let actual_ref_count = self
+            .meta
+            .rewrite_block_references(old_block_id, &new_block_meta, &chunk_remap)?;
+
+        if actual_ref_count as u64 != live_chunks {
+            tracing::info!(
+                old = %old_block_id,
+                new = %new_block_id,
+                pre_scan_live = live_chunks,
+                committed_ref_count = actual_ref_count,
+                "compact_block: additional references landed during rewrite"
+            );
+        }
+
+        // Evict old block from the reader cache so subsequent reads miss
+        // into the (now-redirected) metadata and pick up the new block.
+        {
+            let mut cache = self.reader_cache.lock();
+            let key = old_path.to_string_lossy().into_owned();
+            cache.pop(&key);
+        }
+        // Drop our own old_reader handle before attempting delete (Windows).
+        drop(old_reader);
+
+        // Best-effort delete of the old block file. If this fails, metadata
+        // is already consistent — on the next GC tick or restart the
+        // `cleanup_incomplete_blocks` pass can sweep it.
+        match std::fs::remove_file(&old_path) {
+            Ok(()) => tracing::info!(
+                old = %old_block_id,
+                old_path = %old_path.display(),
+                "compact_block: deleted old block file"
+            ),
+            Err(e) => tracing::warn!(
+                old = %old_block_id,
+                error = %e,
+                "compact_block: could not delete old block file; will be reaped later"
+            ),
+        }
+
+        let dropped = old_chunks.saturating_sub(live_chunks);
+        let bytes_saved = (old_meta.size as i64) - (summary.total_size as i64);
+
+        Ok(CompactionBlockStats {
+            old_block_id: old_block_id.to_string(),
+            new_block_id: Some(new_block_id),
+            old_size_bytes: old_meta.size,
+            new_size_bytes: summary.total_size,
+            bytes_saved,
+            live_chunks,
+            dropped_chunks: dropped,
+        })
+    }
+
+    /// Scan all sealed blocks and compact those whose utilization is below
+    /// `threshold` (ratio in `[0.0, 1.0]`, where utilization = `live_bytes /
+    /// size`). Returns a per-block list of stats. The active block is
+    /// always skipped.
+    ///
+    /// A minimum block size floor (`min_size_bytes`) protects against
+    /// compacting trivial blocks where the re-write cost dominates.
+    pub fn compact_low_utilization(
+        &self,
+        threshold: f64,
+        min_size_bytes: u64,
+    ) -> Result<Vec<CompactionBlockStats>> {
+        let threshold = threshold.clamp(0.0, 1.0);
+        let pinned = self.pinned_blocks.lock().clone();
+        let all_blocks = self.meta.list_all_blocks()?;
+        let all_files = self.meta.list_all_files()?;
+
+        // Per-block live-byte sum from FileMeta.chunks.
+        let mut live_bytes: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for f in &all_files {
+            for c in &f.chunks {
+                *live_bytes.entry(c.block_id.clone()).or_insert(0) += c.compressed_size;
+            }
+        }
+
+        let mut results = Vec::new();
+        for b in &all_blocks {
+            if pinned.contains(&b.block_id) {
+                continue;
+            }
+            if b.size < min_size_bytes {
+                continue;
+            }
+            let live = *live_bytes.get(&b.block_id).unwrap_or(&0);
+            let util = if b.size == 0 {
+                1.0
+            } else {
+                live as f64 / b.size as f64
+            };
+            if util < threshold {
+                match self.compact_block(&b.block_id) {
+                    Ok(stats) => results.push(stats),
+                    Err(e) => tracing::warn!(
+                        block_id = %b.block_id,
+                        error = %e,
+                        "compact_low_utilization: block skipped due to error"
+                    ),
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn block_path(&self, block_id: &str) -> PathBuf {
         // Use a 2-level directory prefix from the block_id to avoid too many files in one dir
         let prefix = &block_id[..2];
@@ -1170,6 +1595,391 @@ mod tests {
         assert_eq!(first.file_count, second.file_count);
         assert_eq!(first.disk_usage_bytes, second.disk_usage_bytes);
         assert_eq!(first.logical_bytes, second.logical_bytes);
+    }
+
+    // ── v0.4.3: Block compaction regressions ─────────────────────────────
+
+    #[test]
+    fn test_compact_block_reclaims_space_from_deleted_file() {
+        // Upload two distinct small files → they share the same active block.
+        // Seal, delete one, compact → new block is smaller AND the surviving
+        // file still reads back byte-identical.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Distinct random-ish payloads so compression can't collapse them.
+        let payload_a: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..200_000u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let id_a = engine.put_bytes(&payload_a, "a.bin", None).unwrap();
+        let id_b = engine.put_bytes(&payload_b, "b.bin", None).unwrap();
+
+        // Seal the active block so it becomes a compactable sealed block.
+        engine.seal_active_block().unwrap();
+
+        // Pick the block id that holds A's first chunk.
+        let file_a = engine.meta.get_file(&id_a).unwrap().unwrap();
+        let block_id = file_a.chunks[0].block_id.clone();
+        let old_size = engine.meta.get_block(&block_id).unwrap().unwrap().size;
+
+        // Delete file B.
+        engine.delete_file(&id_b).unwrap();
+
+        // Compact the (now half-populated) block.
+        let stats = engine.compact_block(&block_id).unwrap();
+        assert!(
+            stats.new_block_id.is_some(),
+            "compaction should produce a new block when live chunks remain"
+        );
+        assert!(
+            stats.bytes_saved > 0,
+            "expected compaction to save bytes (old={} new={})",
+            stats.old_size_bytes,
+            stats.new_size_bytes
+        );
+        assert!(
+            stats.dropped_chunks >= 1,
+            "at least one chunk should have been dropped"
+        );
+        assert!(
+            stats.new_size_bytes < old_size,
+            "new block must be smaller than the old one"
+        );
+
+        // Old block must be gone from metadata.
+        assert!(engine.meta.get_block(&block_id).unwrap().is_none());
+        // File A must still read back byte-identical.
+        let got = engine.get_bytes(&id_a).unwrap();
+        assert_eq!(got, payload_a);
+        // File B must still be 404.
+        assert!(matches!(
+            engine.get_bytes(&id_b).unwrap_err(),
+            JiHuanError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn test_compact_block_preserves_cross_block_dedup() {
+        // After compaction, a second upload of identical content should
+        // dedup-hit the new block (not the old one that's been reaped).
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        let payload_a: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..150_000u32).map(|i| ((i * 3) % 251) as u8).collect();
+        let id_a = engine.put_bytes(&payload_a, "a.bin", None).unwrap();
+        let id_b = engine.put_bytes(&payload_b, "b.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        let file_a = engine.meta.get_file(&id_a).unwrap().unwrap();
+        let old_block = file_a.chunks[0].block_id.clone();
+        engine.delete_file(&id_b).unwrap();
+        let stats = engine.compact_block(&old_block).unwrap();
+        let new_block = stats.new_block_id.clone().unwrap();
+
+        // Upload A's payload again under a different file name — should
+        // dedup-hit into the NEW block, not try to open the deleted old file.
+        let id_a2 = engine.put_bytes(&payload_a, "a2.bin", None).unwrap();
+        let file_a2 = engine.meta.get_file(&id_a2).unwrap().unwrap();
+        for c in &file_a2.chunks {
+            assert_eq!(
+                c.block_id, new_block,
+                "dedup must follow the compaction remap, not point at the purged old block"
+            );
+        }
+
+        // And both copies must still round-trip.
+        assert_eq!(engine.get_bytes(&id_a).unwrap(), payload_a);
+        assert_eq!(engine.get_bytes(&id_a2).unwrap(), payload_a);
+    }
+
+    #[test]
+    fn test_compact_block_rejects_active_block() {
+        // Must refuse to compact the block we're currently writing to.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let id = engine.put_bytes(b"something", "x.txt", None).unwrap();
+        let file = engine.meta.get_file(&id).unwrap().unwrap();
+        let active_block = file.chunks[0].block_id.clone();
+
+        let err = engine.compact_block(&active_block).unwrap_err();
+        assert!(matches!(err, JiHuanError::InvalidArgument(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn test_compact_low_utilization_scanner() {
+        // Three sealed blocks, only one below threshold → only it is compacted.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Block 1: 2 files alive → high utilization
+        let p1 = vec![1u8; 150_000];
+        let p2 = vec![2u8; 150_000];
+        let id1 = engine.put_bytes(&p1, "k1.bin", None).unwrap();
+        let _id2 = engine.put_bytes(&p2, "k2.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+        let block_hi = engine.meta.get_file(&id1).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+
+        // Block 2: 2 files, delete 1 → low utilization
+        let p3 = vec![3u8; 150_000];
+        let p4 = vec![4u8; 150_000];
+        let _id3 = engine.put_bytes(&p3, "k3.bin", None).unwrap();
+        let id4 = engine.put_bytes(&p4, "k4.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+        let block_lo = engine.meta.get_file(&id4).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+        engine.delete_file(&id4).unwrap();
+
+        // Threshold: compact anything under 75% utilization.
+        let results = engine.compact_low_utilization(0.75, 0).unwrap();
+
+        // Exactly the low-util block was compacted.
+        assert_eq!(results.len(), 1, "only block_lo should be compacted");
+        assert_eq!(results[0].old_block_id, block_lo);
+        // And block_hi was untouched.
+        assert!(engine.meta.get_block(&block_hi).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_gc_purges_stale_dedup_for_deleted_block() {
+        // Regression for the v0.4.3 bonus fix: after GC deletes a block
+        // (ref_count → 0), its dedup entries must also be purged or the
+        // next upload of identical content will point at non-existent data.
+        use tokio::runtime::Runtime;
+        let rt = Runtime::new().unwrap();
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Single-chunk file so we can read the one chunk hash straight out
+        // of FileMeta without second-guessing the chunker.
+        let payload: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let id = engine.put_bytes(&payload, "once.bin", None).unwrap();
+        let file = engine.meta.get_file(&id).unwrap().unwrap();
+        assert_eq!(file.chunks.len(), 1);
+        let hash = file.chunks[0].hash.clone();
+
+        engine.seal_active_block().unwrap();
+        engine.delete_file(&id).unwrap();
+
+        // After delete, block has ref_count==0 but dedup row lingers until GC.
+        assert!(engine.meta.get_dedup_entry(&hash).unwrap().is_some());
+
+        // GC runs → ref_count==0 block deleted AND its dedup purged.
+        rt.block_on(async { engine.trigger_gc().await.unwrap() });
+
+        assert!(
+            engine.meta.get_dedup_entry(&hash).unwrap().is_none(),
+            "dedup entry must be purged after its block is GC'd"
+        );
+    }
+
+    // ── v0.4.2 P5: per-file batch commit regressions ─────────────────────
+
+    #[test]
+    fn test_same_upload_chunk_dedup_via_overlay() {
+        // Phase 6b-P1 sets chunk_size to 4 MiB by default. Construct a file
+        // that is exactly two identical chunks. With P5's in-flight overlay,
+        // the second chunk should reuse the first's (block_id, offset) — so
+        // the resulting FileMeta has two chunks pointing at the same
+        // (block_id, offset) pair, and dedup hit counter went up by one.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        // Small chunks for a fast test.
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // 128 KiB of the same byte → exactly 2 × 64 KiB chunks, identical.
+        let payload = vec![0xABu8; 128 * 1024];
+        let file_id = engine.put_bytes(&payload, "twins.bin", None).unwrap();
+
+        let file = engine.meta.get_file(&file_id).unwrap().unwrap();
+        assert_eq!(file.chunks.len(), 2, "expected exactly 2 chunks");
+        assert_eq!(
+            (&file.chunks[0].block_id, file.chunks[0].offset),
+            (&file.chunks[1].block_id, file.chunks[1].offset),
+            "same-content chunks must point at the same block+offset \
+             after P5 overlay dedup",
+        );
+
+        // Round-trip: the file must still read back byte-identical.
+        let got = engine.get_bytes(&file_id).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn test_ref_count_matches_chunk_count_after_batch_commit() {
+        // P5 invariant: after put_stream completes, the block's ref_count
+        // equals the number of chunks (new or deduped) that landed on it.
+        // Regression guard against off-by-one errors in the delta aggregation.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // 3 distinct 64 KiB chunks → 3 ref-count increments on the one block.
+        let mut payload = Vec::with_capacity(3 * 64 * 1024);
+        payload.extend(std::iter::repeat(1u8).take(64 * 1024));
+        payload.extend(std::iter::repeat(2u8).take(64 * 1024));
+        payload.extend(std::iter::repeat(3u8).take(64 * 1024));
+        let file_id = engine.put_bytes(&payload, "triple.bin", None).unwrap();
+
+        let file = engine.meta.get_file(&file_id).unwrap().unwrap();
+        assert_eq!(file.chunks.len(), 3);
+        let block_id = &file.chunks[0].block_id;
+        // All 3 chunks landed on the same (currently active) block.
+        assert!(file.chunks.iter().all(|c| c.block_id == *block_id));
+
+        let block = engine.meta.get_block(block_id).unwrap().unwrap();
+        assert_eq!(
+            block.ref_count, 3,
+            "block ref_count must equal chunk count after batched commit"
+        );
+
+        // Delete: decrements 3 times → ref_count back to 0.
+        engine.delete_file(&file_id).unwrap();
+        let block = engine.meta.get_block(block_id).unwrap().unwrap();
+        assert_eq!(block.ref_count, 0, "delete must bring ref_count back to 0");
+    }
+
+    // ── v0.4.2: GC active-block protection regression ─────────────────────
+
+    #[tokio::test]
+    async fn test_gc_does_not_delete_pinned_active_block() {
+        // Before the pin: GC running while a chunk was just inserted but
+        // `update_block_ref_count(+1)` hadn't landed yet would delete the
+        // active block file — corrupting every chunk written before seal.
+        //
+        // After the pin: the engine registers the block_id in
+        // `pinned_blocks` before any metadata commit, so GC skips it even
+        // when `list_unreferenced_blocks` returns it with ref_count == 0.
+        //
+        // Construction: write a chunk, then manually zero the block's
+        // ref_count in redb to simulate the narrow race window where GC
+        // snapshots mid-transaction. Run GC. The block must survive and
+        // the chunk must still be readable.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        let file_id = engine
+            .put_bytes(b"protected by pin", "guard.txt", None)
+            .unwrap();
+
+        // Grab the block_id the file points at and force its ref_count
+        // back to 0. This mimics the "just-inserted, not yet incremented"
+        // window the pin is designed to cover.
+        let file = engine.meta.get_file(&file_id).unwrap().unwrap();
+        let block_id = file.chunks[0].block_id.clone();
+        let mut b = engine.meta.get_block(&block_id).unwrap().unwrap();
+        b.ref_count = 0;
+        engine.meta.delete_block(&block_id).unwrap();
+        engine.meta.insert_block(&b).unwrap();
+        // Sanity: the block IS in list_unreferenced_blocks now.
+        assert!(engine
+            .meta
+            .list_unreferenced_blocks()
+            .unwrap()
+            .iter()
+            .any(|x| x.block_id == block_id));
+
+        // The engine pinned this block when it was created. GC must skip.
+        let stats = engine.trigger_gc().await.unwrap();
+        assert_eq!(
+            stats.blocks_deleted, 0,
+            "pinned active block must not be deleted by GC"
+        );
+
+        // And the data must still be readable.
+        let got = engine.get_bytes(&file_id).unwrap();
+        assert_eq!(got, b"protected by pin");
+    }
+
+    #[tokio::test]
+    async fn test_gc_reaps_unpinned_unreferenced_block() {
+        // The sibling of the test above: after the block is sealed the
+        // engine unpins it. At that point a 0-ref_count block is *correctly*
+        // a GC candidate — the pin must not linger forever.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        let file_id = engine
+            .put_bytes(b"reap me", "reap.txt", None)
+            .unwrap();
+        // Seal → unpin.
+        engine.seal_active_block().unwrap();
+
+        let file = engine.meta.get_file(&file_id).unwrap().unwrap();
+        let block_id = file.chunks[0].block_id.clone();
+        // Force ref_count to 0 again; this time the block is unpinned.
+        let mut b = engine.meta.get_block(&block_id).unwrap().unwrap();
+        b.ref_count = 0;
+        engine.meta.delete_block(&block_id).unwrap();
+        engine.meta.insert_block(&b).unwrap();
+
+        let stats = engine.trigger_gc().await.unwrap();
+        assert_eq!(
+            stats.blocks_deleted, 1,
+            "sealed + unreferenced block must be reaped"
+        );
+    }
+
+    // ── Phase 6b-P3: compression-outside-lock regression ──────────────────
+
+    #[test]
+    fn test_concurrent_puts_roundtrip_after_compression_offload() {
+        // Phase 6b-P3 moved compress() out of the active_writer critical
+        // section. Regression: 8 threads each uploading a distinct 256 KB
+        // payload must all succeed and read back byte-identical. A single
+        // mis-ordered bookkeeping step (wrong offset, wrong compressed len,
+        // etc.) would surface here as a CRC failure during download.
+        use std::sync::Arc as StdArc;
+        let tmp = tempdir().unwrap();
+        let engine = StdArc::new(open_engine(&tmp));
+
+        let thread_count = 8;
+        let payloads: Vec<Vec<u8>> = (0..thread_count)
+            .map(|seed| {
+                // Deterministic but distinct per thread. zstd must produce
+                // different compressed output for each, so any cross-thread
+                // data mixing would be detectable.
+                let mut v = vec![0u8; 256 * 1024];
+                for (i, b) in v.iter_mut().enumerate() {
+                    *b = ((i as u32).wrapping_mul(1315423911u32).wrapping_add(seed as u32)
+                        & 0xff) as u8;
+                }
+                v
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for (i, data) in payloads.iter().cloned().enumerate() {
+            let eng = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                eng.put_bytes(&data, &format!("concurrent-{i}.bin"), None)
+                    .unwrap()
+            }));
+        }
+        let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for (id, expected) in ids.iter().zip(payloads.iter()) {
+            let got = engine.get_bytes(id).unwrap();
+            assert_eq!(got, *expected, "payload mismatch for {id}");
+        }
     }
 
     // ── Phase 6b-P6: bounded active-block chunk cache ─────────────────────

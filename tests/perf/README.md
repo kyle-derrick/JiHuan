@@ -68,11 +68,58 @@ elapsed 30.1s, total 1842 ops
   GET:   1281 ops  ok=  1281  qps=    42.6  p50=   4.1ms  p95=  18.3ms  p99=  44.8ms
 ```
 
+### load_small_files.py
+
+Small-file / dedup stress. Pure PUT workload with a bounded pool of
+duplicate payloads so dedup hits are measurable. Targets the metadata
++ chunk-index path that dominates wall time at tiny file sizes.
+
+```powershell
+python tests/perf/load_small_files.py --smoke                          # 15s @ 4 workers
+python tests/perf/load_small_files.py --concurrency 32 --duration 60 `
+    --dup-ratio 0.7 --size-min 512 --size-max 65536
+```
+
+The script fetches `/api/status` before and after the run and prints
+the dedup-ratio delta so you can verify the dedup path actually fires.
+
+### load_large_file.py
+
+Single-threaded streaming upload of one very large file, followed by a
+sha256-verified download. Proves `put_stream` really is O(chunk_size)
+RAM and that block rollover works mid-upload.
+
+```powershell
+python tests/perf/load_large_file.py --smoke            # 128 MiB
+python tests/perf/load_large_file.py --size-mb 2048     # 2 GiB, full verify
+python tests/perf/load_large_file.py --size-mb 512 --no-verify
+```
+
+### load_range.py
+
+Hammers one seed file with random `Range: bytes=a-b` requests under
+concurrency and byte-compares every response against the locally-retained
+seed. Any 206 whose payload differs from `seed[a..=b]` is flagged as a
+bad-bytes failure.
+
+```powershell
+python tests/perf/load_range.py --smoke
+python tests/perf/load_range.py --size-mb 64 --concurrency 16 --duration 30
+```
+
+### load_concurrent_dedup.py
+
+N writers race uploading **identical** content. Baseline for future P2
+(`active_writer` sharding). Reports logical-vs-physical bytes delta from
+`/api/status`, which lets you verify the dedup index kicked in.
+
+```powershell
+python tests/perf/load_concurrent_dedup.py --smoke
+python tests/perf/load_concurrent_dedup.py --concurrency 64 --duration 30 --size-kb 64
+```
+
 Planned (next session):
-- `load_small_files.py` — millions of 1-4 KB objects; stress dedup + metadata
-- `load_large_file.py` — single 10 GB streaming upload
-- `load_dedup.py` — repeated identical content, measure hit ratio
-- `load_range.py` — random Range requests
+- `load_mixed_dedup.py` — mix of unique / duplicate content at a fixed ratio
 
 ---
 

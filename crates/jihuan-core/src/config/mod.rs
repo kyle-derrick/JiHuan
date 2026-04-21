@@ -194,6 +194,10 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
 }
 
+fn default_audit_retention_days() -> u64 {
+    90
+}
+
 /// Authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
@@ -209,6 +213,13 @@ pub struct AuthConfig {
     /// plus the SPA bundle at `/ui` and the public status page.
     #[serde(default = "default_exempt_routes")]
     pub exempt_routes: Vec<String>,
+
+    /// How long to retain audit-log rows before the background GC purges
+    /// them. Default 90 days. Set to 0 to disable purging (keep everything
+    /// forever — useful in compliance-heavy environments that ship audit
+    /// events off-box before pruning).
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u64,
 }
 
 impl Default for AuthConfig {
@@ -216,6 +227,7 @@ impl Default for AuthConfig {
         Self {
             enabled: true,
             exempt_routes: default_exempt_routes(),
+            audit_retention_days: default_audit_retention_days(),
         }
     }
 }
