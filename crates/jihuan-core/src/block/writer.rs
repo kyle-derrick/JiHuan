@@ -188,11 +188,19 @@ impl BlockWriter {
         self.entries.len()
     }
 
-    /// Flush the internal BufWriter to the OS page cache.
+    /// Flush the internal BufWriter and sync file data to disk.
     /// Does NOT write the index table or footer; the block remains "open".
+    ///
+    /// We call `sync_data()` here (rather than only BufWriter::flush) so that
+    /// `std::fs::metadata(path).len()` reflects the bytes written — this is
+    /// required for accurate disk-usage stats while a block is still active.
     pub fn flush(&mut self) -> crate::error::Result<()> {
         use std::io::Write as _;
-        self.writer.flush().map_err(crate::error::JiHuanError::Io)
+        self.writer.flush().map_err(crate::error::JiHuanError::Io)?;
+        self.writer
+            .get_ref()
+            .sync_data()
+            .map_err(crate::error::JiHuanError::Io)
     }
 }
 

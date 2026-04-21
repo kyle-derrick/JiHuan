@@ -7,6 +7,7 @@ import {
   KeyRound,
   Settings,
   HardDrive,
+  Activity,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -15,6 +16,7 @@ const nav = [
   { to: '/ui/files', label: '文件管理', icon: Files },
   { to: '/ui/blocks', label: 'Block 管理', icon: Database },
   { to: '/ui/gc', label: 'GC', icon: Trash2 },
+  { to: '/ui/metrics', label: '指标', icon: Activity },
   { to: '/ui/keys', label: '密钥管理', icon: KeyRound },
   { to: '/ui/settings', label: '设置', icon: Settings },
 ]

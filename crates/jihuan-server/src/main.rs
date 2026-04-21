@@ -92,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Pin process start time for uptime reporting
+    http::admin::init_start_time();
+
     // Open engine (registers metric descriptors)
     let engine = Arc::new(Engine::open(config.clone())?);
 

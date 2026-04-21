@@ -6,6 +6,7 @@ import Blocks from '@/pages/Blocks'
 import GC from '@/pages/GC'
 import Keys from '@/pages/Keys'
 import Settings from '@/pages/Settings'
+import Metrics from '@/pages/Metrics'
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
           <Route path="/ui/gc" element={<GC />} />
           <Route path="/ui/keys" element={<Keys />} />
           <Route path="/ui/settings" element={<Settings />} />
+          <Route path="/ui/metrics" element={<Metrics />} />
           <Route path="*" element={<Navigate to="/ui/" replace />} />
         </Routes>
       </Layout>

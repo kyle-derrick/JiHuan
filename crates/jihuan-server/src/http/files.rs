@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use serde::Deserialize;
 use serde::Serialize;
 
 use jihuan_core::{Engine, JiHuanError};
@@ -26,6 +27,21 @@ pub struct FileMetaResponse {
     pub create_time: u64,
     pub content_type: Option<String>,
     pub chunk_count: usize,
+    /// Detailed chunk layout (block_id, offset, sizes, hash). Only populated by /meta endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<ChunkInfoDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChunkInfoDto {
+    pub index: u32,
+    pub block_id: String,
+    pub offset: u64,
+    pub original_size: u64,
+    pub compressed_size: u64,
+    pub hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,53 +51,192 @@ pub struct ErrorResponse {
 }
 
 
+#[derive(Debug, Serialize)]
+pub struct FileListResponse {
+    pub files: Vec<FileMetaResponse>,
+    pub count: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListFilesQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// Case-insensitive substring match against file_name or file_id
+    pub q: Option<String>,
+    /// Sort key: "create_time" (default) | "file_name" | "file_size"
+    pub sort: Option<String>,
+    /// Sort order: "desc" (default) | "asc"
+    pub order: Option<String>,
+}
+
+/// GET /api/v1/files
+/// List all files with optional limit/offset pagination
+pub async fn list_files(
+    State(engine): State<Arc<Engine>>,
+    Query(q): Query<ListFilesQuery>,
+) -> Result<Json<FileListResponse>, AppError> {
+    let all = tokio::task::spawn_blocking(move || engine.list_all_files())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let total = all.len();
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(200);
+    // keep original total for no-filter case
+    let _ = total;
+
+    // Filter
+    let mut filtered: Vec<_> = if let Some(query) = q.q.as_ref().map(|s| s.to_lowercase()) {
+        all.into_iter()
+            .filter(|m| m.file_name.to_lowercase().contains(&query) || m.file_id.contains(&query))
+            .collect()
+    } else {
+        all
+    };
+
+    // Sort
+    let sort_key = q.sort.as_deref().unwrap_or("create_time");
+    let descending = q.order.as_deref().unwrap_or("desc") == "desc";
+    match sort_key {
+        "file_name" => filtered.sort_by(|a, b| a.file_name.cmp(&b.file_name)),
+        "file_size" => filtered.sort_by_key(|m| m.file_size),
+        _ => filtered.sort_by_key(|m| m.create_time),
+    }
+    if descending {
+        filtered.reverse();
+    }
+
+    let total_after_filter = filtered.len();
+
+    let files: Vec<FileMetaResponse> = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|m| FileMetaResponse {
+            file_id: m.file_id,
+            file_name: m.file_name,
+            file_size: m.file_size,
+            create_time: m.create_time,
+            content_type: m.content_type,
+            chunk_count: m.chunks.len(),
+            chunks: None,
+            partition_id: None,
+        })
+        .collect();
+
+    let count = files.len();
+    Ok(Json(FileListResponse { files, count, total: total_after_filter.max(total) }))
+}
+
 /// POST /api/v1/files
-/// Upload a file via multipart form data
+/// Upload a file via multipart form data — streams the body directly into the
+/// engine without buffering the whole file in memory. Memory usage stays bounded
+/// to roughly one chunk (`storage.chunk_size`) plus a small mpsc queue.
 pub async fn upload_file(
     State(engine): State<Arc<Engine>>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
-    let mut file_data: Option<Vec<u8>> = None;
-    let mut file_name = String::from("unknown");
-    let mut content_type: Option<String> = None;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::bad_request(format!("Multipart error: {}", e)))?
-    {
-        let name = field.name().unwrap_or("").to_string();
-        let field_content_type = field.content_type().map(|s| s.to_string());
-
-        if name == "file" || file_data.is_none() {
-            if let Some(fname) = field.file_name() {
-                file_name = fname.to_string();
-            }
-            content_type = field_content_type;
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| AppError::bad_request(format!("Failed to read field: {}", e)))?;
-            file_data = Some(data.to_vec());
-        }
-    }
-
-    let data = file_data.ok_or_else(|| AppError::bad_request("No file field found"))?;
-    let file_size = data.len() as u64;
-    let fn_clone = file_name.clone();
-    let ct = content_type.clone();
-
-    let file_id =
-        tokio::task::spawn_blocking(move || engine.put_bytes(&data, &fn_clone, ct.as_deref()))
+    // Find the first file field
+    let mut field = loop {
+        let f = multipart
+            .next_field()
             .await
-            .map_err(|e| AppError::internal(e.to_string()))?
-            .map_err(AppError::from_jihuan)?;
+            .map_err(|e| AppError::bad_request(format!("Multipart error: {}", e)))?;
+        match f {
+            Some(f) => {
+                let name = f.name().unwrap_or("");
+                if name == "file" || f.file_name().is_some() {
+                    break f;
+                }
+                // skip non-file fields
+                let _ = f.bytes().await;
+            }
+            None => return Err(AppError::bad_request("No file field found")),
+        }
+    };
+
+    let file_name = field
+        .file_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let content_type = field.content_type().map(|s| s.to_string());
+
+    // Bridge async → sync via bounded mpsc of Bytes; blocking worker reads via StreamReader.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(8);
+
+    let fn_clone = file_name.clone();
+    let ct_clone = content_type.clone();
+    let engine_clone = engine.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let reader = ChannelReader::new(rx);
+        engine_clone.put_stream(reader, &fn_clone, ct_clone.as_deref())
+    });
+
+    // Pump bytes from the multipart field into the channel.
+    let mut total_bytes: u64 = 0;
+    let pump_result: Result<(), AppError> = async {
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::bad_request(format!("Failed to read field: {}", e)))?
+        {
+            total_bytes += chunk.len() as u64;
+            if tx.send(Ok(chunk)).is_err() {
+                // Worker dropped (probably errored); stop pumping.
+                break;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    // Closing tx signals EOF to the worker.
+    drop(tx);
+
+    // Propagate multipart error only if the worker didn't already fail with a clearer error.
+    let file_id = worker
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(AppError::from_jihuan)?;
+    pump_result?;
 
     Ok(Json(UploadResponse {
         file_id,
         file_name,
-        file_size,
+        file_size: total_bytes,
     }))
+}
+
+/// Blocking adapter: `std::io::Read` over a `sync_channel` receiver of `Bytes`.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    residual: bytes::Bytes,
+}
+
+impl ChannelReader {
+    fn new(rx: std::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>) -> Self {
+        Self {
+            rx,
+            residual: bytes::Bytes::new(),
+        }
+    }
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.residual.is_empty() {
+            match self.rx.recv() {
+                Ok(Ok(b)) => self.residual = b,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(0), // sender dropped → EOF
+            }
+        }
+        let n = self.residual.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.residual[..n]);
+        self.residual = self.residual.slice(n..);
+        Ok(n)
+    }
 }
 
 /// GET /api/v1/files/:file_id
@@ -163,6 +318,19 @@ pub async fn get_file_meta(
         .map_err(AppError::from_jihuan)?
         .ok_or_else(|| AppError::not_found(&file_id))?;
 
+    let chunks: Vec<ChunkInfoDto> = meta
+        .chunks
+        .iter()
+        .map(|c| ChunkInfoDto {
+            index: c.index,
+            block_id: c.block_id.clone(),
+            offset: c.offset,
+            original_size: c.original_size,
+            compressed_size: c.compressed_size,
+            hash: c.hash.clone(),
+        })
+        .collect();
+
     Ok(Json(FileMetaResponse {
         file_id: meta.file_id,
         file_name: meta.file_name,
@@ -170,6 +338,8 @@ pub async fn get_file_meta(
         create_time: meta.create_time,
         content_type: meta.content_type,
         chunk_count: meta.chunks.len(),
+        chunks: Some(chunks),
+        partition_id: Some(meta.partition_id),
     }))
 }
 
@@ -198,6 +368,13 @@ impl AppError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
+    }
+
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: msg.into(),
         }
     }

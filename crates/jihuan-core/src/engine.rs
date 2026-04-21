@@ -210,6 +210,98 @@ impl Engine {
         Ok(file_id)
     }
 
+    /// Store a file from a streaming reader. Memory usage is bounded to
+    /// `storage.chunk_size` (default 4 MB) regardless of file size.
+    /// This is the preferred entry-point for large uploads.
+    pub fn put_stream<R: Read>(
+        &self,
+        mut reader: R,
+        file_name: &str,
+        content_type: Option<&str>,
+    ) -> Result<String> {
+        let t0 = std::time::Instant::now();
+        let chunk_size = self.config.storage.chunk_size as usize;
+        let algo = self.config.storage.hash_algorithm;
+
+        let file_id = new_id();
+        let create_time = now_secs();
+        let partition_id = current_partition_id(self.config.storage.time_partition_hours);
+
+        let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
+        let mut file_size: u64 = 0;
+        let mut index: u32 = 0;
+        let mut buf = vec![0u8; chunk_size];
+
+        loop {
+            let mut total_read = 0usize;
+            loop {
+                match reader.read(&mut buf[total_read..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total_read += n;
+                        if total_read == chunk_size {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(JiHuanError::Io(e)),
+                }
+            }
+
+            if total_read == 0 {
+                if index == 0 {
+                    // Empty file: emit a single empty chunk for consistency with chunk_data()
+                    let digest = crate::dedup::ChunkDigest::compute(&[], algo);
+                    let raw = RawChunk {
+                        index: 0,
+                        data: bytes::Bytes::new(),
+                        digest,
+                    };
+                    let cm = self.store_chunk(&raw)?;
+                    chunk_metas.push(cm);
+                }
+                break;
+            }
+
+            file_size += total_read as u64;
+            let slice = &buf[..total_read];
+            let digest = crate::dedup::ChunkDigest::compute(slice, algo);
+            let raw = RawChunk {
+                index,
+                data: bytes::Bytes::copy_from_slice(slice),
+                digest,
+            };
+            let cm = self.store_chunk(&raw)?;
+            chunk_metas.push(cm);
+
+            index += 1;
+            if total_read < chunk_size {
+                break;
+            }
+        }
+
+        let file_meta = FileMeta {
+            file_id: file_id.clone(),
+            file_name: file_name.to_string(),
+            file_size,
+            create_time,
+            partition_id,
+            chunks: chunk_metas,
+            content_type: content_type.map(|s| s.to_string()),
+        };
+
+        self.wal.lock().append(WalOperation::InsertFile {
+            file_id: file_id.clone(),
+        })?;
+        self.meta.insert_file(&file_meta)?;
+
+        metrics::counter!("jihuan_puts_total").increment(1);
+        metrics::counter!("jihuan_bytes_written_total").increment(file_size);
+        metrics::histogram!("jihuan_put_duration_seconds").record(t0.elapsed().as_secs_f64());
+
+        Ok(file_id)
+    }
+
     fn store_chunk(&self, raw: &RawChunk) -> Result<ChunkMeta> {
         let hash = &raw.digest.hash;
         let use_dedup = !hash.is_empty();
@@ -550,10 +642,21 @@ impl Engine {
         self.meta.block_count()
     }
 
+    /// List all files (for admin/UI use). Sorted newest-first.
+    pub fn list_all_files(&self) -> Result<Vec<crate::metadata::types::FileMeta>> {
+        self.meta.list_all_files()
+    }
+
     /// Collect a lightweight stats snapshot without any Prometheus dependency.
     pub fn stats(&self) -> Result<crate::metrics::EngineStats> {
         let file_count = self.meta.file_count()?;
         let block_count = self.meta.block_count()?;
+
+        // Flush the active block's BufWriter so on-disk sizes reflect buffered bytes.
+        // This is safe: flush() only pushes the buffered bytes through to the File
+        // without sealing the block.
+        let _ = self.flush_active_block();
+
         let disk_usage_bytes = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
 
         // Rough dedup ratio: if disk is 0 treat as 1x
@@ -687,6 +790,63 @@ mod tests {
         let engine = open_engine(&tmp);
         let result = engine.get_bytes("no-such-file");
         assert!(matches!(result, Err(JiHuanError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_put_stream_small_file() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        let data = b"Streaming upload produces identical content";
+        let file_id = engine
+            .put_stream(std::io::Cursor::new(data), "stream.txt", Some("text/plain"))
+            .unwrap();
+        let got = engine.get_bytes(&file_id).unwrap();
+        assert_eq!(got, data);
+
+        let meta = engine.get_file_meta(&file_id).unwrap().unwrap();
+        assert_eq!(meta.file_size, data.len() as u64);
+        assert_eq!(meta.content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn test_put_stream_empty_file() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let file_id = engine
+            .put_stream(std::io::Cursor::new(b""), "empty.txt", None)
+            .unwrap();
+        assert_eq!(engine.get_bytes(&file_id).unwrap(), b"");
+    }
+
+    #[test]
+    fn test_put_stream_multi_chunk_matches_put_bytes() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 512; // small chunks
+        let engine = Engine::open(cfg).unwrap();
+
+        // 5 KB of data
+        let data: Vec<u8> = (0u8..=255).cycle().take(5 * 1024).collect();
+
+        // Upload via stream
+        let id_stream = engine
+            .put_stream(std::io::Cursor::new(&data), "via_stream.bin", None)
+            .unwrap();
+        // Upload via bytes
+        let id_bytes = engine.put_bytes(&data, "via_bytes.bin", None).unwrap();
+
+        assert_eq!(engine.get_bytes(&id_stream).unwrap(), data);
+        assert_eq!(engine.get_bytes(&id_bytes).unwrap(), data);
+
+        let m_stream = engine.get_file_meta(&id_stream).unwrap().unwrap();
+        let m_bytes = engine.get_file_meta(&id_bytes).unwrap().unwrap();
+        // Same number of chunks and identical hashes at each index (content-addressed).
+        assert_eq!(m_stream.chunks.len(), m_bytes.chunks.len());
+        for (a, b) in m_stream.chunks.iter().zip(m_bytes.chunks.iter()) {
+            assert_eq!(a.hash, b.hash);
+            assert_eq!(a.original_size, b.original_size);
+        }
     }
 
     #[test]

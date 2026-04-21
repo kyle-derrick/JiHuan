@@ -53,17 +53,22 @@ pub fn disk_available_bytes<P: AsRef<Path>>(path: P) -> Option<u64> {
 /// Useful for tracking how much storage is consumed by block files.
 pub fn disk_usage_bytes<P: AsRef<Path>>(path: P) -> u64 {
     let path = path.as_ref();
+    if !path.exists() {
+        return 0;
+    }
     let mut used: u64 = 0;
-    if path.exists() {
-        for entry in walkdir::WalkDir::new(path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    used += meta.len();
-                }
-            }
+    for entry in walkdir::WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // IMPORTANT: use `std::fs::metadata` rather than `entry.metadata()`.
+        // `walkdir` caches the metadata obtained from the directory-enumeration call
+        // (`FindFirstFile`/`FindNextFile` on Windows). That cached size can be
+        // stale for files that still have buffered/unsynced writes from the current
+        // process — the on-disk file actually has more bytes than the cache claims.
+        // A fresh `fs::metadata` call issues a real stat and returns the current size.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
+            used += meta.len();
         }
     }
     used

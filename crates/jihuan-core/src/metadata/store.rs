@@ -183,6 +183,29 @@ impl MetadataStore {
         Ok(file_opt)
     }
 
+    /// List all files (full scan, for admin/UI use)
+    pub fn list_all_files(&self) -> Result<Vec<FileMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut result = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let file: FileMeta = decode(v.value())?;
+            result.push(file);
+        }
+        // Sort newest first
+        result.sort_by(|a, b| b.create_time.cmp(&a.create_time));
+        Ok(result)
+    }
+
     /// List all file IDs in a partition
     pub fn list_files_in_partition(&self, partition_id: u64) -> Result<Vec<String>> {
         let tx = self

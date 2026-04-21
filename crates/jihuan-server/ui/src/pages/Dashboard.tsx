@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Files, Database, HardDrive, Percent, RefreshCw } from 'lucide-react'
+import { Files, Database, HardDrive, Percent, RefreshCw, Clock, Layers } from 'lucide-react'
 import { getStatus, listBlocks, type StatusResponse, type BlockListResponse } from '@/api'
-import { formatBytes } from '@/lib/utils'
+import { formatBytes, formatDuration } from '@/lib/utils'
 
 interface StatCardProps {
   label: string
@@ -45,7 +45,9 @@ export default function Dashboard() {
 
   useEffect(() => { load() }, [])
 
-  const totalDisk = blocks?.blocks.reduce((acc, b) => acc + b.size, 0) ?? 0
+  const diskBytes = status?.disk_usage_bytes ?? 0
+  const totalBlockSize = blocks?.blocks.reduce((acc, b) => acc + b.size, 0) ?? 0
+  const displayDisk = diskBytes > 0 ? diskBytes : totalBlockSize
 
   return (
     <div>
@@ -67,7 +69,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
         <StatCard
           label="文件数"
           value={status?.file_count ?? '—'}
@@ -80,14 +82,40 @@ export default function Dashboard() {
         />
         <StatCard
           label="磁盘占用"
-          value={formatBytes(totalDisk)}
+          value={formatBytes(displayDisk)}
           icon={<HardDrive size={20} />}
+          sub={diskBytes === 0 && totalBlockSize > 0 ? '（含未 seal）' : undefined}
         />
         <StatCard
-          label="算法"
+          label="去重比"
+          value={status ? `${status.dedup_ratio.toFixed(2)}x` : '—'}
+          icon={<Layers size={20} />}
+          sub={status && status.dedup_ratio > 1 ? `节省 ${((1 - 1/status.dedup_ratio) * 100).toFixed(1)}%` : undefined}
+        />
+      </div>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <StatCard
+          label="运行时长"
+          value={status ? formatDuration(status.uptime_secs) : '—'}
+          icon={<Clock size={20} />}
+        />
+        <StatCard
+          label="哈希算法"
           value={status?.hash_algorithm?.toUpperCase() ?? '—'}
           icon={<Percent size={20} />}
           sub={`压缩: ${status?.compression_algorithm ?? '—'} L${status?.compression_level ?? ''}`}
+        />
+        <StatCard
+          label="版本"
+          value={status?.version ?? '—'}
+          icon={<Database size={20} />}
+        />
+        <StatCard
+          label="Active / Sealed"
+          value={blocks ? `${blocks.blocks.filter(b => !b.sealed).length} / ${blocks.blocks.filter(b => b.sealed).length}` : '—'}
+          icon={<Layers size={20} />}
+          sub="未 seal / 已 seal"
         />
       </div>
 
@@ -115,7 +143,7 @@ export default function Dashboard() {
           <h2 className="text-base font-semibold text-gray-800 mb-4">Block 分布（前 10）</h2>
           <div className="space-y-2">
             {blocks.blocks.slice(0, 10).map((b) => {
-              const pct = totalDisk > 0 ? (b.size / totalDisk) * 100 : 0
+              const pct = displayDisk > 0 ? (b.size / displayDisk) * 100 : 0
               return (
                 <div key={b.block_id}>
                   <div className="flex justify-between text-xs text-gray-500 mb-1">

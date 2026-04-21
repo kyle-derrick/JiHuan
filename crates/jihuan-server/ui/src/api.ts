@@ -32,6 +32,9 @@ async function apiJSON<T>(path: string, init: RequestInit = {}): Promise<T> {
 export interface StatusResponse {
   file_count: number
   block_count: number
+  disk_usage_bytes: number
+  dedup_ratio: number
+  uptime_secs: number
   version: string
   hash_algorithm: string
   compression_algorithm: string
@@ -42,6 +45,15 @@ export const getStatus = () => apiJSON<StatusResponse>('/api/status')
 
 // ── Files ───────────────────────────────────────────────────────────────────
 
+export interface ChunkInfo {
+  index: number
+  block_id: string
+  offset: number
+  original_size: number
+  compressed_size: number
+  hash: string
+}
+
 export interface FileMeta {
   file_id: string
   file_name: string
@@ -49,6 +61,8 @@ export interface FileMeta {
   create_time: number
   content_type: string | null
   chunk_count: number
+  chunks?: ChunkInfo[]
+  partition_id?: number
 }
 
 export interface UploadResponse {
@@ -81,6 +95,31 @@ export async function uploadFile(file: File, onProgress?: (pct: number) => void)
     xhr.onerror = () => reject(new Error('Network error'))
     xhr.send(form)
   })
+}
+
+export interface FileListResponse {
+  files: FileMeta[]
+  count: number
+  total: number
+}
+
+export interface ListFilesParams {
+  limit?: number
+  offset?: number
+  q?: string
+  sort?: 'create_time' | 'file_name' | 'file_size'
+  order?: 'asc' | 'desc'
+}
+
+export const listFiles = (params: ListFilesParams = {}) => {
+  const sp = new URLSearchParams()
+  if (params.limit != null) sp.set('limit', String(params.limit))
+  if (params.offset != null) sp.set('offset', String(params.offset))
+  if (params.q) sp.set('q', params.q)
+  if (params.sort) sp.set('sort', params.sort)
+  if (params.order) sp.set('order', params.order)
+  const qs = sp.toString()
+  return apiJSON<FileListResponse>(`/api/v1/files${qs ? '?' + qs : ''}`)
 }
 
 export const getFileMeta = (fileId: string) =>
@@ -116,6 +155,7 @@ export interface BlockInfo {
   ref_count: number
   path: string
   create_time: number
+  sealed: boolean
 }
 
 export interface BlockListResponse {
@@ -123,7 +163,83 @@ export interface BlockListResponse {
   count: number
 }
 
+export interface ReferencingFile {
+  file_id: string
+  file_name: string
+  file_size: number
+  chunks_in_block: number
+}
+
+export interface BlockDetail extends BlockInfo {
+  referencing_files: ReferencingFile[]
+}
+
 export const listBlocks = () => apiJSON<BlockListResponse>('/api/block/list')
+
+export const getBlockDetail = (blockId: string) =>
+  apiJSON<BlockDetail>(`/api/block/${blockId}`)
+
+export async function deleteBlock(blockId: string) {
+  const resp = await apiFetch(`/api/block/${blockId}`, { method: 'DELETE' })
+  if (!resp.ok && resp.status !== 204) {
+    const text = await resp.text()
+    let msg = text
+    try { msg = JSON.parse(text).error ?? text } catch {}
+    throw new Error(`HTTP ${resp.status}: ${msg}`)
+  }
+}
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+export const getConfig = () => apiJSON<Record<string, unknown>>('/api/config')
+
+// ── Metrics ─────────────────────────────────────────────────────────────────
+
+/** Fetch raw Prometheus metrics text from the metrics endpoint (port 9090 by default).
+ * In dev we go through vite proxy; in prod UI is served on HTTP port while metrics
+ * are on a separate port — use absolute URL derived from host. */
+export async function fetchMetricsText(): Promise<string> {
+  // Try same host, port 9090 (default metrics port)
+  const url = `${window.location.protocol}//${window.location.hostname}:9090/metrics`
+  const resp = await fetch(url).catch(() => null)
+  if (!resp || !resp.ok) throw new Error('Metrics endpoint unreachable (port 9090)')
+  return resp.text()
+}
+
+export interface ParsedMetrics {
+  counters: Record<string, number>
+  histograms: Record<string, { count: number; sum: number; quantiles: Record<string, number> }>
+}
+
+/** Minimal Prometheus text-format parser for our known metrics. */
+export function parseMetrics(text: string): ParsedMetrics {
+  const counters: Record<string, number> = {}
+  const histograms: Record<string, { count: number; sum: number; quantiles: Record<string, number> }> = {}
+  for (const line of text.split('\n')) {
+    if (!line || line.startsWith('#')) continue
+    // counter: name value
+    const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9eE+.\-]+)/)
+    if (!m) continue
+    const [, name, labels = '', valueStr] = m
+    const value = parseFloat(valueStr)
+    if (!Number.isFinite(value)) continue
+    if (name.endsWith('_count') || name.endsWith('_sum')) {
+      const base = name.replace(/_(count|sum)$/, '')
+      if (!histograms[base]) histograms[base] = { count: 0, sum: 0, quantiles: {} }
+      if (name.endsWith('_count')) histograms[base].count = value
+      else histograms[base].sum = value
+    } else if (labels.includes('quantile=')) {
+      const qm = labels.match(/quantile="([^"]+)"/)
+      if (qm) {
+        if (!histograms[name]) histograms[name] = { count: 0, sum: 0, quantiles: {} }
+        histograms[name].quantiles[qm[1]] = value
+      }
+    } else if (!labels) {
+      counters[name] = value
+    }
+  }
+  return { counters, histograms }
+}
 
 // ── GC ──────────────────────────────────────────────────────────────────────
 
