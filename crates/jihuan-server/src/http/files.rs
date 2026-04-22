@@ -14,6 +14,72 @@ use jihuan_core::{Engine, JiHuanError};
 
 use crate::http::auth::{require_scope, AuthedKey};
 
+/// Build an RFC 6266-compliant `Content-Disposition: attachment` header
+/// value from an arbitrary user-supplied filename. Guarantees the result
+/// never contains bytes that are illegal in HTTP header values (CR, LF,
+/// NUL, DEL, control chars) — those would otherwise either make the
+/// header unparsable (→ 500) or, worse, allow response splitting.
+///
+/// We emit both forms: a quoted ASCII fallback (`filename="…"`, with
+/// unsafe bytes and backslash/quote replaced by `_`) for old clients, and
+/// the percent-encoded UTF-8 variant (`filename*=UTF-8''…`) that every
+/// modern browser prefers and which preserves full Unicode fidelity.
+fn content_disposition_attachment(name: &str) -> axum::http::HeaderValue {
+    // ── Percent-encode UTF-8 per RFC 5987 §3.2.1 ─────────────────────────
+    // Keep the "attr-char" set (alnum + a few symbols); everything else
+    // — including spaces, quotes and control bytes — is %HH-escaped.
+    fn is_attr_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'&'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+    let mut encoded = String::with_capacity(name.len() * 2);
+    for b in name.as_bytes() {
+        if is_attr_char(*b) {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+
+    // ── ASCII fallback: replace everything outside printable-ASCII or
+    // the few quoted-string special chars with `_` ─────────────────────
+    let mut ascii = String::with_capacity(name.len());
+    for b in name.as_bytes() {
+        match *b {
+            b'"' | b'\\' => ascii.push('_'),
+            0x20..=0x7E => ascii.push(*b as char),
+            _ => ascii.push('_'), // control bytes / non-ASCII
+        }
+    }
+    if ascii.is_empty() {
+        ascii.push_str("download");
+    }
+
+    // HeaderValue::from_str accepts only visible ASCII + space + HT, so
+    // after the sanitisation above this never fails; falling through to
+    // a hardcoded default keeps the type signature infallible.
+    let v = format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii, encoded
+    );
+    axum::http::HeaderValue::from_str(&v).unwrap_or_else(|_| {
+        axum::http::HeaderValue::from_static("attachment; filename=\"download\"")
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     pub file_id: String,
@@ -292,20 +358,24 @@ pub async fn download_file(
         None => None,
     };
 
+    // Build headers using infallible `HeaderValue` constructors where
+    // possible. `content_type` is user-influenced (multipart part header
+    // at upload time), so parse it defensively and fall back to the
+    // static octet-stream default when it contains bytes that are
+    // illegal in a response header.
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        content_type
-            .parse()
-            .unwrap_or("application/octet-stream".parse().unwrap()),
-    );
+    let ct_value = content_type
+        .parse()
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CONTENT_TYPE, ct_value);
     headers.insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}\"", meta.file_name)
-            .parse()
-            .unwrap(),
+        content_disposition_attachment(&meta.file_name),
     );
-    headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    headers.insert(
+        header::ACCEPT_RANGES,
+        axum::http::HeaderValue::from_static("bytes"),
+    );
 
     if let Some((start, end)) = range_req {
         // 206 Partial Content
@@ -407,46 +477,6 @@ fn parse_single_byte_range(header: &str, file_size: u64) -> Result<(u64, u64), R
     }
     // Clamp end to last byte
     Ok((start, end.min(file_size - 1)))
-}
-
-#[cfg(test)]
-mod range_tests {
-    use super::*;
-
-    #[test]
-    fn parse_basic() {
-        assert_eq!(parse_single_byte_range("bytes=0-99", 1000).unwrap(), (0, 99));
-        assert_eq!(
-            parse_single_byte_range("bytes=500-", 1000).unwrap(),
-            (500, 999)
-        );
-        assert_eq!(parse_single_byte_range("bytes=-100", 1000).unwrap(), (900, 999));
-        // Clamps end
-        assert_eq!(
-            parse_single_byte_range("bytes=0-9999", 1000).unwrap(),
-            (0, 999)
-        );
-    }
-
-    #[test]
-    fn parse_rejects_invalid() {
-        assert!(matches!(
-            parse_single_byte_range("bytes=0-100,200-300", 1000),
-            Err(RangeParseError::Multi)
-        ));
-        assert!(matches!(
-            parse_single_byte_range("bytes=1000-2000", 1000),
-            Err(RangeParseError::Unsatisfiable)
-        ));
-        assert!(matches!(
-            parse_single_byte_range("items=0-10", 1000),
-            Err(RangeParseError::Malformed)
-        ));
-        assert!(matches!(
-            parse_single_byte_range("bytes=5-3", 1000),
-            Err(RangeParseError::Unsatisfiable)
-        ));
-    }
 }
 
 /// DELETE /api/v1/files/:file_id
@@ -580,5 +610,85 @@ impl IntoResponse for AppError {
             code,
         });
         (self.status, body).into_response()
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+// Kept at the very bottom of the file to satisfy clippy's
+// `items_after_test_module`: any `pub fn` / `impl` block declared *after*
+// a `#[cfg(test)] mod` would otherwise live in a compilation unit the
+// test harness ignores.
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic() {
+        assert_eq!(parse_single_byte_range("bytes=0-99", 1000).unwrap(), (0, 99));
+        assert_eq!(
+            parse_single_byte_range("bytes=500-", 1000).unwrap(),
+            (500, 999)
+        );
+        assert_eq!(parse_single_byte_range("bytes=-100", 1000).unwrap(), (900, 999));
+        // Clamps end
+        assert_eq!(
+            parse_single_byte_range("bytes=0-9999", 1000).unwrap(),
+            (0, 999)
+        );
+    }
+
+    /// Security regression: malicious filenames (CR/LF for response
+    /// splitting, quotes for `Content-Disposition` quoted-string
+    /// injection, Unicode for header byte-range violations) must never
+    /// propagate into the response header unchanged. We also verify the
+    /// RFC 5987 `filename*=UTF-8''` extended form is attached so modern
+    /// browsers render the original Unicode.
+    #[test]
+    fn content_disposition_sanitises_hostile_filenames() {
+        // Plain ASCII passes through.
+        let v = content_disposition_attachment("hello.txt");
+        assert_eq!(
+            v.to_str().unwrap(),
+            "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
+        );
+
+        // CR/LF must be dropped before the header value is constructed.
+        let v = content_disposition_attachment("evil\r\nX-Injected: pwn\r\n");
+        let s = v.to_str().unwrap();
+        assert!(!s.contains('\r'), "carriage return leaked: {:?}", s);
+        assert!(!s.contains('\n'), "newline leaked: {:?}", s);
+
+        // Embedded quote / backslash are downgraded to `_` in the ASCII
+        // fallback; the extended form percent-encodes them.
+        let v = content_disposition_attachment("a\"b\\c");
+        let s = v.to_str().unwrap();
+        assert!(s.starts_with("attachment; filename=\"a_b_c\";"));
+        assert!(s.contains("filename*=UTF-8''a%22b%5Cc"));
+
+        // Non-ASCII Unicode survives via the extended form.
+        let v = content_disposition_attachment("中文.pdf");
+        let s = v.to_str().unwrap();
+        assert!(s.contains("filename*=UTF-8''%E4%B8%AD%E6%96%87.pdf"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid() {
+        assert!(matches!(
+            parse_single_byte_range("bytes=0-100,200-300", 1000),
+            Err(RangeParseError::Multi)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("bytes=1000-2000", 1000),
+            Err(RangeParseError::Unsatisfiable)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("items=0-10", 1000),
+            Err(RangeParseError::Malformed)
+        ));
+        assert!(matches!(
+            parse_single_byte_range("bytes=5-3", 1000),
+            Err(RangeParseError::Unsatisfiable)
+        ));
     }
 }

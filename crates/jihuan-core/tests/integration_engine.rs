@@ -265,11 +265,10 @@ fn test_data_persists_across_reopen() {
     let file_id = {
         let cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         let engine = Engine::open(cfg).unwrap();
-        let id = engine
+        // Drop engine at end of block → seals active block via Drop
+        engine
             .put_bytes(b"persistent data", "persist.txt", None)
-            .unwrap();
-        // Drop engine → seals active block
-        id
+            .unwrap()
     };
 
     // Reopen

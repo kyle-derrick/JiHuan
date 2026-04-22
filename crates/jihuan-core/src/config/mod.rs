@@ -86,6 +86,26 @@ fn default_auto_compact_every_gc_ticks() -> u32 {
     12 // with 5-min GC tick → once per hour
 }
 
+fn default_auto_compact_min_benefit_bytes() -> u64 {
+    // v0.4.5: skip compaction groups whose projected byte savings
+    // (sum of old block sizes − sum of live bytes) fall below this
+    // threshold. Prevents re-encoding gigabytes just to reclaim a
+    // handful of KiB on datasets with many near-full blocks. 8 MiB is
+    // conservative: one block's worth of overhead/write amplification
+    // has to actually win us this much real disk back.
+    8 * 1024 * 1024
+}
+
+fn default_auto_compact_disk_headroom_bytes() -> u64 {
+    // v0.4.5: before writing a merge group we check that the filesystem
+    // has at least (group_live_bytes + this much) free. Protects against
+    // the edge case where compaction would tip the disk over the edge
+    // while the old blocks are still on disk (they're only deleted after
+    // the new block is committed). 512 MiB default — enough for one
+    // block_file_size plus a little slack on the 1 GiB default.
+    512 * 1024 * 1024
+}
+
 fn default_max_open_block_files() -> usize {
     64
 }
@@ -196,6 +216,21 @@ pub struct StorageConfig {
     /// is false.
     #[serde(default = "default_auto_compact_every_gc_ticks")]
     pub auto_compact_every_gc_ticks: u32,
+
+    /// v0.4.5: skip a compaction *group* when its projected byte savings
+    /// (sum of old block sizes − sum of live bytes) are below this floor.
+    /// Applies to both single-block groups (the targeted rewrite path is
+    /// unaffected) and multi-block merges. Zero disables the filter.
+    #[serde(default = "default_auto_compact_min_benefit_bytes")]
+    pub auto_compact_min_benefit_bytes: u64,
+
+    /// v0.4.5: minimum filesystem free-space headroom (bytes) required to
+    /// start a compaction group. Checked as `available(data_dir) >=
+    /// group_live_bytes + auto_compact_disk_headroom_bytes`. Groups that
+    /// don't fit are skipped — individual compactions don't partially apply.
+    /// Zero disables the check.
+    #[serde(default = "default_auto_compact_disk_headroom_bytes")]
+    pub auto_compact_disk_headroom_bytes: u64,
 }
 
 /// Server configuration
@@ -232,6 +267,20 @@ pub struct ServerConfig {
     /// credentials).
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+
+    /// v0.4.5: per-request wall-clock timeout in seconds for non-upload
+    /// HTTP routes. Guards against slow-loris clients, stuck backend
+    /// tasks, and misbehaving reverse proxies that hold connections
+    /// indefinitely. `0` disables the timeout (not recommended in
+    /// production). Upload and download routes are intentionally exempt
+    /// — streaming a multi-GB file can legitimately take much longer
+    /// than the default.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 fn default_audit_retention_days() -> u64 {
@@ -260,6 +309,14 @@ pub struct AuthConfig {
     /// events off-box before pruning).
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u64,
+
+    /// v0.4.5: emit the `Secure` flag on session cookies so browsers only
+    /// return them over HTTPS. **Leave `false` for plain-HTTP dev** —
+    /// a `Secure` cookie over HTTP is silently dropped by every modern
+    /// browser, breaking the UI login flow. Flip to `true` once the
+    /// deployment is behind TLS (reverse proxy or direct).
+    #[serde(default)] // defaults to false
+    pub cookie_secure: bool,
 }
 
 impl Default for AuthConfig {
@@ -268,6 +325,7 @@ impl Default for AuthConfig {
             enabled: true,
             exempt_routes: default_exempt_routes(),
             audit_retention_days: default_audit_retention_days(),
+            cookie_secure: false,
         }
     }
 }
@@ -439,6 +497,8 @@ impl ConfigTemplate {
                 auto_compact_threshold: default_auto_compact_threshold(),
                 auto_compact_min_size_bytes: default_auto_compact_min_size_bytes(),
                 auto_compact_every_gc_ticks: default_auto_compact_every_gc_ticks(),
+                auto_compact_min_benefit_bytes: default_auto_compact_min_benefit_bytes(),
+                auto_compact_disk_headroom_bytes: default_auto_compact_disk_headroom_bytes(),
             },
             server: ServerConfig {
                 http_addr: default_http_addr(),
@@ -448,6 +508,7 @@ impl ConfigTemplate {
                 max_body_size: None,
                 enable_access_log: true,
                 cors_origins: default_cors_origins(),
+                request_timeout_secs: default_request_timeout_secs(),
             },
             auth: AuthConfig::default(),
         }

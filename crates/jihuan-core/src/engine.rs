@@ -109,6 +109,30 @@ pub struct CompactionBlockStats {
     pub dropped_chunks: u64,
 }
 
+/// v0.4.5: per-block live-byte / live-hash view used by the compaction
+/// scanner and by the admin block-listing API.
+///
+/// Deliberately *not* serialisable — callers project the `live_bytes` scalar
+/// into their own DTOs (`BlockInfoDto` / stats structs). Keeping the
+/// `live_hashes` set internal avoids shipping potentially large hash lists
+/// over the wire on every `/api/block/list` poll.
+#[derive(Debug, Clone)]
+pub struct BlockLiveInfo {
+    /// Sum of `compressed_size` over **unique** chunk hashes referenced by
+    /// any live file. See [`Engine::compute_block_live_info`] for dedup
+    /// rationale.
+    pub live_bytes: u64,
+    /// The set of unique hashes referenced. Consumed by
+    /// `compact_merge_group` to decide which chunks to copy over.
+    ///
+    /// Stored as `Arc<str>` rather than `String` so the downstream
+    /// `compact_low_utilization` scanner can `.clone()` this set into the
+    /// candidate tuple without re-allocating every hash — a cheap refcount
+    /// bump instead of N String allocations. Matters on dedup-heavy tiers
+    /// where a single candidate block can easily hold 10k+ unique hashes.
+    pub live_hashes: std::collections::HashSet<std::sync::Arc<str>>,
+}
+
 /// TTL for the `stats()` cache. Five seconds balances Dashboard freshness
 /// against scan cost: a 1 M-file deployment walks `data_dir` in ~1 s, so
 /// 5 s keeps amortised CPU at ~20 % of a core even under a 1 Hz poll.
@@ -126,6 +150,32 @@ pub struct RepairSummary {
     pub files_removed: u32,
     pub blocks_removed: u32,
     pub dedup_removed: u32,
+}
+
+/// v0.4.5: `(source_block_meta, live_bytes, live_hashes)` triple used by
+/// the cross-block compaction merger. Named to appease clippy's
+/// `type_complexity` lint and to make the many `Vec<...>` / `&[...]`
+/// signatures in `engine.rs` readable.
+type CompactSource = (BlockMeta, u64, std::collections::HashSet<std::sync::Arc<str>>);
+
+/// Result of [`Engine::reseal_orphan_block_static`].
+///
+/// `chunks_restored` is the number of **unique** chunk hashes whose
+/// `ChunkEntry` rows we rebuilt in the new index table. Files that dedup
+/// against this block will all point back at those same entries after
+/// the rename, so `chunks_restored` may be less than the number of
+/// `FileMeta`-level chunk references that the operator expects.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ResealSummary {
+    pub block_id: String,
+    pub chunks_restored: u64,
+    /// Size of the resealed `.blk` after truncation + footer write.
+    pub final_size: u64,
+    /// Bytes dropped from the end of the orphan file because they were
+    /// part of a chunk that never made it into metadata (partial write
+    /// at crash time). Non-zero indicates those bytes are permanently
+    /// gone; all metadata-referenced bytes survived.
+    pub trailing_bytes_truncated: u64,
 }
 
 /// Cached chunk data stored in memory while a block is still being written.
@@ -959,6 +1009,188 @@ impl Engine {
         Self::repair_static(&self.meta, &self.config.storage.data_dir)
     }
 
+    /// Recovery helper: rebuild a valid footer + index table for a
+    /// quarantined `.blk.orphan` so the block becomes readable again.
+    ///
+    /// **Must be run while the server is stopped** — we open the data
+    /// file in write mode and truncate any trailing partial chunk. The
+    /// orphan is produced by `cleanup_incomplete_blocks` on startup when
+    /// an unsealed active block still has metadata references; by the
+    /// time this function runs, all metadata for the block is intact
+    /// (if it weren't, the operator would have chosen `JIHUAN_REPAIR=1`
+    /// instead, which *removes* the metadata).
+    ///
+    /// Procedure:
+    /// 1. Look up `BlockMeta` to find the expected `.blk` path; derive
+    ///    `.blk.orphan` from it.
+    /// 2. Stream `FileMeta` rows, collect unique `(hash, offset,
+    ///    compressed_size, original_size)` pointing at this block.
+    /// 3. Sort ascending by offset; truncate the orphan file to the
+    ///    max `offset + compressed_size` (drops bytes from a partial
+    ///    chunk that crashed before its metadata was committed).
+    /// 4. For every unique chunk, read its compressed bytes back off
+    ///    disk, compute its CRC32, and build a `ChunkEntry`. Accumulate
+    ///    the whole-block `data_crc32` as the concatenation of those
+    ///    bytes in offset order, matching `BlockWriter::finish`.
+    /// 5. Serialise the index table and a fresh `BlockFooter`, fsync,
+    ///    then rename `.blk.orphan` → `.blk`.
+    /// 6. Update `BlockMeta.size` so the UI's utilisation math agrees
+    ///    with the new file size.
+    ///
+    /// All steps run before any rename, so a crash partway through
+    /// leaves the orphan file in place and the metadata untouched —
+    /// the operator can simply re-run the command.
+    pub fn reseal_orphan_block_static(
+        meta: &MetadataStore,
+        data_dir: &std::path::Path,
+        block_id: &str,
+        compression: crate::config::CompressionAlgorithm,
+    ) -> Result<ResealSummary> {
+        use crate::block::format::{BlockFooter, ChunkEntry};
+        use std::collections::HashMap;
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        // ── 1. Locate the orphan file ────────────────────────────────────
+        let mut block_meta = meta.get_block(block_id)?.ok_or_else(|| {
+            JiHuanError::NotFound(format!(
+                "reseal: no BlockMeta row for block_id {}. \
+                 If the metadata is truly gone, run JIHUAN_REPAIR=1 to purge \
+                 any dangling references and then delete the .blk.orphan manually.",
+                block_id
+            ))
+        })?;
+
+        let sealed_path = std::path::PathBuf::from(&block_meta.path);
+        let orphan_path = sealed_path.with_extension("blk.orphan");
+
+        if sealed_path.exists() && !orphan_path.exists() {
+            return Err(JiHuanError::InvalidArgument(format!(
+                "reseal: {} is already sealed (no .blk.orphan next to it); nothing to do",
+                block_id
+            )));
+        }
+        if !orphan_path.exists() {
+            return Err(JiHuanError::NotFound(format!(
+                "reseal: orphan file {} does not exist",
+                orphan_path.display()
+            )));
+        }
+        let _ = data_dir; // reserved for future subdir validation
+
+        // ── 2. Collect unique chunks pointing at this block ──────────────
+        // Dedup by hash: multiple FileMeta rows may reference the same
+        // physical (offset, compressed_size) tuple. Take the first.
+        let mut unique: HashMap<String, (u64, u32, u32)> = HashMap::new();
+        meta.for_each_file(|f| {
+            for c in &f.chunks {
+                if c.block_id == block_id {
+                    unique
+                        .entry(c.hash.clone())
+                        .or_insert((c.offset, c.compressed_size as u32, c.original_size as u32));
+                }
+            }
+            Ok(())
+        })?;
+        if unique.is_empty() {
+            return Err(JiHuanError::InvalidArgument(format!(
+                "reseal: no FileMeta rows reference block {}; \
+                 run JIHUAN_REPAIR=1 to clean dangling metadata and delete the orphan file",
+                block_id
+            )));
+        }
+
+        // ── 3. Sort by offset & verify the orphan file covers them all ──
+        let mut sorted: Vec<(String, u64, u32, u32)> = unique
+            .into_iter()
+            .map(|(h, (off, cs, os))| (h, off, cs, os))
+            .collect();
+        sorted.sort_by_key(|x| x.1);
+        let data_end: u64 = sorted
+            .iter()
+            .map(|(_, off, cs, _)| *off + *cs as u64)
+            .max()
+            .unwrap_or(0);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&orphan_path)
+            .map_err(JiHuanError::Io)?;
+        let orig_size = file.metadata().map_err(JiHuanError::Io)?.len();
+        if orig_size < data_end {
+            return Err(JiHuanError::DataCorruption(format!(
+                "reseal: orphan file is {} bytes but metadata requires at least {} — \
+                 the last chunk write never hit disk. Aborting to avoid silent data loss.",
+                orig_size, data_end
+            )));
+        }
+        let trailing = orig_size.saturating_sub(data_end);
+
+        // ── 4. Build ChunkEntry rows and accumulate block data_crc32 ────
+        let algo_byte: u8 = match compression {
+            crate::config::CompressionAlgorithm::None => 0,
+            crate::config::CompressionAlgorithm::Lz4 => 1,
+            crate::config::CompressionAlgorithm::Zstd => 2,
+        };
+        let mut entries: Vec<ChunkEntry> = Vec::with_capacity(sorted.len());
+        let mut block_hasher = crc32fast::Hasher::new();
+        for (hash, offset, cs, os) in &sorted {
+            file.seek(SeekFrom::Start(*offset)).map_err(JiHuanError::Io)?;
+            let mut buf = vec![0u8; *cs as usize];
+            file.read_exact(&mut buf).map_err(JiHuanError::Io)?;
+            let data_crc = crc32fast::hash(&buf);
+            block_hasher.update(&buf);
+            entries.push(ChunkEntry::new(hash, *offset, *cs, *os, data_crc, algo_byte));
+        }
+        let block_data_crc = block_hasher.finalize();
+
+        // ── 5. Truncate partial tail, append index + footer ─────────────
+        file.set_len(data_end).map_err(JiHuanError::Io)?;
+        file.seek(SeekFrom::Start(data_end)).map_err(JiHuanError::Io)?;
+        for e in &entries {
+            let buf = bincode::encode_to_vec(e, bincode::config::standard()).map_err(|err| {
+                JiHuanError::Serialization(format!("ChunkEntry encode: {}", err))
+            })?;
+            file.write_all(&buf).map_err(JiHuanError::Io)?;
+        }
+        let chunk_count = entries.len() as u32;
+        let footer = BlockFooter::new(data_end, chunk_count, block_data_crc);
+        let footer_buf = bincode::encode_to_vec(&footer, bincode::config::standard())
+            .map_err(|err| JiHuanError::Serialization(format!("BlockFooter encode: {}", err)))?;
+        file.write_all(&footer_buf).map_err(JiHuanError::Io)?;
+        file.sync_all().map_err(JiHuanError::Io)?;
+        drop(file);
+
+        // ── 6. Rename orphan → sealed, update BlockMeta.size ────────────
+        std::fs::rename(&orphan_path, &sealed_path).map_err(JiHuanError::Io)?;
+        let final_size = std::fs::metadata(&sealed_path)
+            .map_err(JiHuanError::Io)?
+            .len();
+        block_meta.size = final_size;
+        meta.insert_block(&block_meta)?;
+
+        Ok(ResealSummary {
+            block_id: block_id.to_string(),
+            chunks_restored: chunk_count as u64,
+            final_size,
+            trailing_bytes_truncated: trailing,
+        })
+    }
+
+    /// Test-only: flush the active block's BufWriter to the file so a
+    /// simulated kill (drop the engine without `shutdown()`) reliably
+    /// leaves all committed chunk data on disk. Mirrors the kernel-level
+    /// fsync that a clean shutdown would perform, minus the footer write.
+    #[cfg(test)]
+    pub(crate) fn flush_active_writer_for_test(&self) -> Result<()> {
+        let mut guard = self.active_writer.lock();
+        if let Some(ab) = guard.as_mut() {
+            ab.writer.flush()?;
+        }
+        Ok(())
+    }
+
     /// Test-only: wipe the active block's chunk cache to force the next read
     /// through the disk-fallback path. Used by Phase 6b-P6 eviction tests so
     /// we don't need to write tens of MB to trigger eviction organically.
@@ -1410,6 +1642,90 @@ impl Engine {
         &self.meta
     }
 
+    /// v0.4.5: compute per-block *unique* live-bytes and live-hash sets by
+    /// scanning every `FileMeta.chunks[]` entry once.
+    ///
+    /// `live_bytes` for a block is defined as the sum of `compressed_size`
+    /// over the **unique** chunk hashes referenced from at least one live
+    /// file. Deduplicated references (same hash referenced by multiple
+    /// files, or multiple times within one file) contribute **once**, since
+    /// the chunk physically occupies the block exactly once. This is the
+    /// canonical utilisation metric used by both:
+    ///   * the compaction scanner (deciding which blocks to rewrite);
+    ///   * the `/api/block/list` + `/api/block/:id` API surface (so the UI
+    ///     shows the same ratio the scanner uses).
+    ///
+    /// Prior to v0.4.5 the scanner naively summed `compressed_size` per
+    /// `ChunkMeta` reference, which could overshoot the physical block size
+    /// on dedup-heavy datasets (utilisation > 100% reported) and starve
+    /// compaction of genuinely low-util blocks. Fixed by the HashSet-
+    /// per-block aggregation below.
+    pub fn compute_block_live_info(
+        &self,
+    ) -> Result<std::collections::HashMap<String, BlockLiveInfo>> {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        // Streaming aggregation: we never hold more than one FileMeta in
+        // heap at a time (beyond the growing per-block HashSets). For a
+        // 1 M-file deployment this replaces an ~O(files × avg_chunks)
+        // Vec<FileMeta> allocation (~hundreds of MB) with O(unique_hashes)
+        // Arc<str> buffers (~dozens of MB).
+        let mut live_hashes_per_block: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        // Hash-string intern pool: dedup-heavy tiers see the same hash
+        // referenced by many files; this keeps only one `Arc<str>` alive.
+        let mut intern: HashMap<String, Arc<str>> = HashMap::new();
+        // `compressed_size` per (block_id, hash) pair. All references to
+        // the same (block, hash) agree on the size; we take the first.
+        let mut size_by_block_hash: HashMap<(String, Arc<str>), u64> = HashMap::new();
+
+        self.meta.for_each_file(|f| {
+            for c in &f.chunks {
+                let h: Arc<str> = match intern.get(&c.hash) {
+                    Some(a) => a.clone(),
+                    None => {
+                        let a: Arc<str> = Arc::from(c.hash.as_str());
+                        intern.insert(c.hash.clone(), a.clone());
+                        a
+                    }
+                };
+                live_hashes_per_block
+                    .entry(c.block_id.clone())
+                    .or_default()
+                    .insert(h.clone());
+                size_by_block_hash
+                    .entry((c.block_id.clone(), h))
+                    .or_insert(c.compressed_size);
+            }
+            Ok(())
+        })?;
+        // intern is no longer needed now that every Arc<str> has been
+        // cloned into the sets; drop it early to free memory before the
+        // live_bytes reduction below.
+        drop(intern);
+
+        let mut out: HashMap<String, BlockLiveInfo> = HashMap::new();
+        for (block_id, hashes) in live_hashes_per_block {
+            let live_bytes: u64 = hashes
+                .iter()
+                .map(|h| {
+                    size_by_block_hash
+                        .get(&(block_id.clone(), h.clone()))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .sum();
+            out.insert(
+                block_id,
+                BlockLiveInfo {
+                    live_bytes,
+                    live_hashes: hashes,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
@@ -1670,28 +1986,19 @@ impl Engine {
         threshold: f64,
         min_size_bytes: u64,
     ) -> Result<Vec<CompactionBlockStats>> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
 
         let threshold = threshold.clamp(0.0, 1.0);
         let pinned = self.pinned_blocks.lock().clone();
         let all_blocks = self.meta.list_all_blocks()?;
-        let all_files = self.meta.list_all_files()?;
 
-        // Per-block live-byte sum + live hash set from FileMeta.chunks.
-        let mut live_bytes: HashMap<String, u64> = HashMap::new();
-        let mut live_hashes_per_block: HashMap<String, HashSet<String>> = HashMap::new();
-        for f in &all_files {
-            for c in &f.chunks {
-                *live_bytes.entry(c.block_id.clone()).or_insert(0) += c.compressed_size;
-                live_hashes_per_block
-                    .entry(c.block_id.clone())
-                    .or_default()
-                    .insert(c.hash.clone());
-            }
-        }
+        // v0.4.5: use the canonical unique-hash live-bytes computation so
+        // the scanner and `/api/block/list` never disagree, and dedup-heavy
+        // datasets don't falsely report >100% utilisation.
+        let live_info = self.compute_block_live_info()?;
 
         // Filter candidates: sealed, non-pinned, above min_size, below util threshold.
-        let mut candidates: Vec<(BlockMeta, u64, HashSet<String>)> = Vec::new();
+        let mut candidates: Vec<CompactSource> = Vec::new();
         for b in all_blocks {
             if pinned.contains(&b.block_id) {
                 continue;
@@ -1699,22 +2006,39 @@ impl Engine {
             if b.size < min_size_bytes {
                 continue;
             }
-            let live = live_bytes.get(&b.block_id).copied().unwrap_or(0);
+            let (live, hashes) = match live_info.get(&b.block_id) {
+                Some(info) => (info.live_bytes, info.live_hashes.clone()),
+                None => (0, HashSet::new()),
+            };
             let util = if b.size == 0 {
                 1.0
             } else {
                 live as f64 / b.size as f64
             };
+            // Per-candidate scan decision. Emits the four numbers an
+            // operator needs to reproduce the scanner's verdict by hand,
+            // plus whether the block was kept or dropped. Enable with
+            // `RUST_LOG=jihuan_core::engine=debug`.
+            tracing::debug!(
+                block_id = %b.block_id,
+                size = b.size,
+                live_bytes = live,
+                utilization = %format_args!("{:.3}", util),
+                threshold = %format_args!("{:.3}", threshold),
+                kept = util < threshold,
+                "compact_low_utilization: candidate scan"
+            );
             if util < threshold {
-                let hashes = live_hashes_per_block
-                    .get(&b.block_id)
-                    .cloned()
-                    .unwrap_or_default();
                 candidates.push((b, live, hashes));
             }
         }
 
         if candidates.is_empty() {
+            tracing::debug!(
+                threshold = %format_args!("{:.3}", threshold),
+                min_size_bytes,
+                "compact_low_utilization: no candidates below threshold; nothing to do"
+            );
             return Ok(vec![]);
         }
 
@@ -1731,8 +2055,8 @@ impl Engine {
         candidates.sort_by_key(|(_, live, _)| *live);
 
         let block_file_size = self.config.storage.block_file_size;
-        let mut groups: Vec<Vec<(BlockMeta, u64, HashSet<String>)>> = Vec::new();
-        let mut current: Vec<(BlockMeta, u64, HashSet<String>)> = Vec::new();
+        let mut groups: Vec<Vec<CompactSource>> = Vec::new();
+        let mut current: Vec<CompactSource> = Vec::new();
         let mut current_size: u64 = 0;
         for cand in candidates {
             let cand_live = cand.1;
@@ -1752,6 +2076,97 @@ impl Engine {
             group_count = groups.len(),
             "compact_low_utilization: packed candidates into groups"
         );
+
+        // v0.4.5 pre-filter 1: drop groups whose projected savings fall
+        // below `auto_compact_min_benefit_bytes`. Saves the I/O of
+        // re-encoding a group where dead bytes are noise. Computed
+        // per-group so a trivial single-block group can be skipped while
+        // a rich multi-block merge in the same pass still runs.
+        let min_benefit = self.config.storage.auto_compact_min_benefit_bytes;
+        if min_benefit > 0 {
+            let before = groups.len();
+            groups.retain(|g| {
+                let old_sum: u64 = g.iter().map(|(b, _, _)| b.size).sum();
+                let live_sum: u64 = g.iter().map(|(_, live, _)| *live).sum();
+                let benefit = old_sum.saturating_sub(live_sum);
+                if benefit < min_benefit {
+                    tracing::debug!(
+                        group_size = g.len(),
+                        benefit,
+                        min_benefit,
+                        "compact_low_utilization: group skipped (benefit < min_benefit)"
+                    );
+                    false
+                } else {
+                    // Verbose audit trail for kept groups too — pairs with
+                    // the skip debug above so `RUST_LOG=…engine=debug` gives
+                    // you a per-group keep/skip ledger with the exact
+                    // numbers the scanner used.
+                    tracing::debug!(
+                        group_size = g.len(),
+                        old_sum,
+                        live_sum,
+                        benefit,
+                        min_benefit,
+                        "compact_low_utilization: group kept (benefit >= min_benefit)"
+                    );
+                    true
+                }
+            });
+            if before != groups.len() {
+                tracing::info!(
+                    skipped = before - groups.len(),
+                    remaining = groups.len(),
+                    min_benefit,
+                    "compact_low_utilization: filtered groups by min_benefit"
+                );
+            }
+        }
+
+        // v0.4.5 pre-filter 2: verify the filesystem has enough free space
+        // to hold each group's new block in addition to the still-present
+        // source blocks (they're only unlinked after the redb commit). We
+        // check once per group, greedily accounting for groups we've
+        // already accepted in this pass.
+        let headroom = self.config.storage.auto_compact_disk_headroom_bytes;
+        let groups = if headroom > 0 {
+            let data_dir = self.config.storage.data_dir.clone();
+            match fs2::available_space(&data_dir) {
+                Ok(mut avail) => {
+                    let mut kept: Vec<_> = Vec::with_capacity(groups.len());
+                    for g in groups {
+                        let live_sum: u64 = g.iter().map(|(_, live, _)| *live).sum();
+                        let required = live_sum.saturating_add(headroom);
+                        if avail < required {
+                            tracing::warn!(
+                                group_size = g.len(),
+                                live_sum,
+                                required,
+                                available = avail,
+                                "compact_low_utilization: group skipped (insufficient disk headroom)"
+                            );
+                            continue;
+                        }
+                        // Reserve the live bytes; old blocks are unlinked after
+                        // commit so they'll be freed back shortly, but during
+                        // this pass we must assume the peak.
+                        avail = avail.saturating_sub(live_sum);
+                        kept.push(g);
+                    }
+                    kept
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        data_dir = %data_dir.display(),
+                        "compact_low_utilization: could not query filesystem free space; skipping disk-headroom check"
+                    );
+                    groups
+                }
+            }
+        } else {
+            groups
+        };
 
         let mut results = Vec::new();
         for group in groups {
@@ -1782,7 +2197,7 @@ impl Engine {
     /// (minus the single shared block header/trailer of ~500-1000 B).
     fn compact_merge_group(
         &self,
-        group: &[(BlockMeta, u64, std::collections::HashSet<String>)],
+        group: &[CompactSource],
     ) -> Result<Vec<CompactionBlockStats>> {
         use std::collections::HashMap;
 
@@ -1794,7 +2209,7 @@ impl Engine {
         // their stats directly without copying. Everyone else goes into the
         // merge writer.
         let mut stats: Vec<CompactionBlockStats> = Vec::new();
-        let mut effective: Vec<&(BlockMeta, u64, std::collections::HashSet<String>)> = Vec::new();
+        let mut effective: Vec<&CompactSource> = Vec::new();
         for entry in group {
             if entry.2.is_empty() {
                 stats.push(CompactionBlockStats {
@@ -1893,10 +2308,13 @@ impl Engine {
             let mut live_count: u64 = 0;
             let mut contributed: u64 = 0;
             for hash in live_hashes {
-                let src_entry = hash_to_entry.get(hash).ok_or_else(|| {
+                // hash is &Arc<str>; HashMap<String, _>::get wants &str via
+                // String: Borrow<str>. as_ref() yields the &str we need.
+                let hash_str: &str = hash.as_ref();
+                let src_entry = hash_to_entry.get(hash_str).ok_or_else(|| {
                     JiHuanError::DataCorruption(format!(
                         "compact_merge_group: live hash {} missing from block {}'s index",
-                        hash, old_meta.block_id
+                        hash_str, old_meta.block_id
                     ))
                 })?;
                 let data = old_reader.read_chunk(src_entry, verify)?;
@@ -1906,9 +2324,13 @@ impl Engine {
                     self.config.storage.compression_level,
                 )?;
                 let new_entry =
-                    writer.append_precompressed_chunk(&compressed, data.len() as u32, hash)?;
+                    writer.append_precompressed_chunk(&compressed, data.len() as u32, hash_str)?;
                 chunk_remap.insert(
-                    hash.clone(),
+                    // rewrite_block_references_group's tx layer expects
+                    // owned String keys, so pay one allocation here. The
+                    // Arc<str> savings are on the live_hashes fan-out,
+                    // not on this inner per-live-chunk map.
+                    hash_str.to_string(),
                     (
                         new_block_id.clone(),
                         new_entry.data_offset,
@@ -2078,6 +2500,8 @@ mod tests {
         cfg.storage.auto_compact_threshold = 0.75;
         cfg.storage.auto_compact_min_size_bytes = 0;
         cfg.storage.auto_compact_every_gc_ticks = 1;
+        cfg.storage.auto_compact_min_benefit_bytes = 0;
+        cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Arc::new(Engine::open(cfg).unwrap());
 
         let p_a: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
@@ -2224,11 +2648,20 @@ mod tests {
         let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         cfg.storage.chunk_size = 64 * 1024;
         cfg.storage.block_file_size = 16 * 1024 * 1024;
+        // v0.4.5: tests use sub-MB payloads; disable the production
+        // min-benefit/headroom filters so we actually exercise the
+        // scanner path.
+        cfg.storage.auto_compact_min_benefit_bytes = 0;
+        cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Engine::open(cfg).unwrap();
 
-        // Block 1: 2 files alive → high utilization
-        let p1 = vec![1u8; 150_000];
-        let p2 = vec![2u8; 150_000];
+        // Block 1: 2 files alive → high utilization.
+        // Use varied bytes so chunks within one file DON'T self-dedup — this
+        // models realistic workloads. (Uniform `vec![n; N]` payloads would
+        // collapse intra-file chunks to one physical write and make the
+        // utilisation math pathological due to block overhead.)
+        let p1: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
+        let p2: Vec<u8> = (0..150_000u32).map(|j| ((j * 7) % 251) as u8).collect();
         let id1 = engine.put_bytes(&p1, "k1.bin", None).unwrap();
         let _id2 = engine.put_bytes(&p2, "k2.bin", None).unwrap();
         engine.seal_active_block().unwrap();
@@ -2236,9 +2669,9 @@ mod tests {
             .block_id
             .clone();
 
-        // Block 2: 2 files, delete 1 → low utilization
-        let p3 = vec![3u8; 150_000];
-        let p4 = vec![4u8; 150_000];
+        // Block 2: 2 files, delete 1 → low utilization.
+        let p3: Vec<u8> = (0..150_000u32).map(|j| ((j * 11) % 251) as u8).collect();
+        let p4: Vec<u8> = (0..150_000u32).map(|j| ((j * 13) % 251) as u8).collect();
         let _id3 = engine.put_bytes(&p3, "k3.bin", None).unwrap();
         let id4 = engine.put_bytes(&p4, "k4.bin", None).unwrap();
         engine.seal_active_block().unwrap();
@@ -2273,6 +2706,8 @@ mod tests {
         // candidates end up above threshold).
         cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
         cfg.storage.compression_level = 0;
+        cfg.storage.auto_compact_min_benefit_bytes = 0;
+        cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Engine::open(cfg).unwrap();
 
         // Build 3 blocks, each with 2 files, delete 1 per block → each
@@ -2342,6 +2777,158 @@ mod tests {
             let got = engine.get_bytes(id).unwrap();
             assert_eq!(got, *expected, "file {} corrupted after merge compact", id);
         }
+    }
+
+    #[test]
+    fn test_reseal_orphan_roundtrip_restores_file_reads() {
+        // Regression for v0.4.5 recovery path:
+        //   1. Upload files into the active block (not sealed).
+        //   2. Simulate a hard-kill crash: drop the engine without calling
+        //      shutdown(), then manually rename the active .blk → .blk.orphan
+        //      (this is exactly what cleanup_incomplete_blocks does at next
+        //       startup when it sees a referenced but footerless block).
+        //   3. Call reseal_orphan_block_static.
+        //   4. Re-open engine, verify both files read back byte-identical.
+        use std::sync::Arc;
+
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg.clone()).unwrap();
+
+        let p_a: Vec<u8> = (0..250_000u32).map(|i| (i % 251) as u8).collect();
+        let p_b: Vec<u8> = (0..180_000u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let id_a = engine.put_bytes(&p_a, "a.bin", None).unwrap();
+        let id_b = engine.put_bytes(&p_b, "b.bin", None).unwrap();
+
+        // NOTE: deliberately do NOT call seal_active_block — this mirrors the
+        // kill -9 failure mode. The block file currently has a valid header
+        // and chunk data but no footer / index table.
+        let block_id = engine.meta.get_file(&id_a).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+        let block_meta = engine.meta.get_block(&block_id).unwrap().unwrap();
+        let sealed_path = std::path::PathBuf::from(&block_meta.path);
+        let orphan_path = sealed_path.with_extension("blk.orphan");
+
+        // Flush the BufWriter so every committed chunk hits disk before we
+        // simulate the kill. Without this hook the tail < 8 KB of
+        // compressed data stays in the BufWriter and is lost on drop, and
+        // the resealer (correctly) refuses to seal an orphan whose metadata
+        // references bytes that aren't there.
+        engine.flush_active_writer_for_test().unwrap();
+
+        // Drop engine WITHOUT shutdown() to mimic the crash, then rename.
+        drop(engine);
+        std::fs::rename(&sealed_path, &orphan_path).unwrap();
+        assert!(!sealed_path.exists());
+        assert!(orphan_path.exists());
+
+        // Open the metadata store directly (no engine) and reseal.
+        let meta = Arc::new(
+            crate::metadata::store::MetadataStore::open(
+                cfg.storage.meta_dir.join("meta.db"),
+            )
+            .unwrap(),
+        );
+        let summary = Engine::reseal_orphan_block_static(
+            &meta,
+            &cfg.storage.data_dir,
+            &block_id,
+            cfg.storage.compression_algorithm,
+        )
+        .unwrap();
+        assert!(summary.chunks_restored > 0);
+        assert!(!orphan_path.exists(), "orphan should be renamed away");
+        assert!(sealed_path.exists(), "sealed .blk must exist after reseal");
+        drop(meta); // release redb lock so Engine::open can reopen it
+
+        // Reopen the engine; BlockReader::open must succeed now, and both
+        // files must round-trip byte-identically.
+        let engine = Engine::open(cfg).unwrap();
+        assert_eq!(engine.get_bytes(&id_a).unwrap(), p_a);
+        assert_eq!(engine.get_bytes(&id_b).unwrap(), p_b);
+    }
+
+    #[test]
+    fn test_compute_block_live_info_dedups_across_files() {
+        // v0.4.5 regression: dedup-heavy datasets used to report
+        // `live_bytes > size` because the old scanner summed
+        // compressed_size per ChunkMeta reference instead of per unique
+        // hash. The fix uses the canonical unique-hash aggregation.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+
+        // Two uploads with identical contents → should fully dedup.
+        let payload = vec![9u8; 200_000];
+        let id1 = engine.put_bytes(&payload, "a.bin", None).unwrap();
+        let _id2 = engine.put_bytes(&payload, "b.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        let block_id = engine.meta.get_file(&id1).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+        let block_meta = engine.meta.get_block(&block_id).unwrap().unwrap();
+
+        let info = engine.compute_block_live_info().unwrap();
+        let per_block = info.get(&block_id).expect("block has live info");
+
+        // Sanity: dedup kept it to one physical copy → live_bytes <= size.
+        assert!(
+            per_block.live_bytes <= block_meta.size,
+            "live_bytes {} must not exceed block size {} after dedup",
+            per_block.live_bytes,
+            block_meta.size
+        );
+    }
+
+    #[test]
+    fn test_compact_low_utilization_respects_min_benefit() {
+        // min_benefit_bytes configured higher than the group's projected
+        // savings → scanner reports "no work" and no new block is written.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
+        cfg.storage.compression_level = 0;
+        // Only ~150 KB would be freed — set the floor well above that.
+        cfg.storage.auto_compact_min_benefit_bytes = 8 * 1024 * 1024;
+        cfg.storage.auto_compact_disk_headroom_bytes = 0;
+        let engine = Engine::open(cfg).unwrap();
+
+        let keep_payload = vec![1u8; 150_000];
+        let drop_payload = vec![2u8; 150_000];
+        let id_keep = engine.put_bytes(&keep_payload, "keep.bin", None).unwrap();
+        let id_drop = engine.put_bytes(&drop_payload, "drop.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+        let block_id = engine.meta.get_file(&id_keep).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+        engine.delete_file(&id_drop).unwrap();
+
+        let results = engine.compact_low_utilization(0.9, 0).unwrap();
+        assert!(
+            results.is_empty(),
+            "min_benefit filter should have dropped the group, got {:?}",
+            results
+        );
+        // Block is untouched.
+        assert!(engine.meta.get_block(&block_id).unwrap().is_some());
+
+        // Flip the filter off → the same call now compacts.
+        let mut cfg2 = engine.config().clone();
+        cfg2.storage.auto_compact_min_benefit_bytes = 0;
+        // Can't mutate engine.config in place; open a fresh engine on same dirs.
+        drop(engine);
+        let engine = Engine::open(cfg2).unwrap();
+        let results = engine.compact_low_utilization(0.9, 0).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "without min_benefit, the block should compact"
+        );
     }
 
     #[test]

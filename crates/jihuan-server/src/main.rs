@@ -13,7 +13,7 @@ mod http;
 mod service;
 
 #[derive(Parser, Debug)]
-#[command(name = "jihuan-server", about = "JiHuan storage server")]
+#[command(name = "jihuan-server", version, about = "JiHuan storage server")]
 struct Args {
     /// Path to the config TOML file
     #[arg(short, long, env = "JIHUAN_CONFIG")]
@@ -225,16 +225,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Parse addresses
+    // Parse listener addresses; a misconfigured address is a fatal
+    // startup error — bubble it up with context so operators see the
+    // offending string instead of a terse `.expect` panic.
     let http_addr: SocketAddr = config
         .server
         .http_addr
         .parse()
-        .expect("Invalid HTTP address");
+        .map_err(|e| anyhow::anyhow!("invalid http_addr {:?}: {}", config.server.http_addr, e))?;
     let grpc_addr: SocketAddr = config
         .server
         .grpc_addr
         .parse()
-        .expect("Invalid gRPC address");
+        .map_err(|e| anyhow::anyhow!("invalid grpc_addr {:?}: {}", config.server.grpc_addr, e))?;
 
     // Build CORS layer from config. Empty origins list ⇒ same-origin only
     // (no CORS headers emitted). "*" ⇒ dev-friendly `Any`. Otherwise each

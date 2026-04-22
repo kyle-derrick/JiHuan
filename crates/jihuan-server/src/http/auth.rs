@@ -472,7 +472,7 @@ pub fn build_new_key(name: &str, scopes: Vec<String>) -> (String, ApiKeyMeta, u6
         let mut sha = Sha256::new();
         sha.update(id1.as_bytes());
         sha.update(id2.as_bytes());
-        sha.update(&now_secs().to_le_bytes());
+        sha.update(now_secs().to_le_bytes());
         let digest = sha.finalize();
         let mut buf = [0u8; 24];
         buf.copy_from_slice(&digest[..24]);
@@ -515,12 +515,76 @@ pub async fn list_keys(
 }
 
 /// DELETE /api/keys/:key_id  — Revoke an API key. admin only.
+///
+/// v0.4.5 safety interlocks:
+///
+/// 1. Callers cannot delete their **own** key mid-session — that would
+///    instantly 401 every follow-up request and force a restart to
+///    recover via the bootstrap path.
+/// 2. Callers cannot delete the **last admin** key — the system would
+///    have no way to mint new keys and the UI admin views would all go
+///    dark. This mirrors the "can't remove the last root user" rule
+///    from most auth systems.
 pub async fn delete_key(
     State(engine): State<Arc<Engine>>,
     caller: AuthedKey,
     axum::extract::Path(key_id): axum::extract::Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_scope(&caller, "admin")?;
+
+    // ── Interlock #1: refuse self-delete ────────────────────────────────
+    if caller.0.key_id == key_id {
+        audit::record(
+            engine.clone(),
+            Some(caller.0.key_id.clone()),
+            None,
+            "key.delete",
+            Some(key_id.clone()),
+            AuditResult::Denied {
+                reason: "cannot delete your own key".to_string(),
+            },
+            Some(409),
+        );
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "Refusing to delete the key that issued this request. Use another admin key, or delete this key from the CLI after revoking scopes.".to_string(),
+        });
+    }
+
+    // ── Interlock #2: refuse deletion of the last admin key ────────────
+    let engine_probe = engine.clone();
+    let key_id_probe = key_id.clone();
+    let is_sole_admin = tokio::task::spawn_blocking(move || {
+        let keys = engine_probe.metadata().list_api_keys()?;
+        let admins: Vec<_> = keys
+            .iter()
+            .filter(|k| k.scopes.iter().any(|s| s == "admin"))
+            .collect();
+        // "Last admin" = exactly one admin exists, and it is the target.
+        let sole = admins.len() == 1 && admins[0].key_id == key_id_probe;
+        Ok::<bool, jihuan_core::JiHuanError>(sole)
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .map_err(AppError::from_jihuan)?;
+    if is_sole_admin {
+        audit::record(
+            engine.clone(),
+            Some(caller.0.key_id.clone()),
+            None,
+            "key.delete",
+            Some(key_id.clone()),
+            AuditResult::Denied {
+                reason: "would remove the last admin key".to_string(),
+            },
+            Some(409),
+        );
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "Refusing to delete the last admin key. Create another admin key first.".to_string(),
+        });
+    }
+
     let engine_task = engine.clone();
     let key_id_task = key_id.clone();
     let removed = tokio::task::spawn_blocking(move || engine_task.metadata().delete_api_key(&key_id_task))
@@ -542,7 +606,7 @@ pub async fn delete_key(
         );
         return Err(AppError {
             status: StatusCode::NOT_FOUND,
-            message: format!("Key not found"),
+            message: "Key not found".to_string(),
         });
     }
     audit::record(
@@ -653,14 +717,18 @@ pub async fn login(
         Some(200),
     );
 
-    // Build the Set-Cookie header. We deliberately do not set `Secure` because
-    // the default deployment is plain HTTP on localhost; a TLS-enabled deployment
-    // should add `Secure` via a reverse proxy or Phase 3 (TLS) changes.
+    // Build the Set-Cookie header. `Secure` is gated on
+    // `auth.cookie_secure` so plain-HTTP dev deployments still work
+    // (browsers drop `Secure` cookies over HTTP). Operators behind TLS
+    // must flip the flag on, otherwise a MITM could strip HTTPS and
+    // exfiltrate the session token.
+    let secure_attr = if auth.config.cookie_secure { "; Secure" } else { "" };
     let cookie = format!(
-        "{name}={val}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Strict",
+        "{name}={val}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Strict{sec}",
         name = SESSION_COOKIE,
         val = token,
         ttl = SESSION_TTL_SECS,
+        sec = secure_attr,
     );
 
     let body = Json(LoginResponse {
@@ -698,10 +766,14 @@ pub async fn logout(
         AuditResult::Ok,
         Some(204),
     );
-    // Overwrite the cookie with an immediately-expired value.
+    // Overwrite the cookie with an immediately-expired value. Match the
+    // `Secure` attribute used at login so browsers don't treat the
+    // clearing cookie as a different one and skip it.
+    let secure_attr = if auth.config.cookie_secure { "; Secure" } else { "" };
     let clear = format!(
-        "{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
-        name = SESSION_COOKIE
+        "{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{sec}",
+        name = SESSION_COOKIE,
+        sec = secure_attr,
     );
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut()

@@ -99,10 +99,10 @@ impl BlockWriter {
     }
 
     /// Append an already-compressed chunk to the block. The caller is
-    /// responsible for having compressed `compressed` with the same algorithm
-    /// + level this writer was configured with — the algorithm byte stored
-    /// in the [`ChunkEntry`] is derived from `self.compression`, not from
-    /// the payload.
+    /// responsible for having compressed `compressed` with the same
+    /// algorithm and level this writer was configured with — the
+    /// algorithm byte stored in the [`ChunkEntry`] is derived from
+    /// `self.compression`, not from the payload.
     ///
     /// Phase 6b-P3: by exposing this path we let `Engine::store_chunk`
     /// compress each chunk *before* acquiring `active_writer`, so concurrent

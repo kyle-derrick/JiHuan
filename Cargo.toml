@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.4.5"
 edition = "2021"
 rust-version = "1.75"
 authors = ["JiHuan Contributors"]
@@ -61,7 +61,7 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 axum = { version = "0.7", features = ["multipart"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = { version = "0.4", features = ["util", "timeout"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs", "timeout"] }
 hyper = { version = "1", features = ["full"] }
 
 # gRPC
@@ -82,6 +82,7 @@ metrics-exporter-prometheus = "0.16"
 include_dir = "0.7"
 
 # utils
+fs2 = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"

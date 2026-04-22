@@ -78,6 +78,14 @@ pub struct BlockInfoDto {
     pub path: String,
     /// true if block file is sealed (size>0 means we've recorded final size)
     pub sealed: bool,
+    /// v0.4.5: sum of compressed_size over *unique* chunk hashes in this
+    /// block that are still referenced by at least one live file. Matches
+    /// the live-bytes definition used by the compaction scanner.
+    pub live_bytes: u64,
+    /// v0.4.5: `live_bytes / size` in `[0.0, 1.0]`. `None` when the block
+    /// is unsealed and its file size is still 0 (utilisation is
+    /// ill-defined in that state).
+    pub utilization: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +96,8 @@ pub struct BlockDetailResponse {
     pub create_time: u64,
     pub path: String,
     pub sealed: bool,
+    pub live_bytes: u64,
+    pub utilization: Option<f64>,
     pub referencing_files: Vec<ReferencingFileDto>,
 }
 
@@ -169,14 +179,15 @@ pub async fn trigger_gc(
 /// POST `/api/admin/compact` — v0.4.3 block compaction.
 ///
 /// Body is a JSON object with the following optional fields:
-///   * `block_id`        — compact exactly this one block. Takes priority
-///                         over the threshold-based scan when present.
-///   * `threshold`       — `[0.0, 1.0]`, default `0.5`. Blocks whose
-///                         `live_bytes / size` is below this ratio are
-///                         compacted. Ignored when `block_id` is set.
-///   * `min_size_bytes`  — blocks smaller than this are skipped even when
-///                         below the threshold, to avoid spending I/O on
-///                         tiny blocks. Default `4 MiB`.
+///
+/// * `block_id` — compact exactly this one block. Takes priority over the
+///   threshold-based scan when present.
+/// * `threshold` — `[0.0, 1.0]`, default `0.5`. Blocks whose
+///   `live_bytes / size` is below this ratio are compacted. Ignored when
+///   `block_id` is set.
+/// * `min_size_bytes` — blocks smaller than this are skipped even when
+///   below the threshold, to avoid spending I/O on tiny blocks.
+///   Default `4 MiB`.
 ///
 /// Returns an array of per-block stats. The active (unsealed) block is
 /// never compacted regardless of parameters.
@@ -280,7 +291,16 @@ pub async fn list_blocks(
     caller: AuthedKey,
 ) -> Result<Json<BlockListResponse>, AppError> {
     require_scope(&caller, "read")?;
-    let blocks = tokio::task::spawn_blocking(move || engine.metadata().list_all_blocks())
+    let e_for_blocks = engine.clone();
+    let blocks = tokio::task::spawn_blocking(move || e_for_blocks.metadata().list_all_blocks())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    // v0.4.5: compute canonical per-block live_bytes via the engine helper
+    // so the UI's utilisation reading matches the compaction scanner's.
+    let e_for_live = engine.clone();
+    let live_info = tokio::task::spawn_blocking(move || e_for_live.compute_block_live_info())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -300,6 +320,15 @@ pub async fn list_blocks(
                 } else {
                     std::fs::metadata(&b.path).map(|m| m.len()).unwrap_or(0)
                 };
+                let live_bytes = live_info
+                    .get(&b.block_id)
+                    .map(|i| i.live_bytes)
+                    .unwrap_or(0);
+                let utilization = if size == 0 {
+                    None
+                } else {
+                    Some((live_bytes as f64 / size as f64).clamp(0.0, 1.0))
+                };
                 BlockInfoDto {
                     sealed,
                     block_id: b.block_id,
@@ -307,6 +336,8 @@ pub async fn list_blocks(
                     ref_count: b.ref_count,
                     create_time: b.create_time,
                     path: b.path,
+                    live_bytes,
+                    utilization,
                 }
             })
             .collect::<Vec<_>>()
@@ -330,14 +361,16 @@ pub async fn get_block_detail(
     require_scope(&caller, "read")?;
     let e = engine.clone();
     let bid = block_id.clone();
-    let (block, files) = tokio::task::spawn_blocking(move || -> jihuan_core::error::Result<_> {
-        let block = e.metadata().get_block(&bid)?;
-        let files = e.list_all_files()?;
-        Ok((block, files))
-    })
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .map_err(|e| AppError::internal(e.to_string()))?;
+    let (block, files, live_info) =
+        tokio::task::spawn_blocking(move || -> jihuan_core::error::Result<_> {
+            let block = e.metadata().get_block(&bid)?;
+            let files = e.list_all_files()?;
+            let live_info = e.compute_block_live_info()?;
+            Ok((block, files, live_info))
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     let block = block.ok_or_else(|| AppError::not_found(&block_id))?;
 
@@ -351,6 +384,16 @@ pub async fn get_block_detail(
         tokio::task::spawn_blocking(move || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
             .await
             .map_err(|e| AppError::internal(e.to_string()))?
+    };
+
+    let live_bytes = live_info
+        .get(&block_id)
+        .map(|i| i.live_bytes)
+        .unwrap_or(0);
+    let utilization = if size == 0 {
+        None
+    } else {
+        Some((live_bytes as f64 / size as f64).clamp(0.0, 1.0))
     };
 
     let referencing_files: Vec<ReferencingFileDto> = files
@@ -377,6 +420,8 @@ pub async fn get_block_detail(
         ref_count: block.ref_count,
         create_time: block.create_time,
         path: block.path,
+        live_bytes,
+        utilization,
         referencing_files,
     }))
 }

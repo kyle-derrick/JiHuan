@@ -187,6 +187,11 @@ export interface BlockInfo {
   path: string
   create_time: number
   sealed: boolean
+  /** v0.4.5: bytes physically occupied by *live* chunks (unique hashes
+   *  still referenced by some file). Matches the compaction scanner's view. */
+  live_bytes: number
+  /** v0.4.5: live_bytes / size, `null` when the block is unsealed and empty. */
+  utilization: number | null
 }
 
 export interface BlockListResponse {

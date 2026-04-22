@@ -12,7 +12,9 @@ const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 #[derive(Parser, Debug)]
 #[command(
     name = "jihuan",
-    about = "JiHuan storage CLI — talks to a running jihuan-server via HTTP"
+    version,
+    about = "JiHuan storage CLI — talks to a running jihuan-server via HTTP",
+    long_about = None,
 )]
 struct Cli {
     /// Server base URL
@@ -88,6 +90,20 @@ enum Commands {
     ValidateConfig {
         /// Path to config TOML file
         config: PathBuf,
+    },
+    /// v0.4.5 recovery: rebuild footer+index for a quarantined `.blk.orphan`.
+    ///
+    /// Run this with the server STOPPED. The tool opens the metadata DB
+    /// directly, re-derives every live chunk's `(offset, compressed_size)`
+    /// from redb, re-computes the per-chunk and block-level CRC32 from
+    /// the on-disk bytes, writes a fresh index + footer, and renames
+    /// `.blk.orphan` → `.blk`. Any trailing partial-chunk bytes from the
+    /// original crash are truncated (they were never committed anyway).
+    ResealOrphan {
+        /// Path to the server config TOML (same one the server uses).
+        config: PathBuf,
+        /// Block ID (from the startup log line `block_id=...`).
+        block_id: String,
     },
 }
 
@@ -412,8 +428,8 @@ async fn main() -> Result<()> {
             let resp = check_response(resp, "list-blocks").await?;
             let r: BlockListResponse = resp.json().await?;
             println!(
-                "{:<36} {:>14} {:>10}  {}",
-                "BLOCK ID", "SIZE (bytes)", "REF COUNT", "PATH"
+                "{:<36} {:>14} {:>10}  PATH",
+                "BLOCK ID", "SIZE (bytes)", "REF COUNT"
             );
             println!("{}", "-".repeat(90));
             for b in &r.blocks {
@@ -441,6 +457,48 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         },
+
+        // ── reseal-orphan (local, server MUST be stopped) ────────────────────
+        Commands::ResealOrphan { config, block_id } => {
+            let cfg = AppConfig::from_file(config)
+                .with_context(|| format!("failed to load {}", config.display()))?;
+
+            // We open the metadata DB directly (no Engine). redb holds an
+            // exclusive file lock, so if the server is still running this
+            // will fail with a clear "Database already open" error — that
+            // doubles as a safety interlock against accidental concurrent
+            // use.
+            let meta_path = cfg.storage.meta_dir.join("meta.db");
+            let meta = jihuan_core::metadata::store::MetadataStore::open(&meta_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open metadata store at {} — is the server still running?",
+                        meta_path.display()
+                    )
+                })?;
+
+            match jihuan_core::Engine::reseal_orphan_block_static(
+                &meta,
+                &cfg.storage.data_dir,
+                block_id,
+                cfg.storage.compression_algorithm,
+            ) {
+                Ok(summary) => {
+                    println!("Resealed block {}", summary.block_id);
+                    println!("  chunks restored:         {}", summary.chunks_restored);
+                    println!("  sealed file size:        {} bytes", summary.final_size);
+                    println!(
+                        "  trailing bytes dropped:  {} (never committed to metadata)",
+                        summary.trailing_bytes_truncated
+                    );
+                    println!("You can now start the server.");
+                }
+                Err(e) => {
+                    eprintln!("reseal-orphan failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     Ok(())

@@ -19,22 +19,38 @@ verify_on_read     = true
 # Uploads that would exceed this are rejected with HTTP 507.
 # max_storage_bytes  = 10737418240  # e.g. 10 GB
 
-# v0.4.4 auto-compaction: rewrite partially-deleted blocks in the background
-# so their freed space becomes usable again. Opt-in because compaction
-# re-compresses live chunks (extra CPU + write amplification).
-auto_compact_enabled       = true        # flip on by default for general use
-auto_compact_threshold     = 0.5         # rewrite blocks <50% utilised
-auto_compact_min_size_bytes = 65536      # 64 KiB — skip only truly trivial blocks
-                                         # (lower default: typical workloads rarely
-                                         #  fill a block past a few KiB before sealing,
-                                         #  a larger floor silently disables the feature)
-auto_compact_every_gc_ticks = 12         # 12 × 300 s = once per hour
+# v0.4.4+ auto-compaction: rewrite partially-deleted blocks in the background
+# so their freed space becomes usable again. v0.4.5 also greedy-bin-packs
+# multiple low-util blocks into ONE new block (cross-block merge) to keep
+# the total block count from drifting up.
+#
+# Enabled by default at a conservative cadence — the min-benefit and disk-
+# headroom guards below keep it from running when there's no real payoff.
+auto_compact_enabled         = true       # scan + merge in the background
+auto_compact_threshold       = 0.5        # candidate if live_bytes/size < 50%
+auto_compact_min_size_bytes  = 65536      # 64 KiB — pre-filter trivial blocks
+auto_compact_every_gc_ticks  = 12         # 12 × 300 s = once per hour
+
+# v0.4.5 safety rails (apply to both the manual /api/admin/compact scan path
+# and the background loop):
+auto_compact_min_benefit_bytes   = 8388608    # 8 MiB — skip groups whose
+                                              # projected savings are below
+                                              # this floor. 0 = no floor.
+auto_compact_disk_headroom_bytes = 536870912  # 512 MiB — require at least
+                                              # (group_live_bytes + this)
+                                              # free on the data filesystem
+                                              # before writing a new block.
+                                              # 0 = skip the check.
 
 [server]
 http_addr    = "0.0.0.0:8080"
 grpc_addr    = "0.0.0.0:8081"
 metrics_addr = "0.0.0.0:9090"
 enable_access_log = true
+# v0.4.5: wall-clock timeout (seconds) for control-plane routes
+# (/api/status, /api/admin/*, /api/keys, etc). Upload and download are
+# exempt so multi-GB streaming isn't cut off. 0 disables.
+request_timeout_secs = 30
 
 [auth]
 # Set enabled = true to require API keys for all requests (except /api/status and /ui)

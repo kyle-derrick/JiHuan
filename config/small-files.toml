@@ -16,12 +16,17 @@ gc_threshold       = 0.7
 gc_interval_secs   = 300
 max_open_block_files = 64
 verify_on_read     = true
-# v0.4.4: small-file workloads fragment quickly under deletions.
-# Compact aggressively to reclaim the freed slots.
-auto_compact_enabled        = true
-auto_compact_threshold      = 0.5
-auto_compact_min_size_bytes = 2097152    # 2 MiB
-auto_compact_every_gc_ticks = 12         # 12 × 300 s = once per hour
+# v0.4.4+: small-file workloads fragment quickly under deletions.
+# Compact aggressively to reclaim freed slots; v0.4.5 cross-block merge
+# also collapses the "many half-empty blocks" pattern that small-file +
+# churn produces.
+auto_compact_enabled             = true
+auto_compact_threshold           = 0.6        # compact anything <60% full
+auto_compact_min_size_bytes      = 1048576    # 1 MiB — small-file profile
+auto_compact_every_gc_ticks      = 12         # 12 × 300 s = once per hour
+auto_compact_min_benefit_bytes   = 4194304    # 4 MiB — smaller payoff is
+                                              # acceptable for dense fanout
+auto_compact_disk_headroom_bytes = 536870912  # 512 MiB
 
 [server]
 http_addr    = "0.0.0.0:8080"

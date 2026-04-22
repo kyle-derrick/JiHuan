@@ -35,6 +35,7 @@ once_cell = { workspace = true }
 num_cpus = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
+fs2 = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]

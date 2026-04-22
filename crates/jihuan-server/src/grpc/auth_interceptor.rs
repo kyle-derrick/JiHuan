@@ -80,6 +80,11 @@ pub fn make_interceptor(
 /// non-`read` capability. Returns `PermissionDenied` when the key lacks the
 /// scope, or `Internal` if the interceptor did not attach a principal (a
 /// programming error — should not happen in practice).
+///
+/// `result_large_err` is silenced: `tonic::Status` is a third-party enum we
+/// cannot shrink, and boxing every per-RPC Result would add one allocation
+/// on every gRPC call without measurable benefit on the error path.
+#[allow(clippy::result_large_err)]
 pub fn require_scope_grpc<T>(req: &Request<T>, required: &str) -> Result<(), Status> {
     let authed = req
         .extensions()

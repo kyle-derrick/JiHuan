@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -7,6 +8,7 @@ use axum::{
     Extension, Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
+use tower_http::timeout::TimeoutLayer;
 
 use jihuan_core::Engine;
 
@@ -32,12 +34,44 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
     // Smaller default for all other routes (protect against oversized JSON etc.)
     let default_limit_layer = DefaultBodyLimit::max(16 * 1024 * 1024); // 16 MB
 
-    let upload_router = Router::new()
+    // v0.4.5 slow-loris / stuck-backend guard. Applied ONLY to control-plane
+    // routes (status, gc, compact, keys, config, auth). Upload and download
+    // are explicitly exempt — legitimate multi-GB file I/O can dwarf this
+    // timeout. `0` disables the layer (not recommended).
+    let timeout_secs = engine.config().server.request_timeout_secs;
+    let request_timeout_layer: Option<TimeoutLayer> = if timeout_secs == 0 {
+        None
+    } else {
+        Some(TimeoutLayer::new(Duration::from_secs(timeout_secs)))
+    };
+
+    // Streaming-path routers: upload (configurable body limit, no timeout)
+    // and download (default body limit, no timeout). These stay OUT of
+    // `main_router` so the global request-timeout layer applied below
+    // cannot cut off legitimate multi-GB transfers. Both get their own
+    // copy of `auth_middleware` so scope checks still run.
+    let streaming_auth_layer = middleware::from_fn_with_state(
+        auth_state.clone(),
+        auth::auth_middleware,
+    );
+
+    let upload_router: Router = Router::new()
         .route(
             "/api/v1/files",
             get(files::list_files).post(files::upload_file),
         )
-        .layer(upload_limit_layer);
+        .layer(upload_limit_layer)
+        .layer(streaming_auth_layer.clone())
+        .with_state(engine.clone());
+
+    let download_router: Router = Router::new()
+        .route(
+            "/api/v1/files/:file_id",
+            get(files::download_file).delete(files::delete_file),
+        )
+        .layer(default_limit_layer)
+        .layer(streaming_auth_layer)
+        .with_state(engine.clone());
 
     // `/api/auth/*` endpoints use `State<AuthState>`, unlike the rest of the
     // app which uses `State<Arc<Engine>>`. Build them as a self-contained
@@ -54,13 +88,8 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         ))
         .with_state(auth_state.clone());
 
-    let main_router: Router = Router::new()
-        .merge(upload_router)
+    let mut main_router: Router = Router::new()
         .route("/api/v1/files/:file_id/meta", get(files::get_file_meta))
-        .route(
-            "/api/v1/files/:file_id",
-            get(files::download_file).delete(files::delete_file),
-        )
         // Admin routes
         .route("/api/status", get(admin::get_status))
         .route("/api/gc/trigger", post(admin::trigger_gc))
@@ -94,6 +123,17 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         .layer(Extension(admin::MetricsHandle(metrics_handle)))
         .with_state(engine);
 
+    // The timeout wraps everything *above* in this chain, but NOT
+    // upload/download routes that were already merged with their own
+    // body-limit layers — tower_http's TimeoutLayer applies per-request
+    // at the service boundary, and upload/download handlers themselves
+    // `spawn_blocking` without holding the request future's timer open
+    // while streaming chunks to disk. The cap is therefore effectively
+    // on the handler's setup phase, which is fine.
+    if let Some(t) = request_timeout_layer {
+        main_router = main_router.layer(t);
+    }
+
     // Liveness / readiness probes (k8s-compatible). Served outside the auth
     // and CORS layers so orchestrators can hit them without a credential
     // and without worrying about preflight headers. They must stay cheap
@@ -105,5 +145,7 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
     Router::new()
         .merge(probe_router)
         .merge(auth_router)
+        .merge(upload_router)
+        .merge(download_router)
         .merge(main_router)
 }

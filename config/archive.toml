@@ -1,0 +1,34 @@
+# JiHuan - Archival / WORM Configuration
+# Cold data that's written once, read rarely, and almost never deleted.
+# Optimised for maximum dedup + compression; background work is rare.
+
+[storage]
+data_dir = "./jihuan-data/data"
+meta_dir = "./jihuan-data/meta"
+wal_dir  = "./jihuan-data/wal"
+block_file_size    = 4294967296  # 4 GB — fewer, bigger blocks = fewer files
+chunk_size         = 8388608     # 8 MB — better dedup granularity for
+                                 # backup-style payloads (tar / zip chunks)
+hash_algorithm     = "sha256"
+compression_algorithm = "zstd"
+compression_level  = 19          # slow-but-strong; retrieval is rare
+time_partition_hours = 168       # 1 week partitions
+gc_threshold       = 0.5
+gc_interval_secs   = 3600        # hourly is plenty for WORM data
+max_open_block_files = 16
+verify_on_read     = true        # trust but verify for cold storage
+
+# v0.4.5: deletions are rare → fragmentation is rare. When it does happen
+# we want the savings to be substantial before re-encoding gigabytes.
+auto_compact_enabled             = true
+auto_compact_threshold           = 0.4        # only very wasteful blocks
+auto_compact_min_size_bytes      = 67108864   # 64 MiB
+auto_compact_every_gc_ticks      = 24         # 24 × 3600 s = once per day
+auto_compact_min_benefit_bytes   = 536870912  # 512 MiB floor
+auto_compact_disk_headroom_bytes = 4294967296 # 4 GiB — match block size
+
+[server]
+http_addr    = "0.0.0.0:8080"
+grpc_addr    = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = true

@@ -16,8 +16,16 @@ gc_threshold       = 0.8
 gc_interval_secs   = 120
 max_open_block_files = 128
 verify_on_read     = false
-# v0.4.4: disabled for speed profile — compaction adds CPU / write amp.
-auto_compact_enabled = false
+# v0.4.4+: disabled for speed profile — compaction adds CPU / write amp.
+# If you flip it on (say, after a purge of millions of files), keep the
+# v0.4.5 safety rails generous so background work never contends with
+# foreground latency targets.
+auto_compact_enabled             = false
+auto_compact_threshold           = 0.3        # only the genuinely wasteful
+auto_compact_min_size_bytes      = 1048576    # 1 MiB
+auto_compact_every_gc_ticks      = 60         # 60 × 120 s = once per 2 h
+auto_compact_min_benefit_bytes   = 67108864   # 64 MiB — don't churn for less
+auto_compact_disk_headroom_bytes = 1073741824 # 1 GiB free required
 
 [server]
 http_addr    = "0.0.0.0:8080"

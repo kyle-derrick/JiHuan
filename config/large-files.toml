@@ -16,11 +16,16 @@ gc_threshold       = 0.8
 gc_interval_secs   = 600
 max_open_block_files = 32
 verify_on_read     = true
-# v0.4.4: big-file workloads have large blocks; rewrite when >50% dead.
-auto_compact_enabled        = true
-auto_compact_threshold      = 0.5
-auto_compact_min_size_bytes = 16777216   # 16 MiB (big blocks deserve big threshold)
-auto_compact_every_gc_ticks = 6          # 6 × 600 s = once per hour
+# v0.4.4+: big-file workloads have large blocks; rewrite when >50% dead.
+# Large block_file_size means each compacted group copies a lot of bytes,
+# so require a proportionally bigger benefit before running.
+auto_compact_enabled             = true
+auto_compact_threshold           = 0.5
+auto_compact_min_size_bytes      = 16777216   # 16 MiB
+auto_compact_every_gc_ticks      = 6          # 6 × 600 s = once per hour
+auto_compact_min_benefit_bytes   = 134217728  # 128 MiB — only run when the
+                                              # disk savings are sizeable
+auto_compact_disk_headroom_bytes = 2147483648 # 2 GiB free for the 2 GB block
 
 [server]
 http_addr    = "0.0.0.0:8080"

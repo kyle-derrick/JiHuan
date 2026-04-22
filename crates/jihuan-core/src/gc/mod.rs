@@ -89,14 +89,25 @@ impl GcService {
         let svc = self.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(svc.config.gc_interval_secs));
+            let mut tick_seq: u64 = 0;
             loop {
                 ticker.tick().await;
                 if !svc.running.load(Ordering::Relaxed) {
                     break;
                 }
+                tick_seq = tick_seq.wrapping_add(1);
+                // Debug-only preamble so `RUST_LOG=jihuan_core::gc=debug`
+                // yields a numbered start/end pair per tick. At info level
+                // the existing completion log is enough.
+                tracing::debug!(
+                    tick = tick_seq,
+                    interval_secs = svc.config.gc_interval_secs,
+                    "GC: tick starting"
+                );
                 match svc.run_once().await {
                     Ok(stats) => {
                         tracing::info!(
+                            tick = tick_seq,
                             blocks_deleted = stats.blocks_deleted,
                             bytes_reclaimed = stats.bytes_reclaimed,
                             duration_ms = stats.duration_ms,
@@ -168,6 +179,15 @@ impl GcService {
         // Clone the pin set once per tick so the Mutex is only held for
         // microseconds. HashSet::clone is O(n) but n ≤ active writer count.
         let pinned: std::collections::HashSet<String> = self.pinned_blocks.lock().clone();
+        // Top-line summary so `RUST_LOG=jihuan_core::gc=debug` yields one
+        // log line per tick summarising how much work the GC pass has to
+        // do before it starts deleting. The per-block decisions below
+        // then explain *which* blocks got reclaimed vs. skipped.
+        tracing::debug!(
+            unreferenced = unreferenced.len(),
+            pinned_count = pinned.len(),
+            "GC: beginning reclaim pass"
+        );
         for block in unreferenced {
             if pinned.contains(&block.block_id) {
                 tracing::debug!(
@@ -558,7 +578,7 @@ mod tests {
         let store = MetadataStore::open(&store_path).unwrap();
 
         let incomplete = data_dir.join("inc.blk");
-        std::fs::write(&incomplete, &crate::block::format::BLOCK_MAGIC).unwrap();
+        std::fs::write(&incomplete, crate::block::format::BLOCK_MAGIC).unwrap();
 
         let report = cleanup_incomplete_blocks(&data_dir, &store).unwrap();
         assert_eq!(report.deleted_orphans, 1);
@@ -577,7 +597,7 @@ mod tests {
 
         let block_id = "active-block-00000000000000000000000";
         let block_path = data_dir.join(format!("{}.blk", block_id));
-        std::fs::write(&block_path, &crate::block::format::BLOCK_MAGIC).unwrap();
+        std::fs::write(&block_path, crate::block::format::BLOCK_MAGIC).unwrap();
 
         store
             .insert_block(&BlockMeta::new(

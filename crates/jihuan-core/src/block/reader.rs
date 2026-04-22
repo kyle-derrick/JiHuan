@@ -247,7 +247,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         // Write a partial file with only the magic header, no footer
         let path = tmp.path().join("partial.blk");
-        std::fs::write(&path, &crate::block::format::BLOCK_MAGIC).unwrap();
+        std::fs::write(&path, crate::block::format::BLOCK_MAGIC).unwrap();
         assert!(!BlockReader::is_complete(&path));
     }
 

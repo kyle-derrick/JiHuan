@@ -321,7 +321,12 @@ impl MetadataStore {
         Ok(file_opt)
     }
 
-    /// List all files (full scan, for admin/UI use)
+    /// List all files (full scan, for admin/UI use).
+    ///
+    /// Materialises every `FileMeta` into a `Vec`, so at ~1 M files this
+    /// reaches ~hundreds of MB of heap. Aggregation-only callers (e.g. the
+    /// compaction scanner) should prefer [`Self::for_each_file`] which
+    /// streams one row at a time.
     pub fn list_all_files(&self) -> Result<Vec<FileMeta>> {
         let tx = self
             .db
@@ -342,6 +347,37 @@ impl MetadataStore {
         // Sort newest first
         result.sort_by(|a, b| b.create_time.cmp(&a.create_time));
         Ok(result)
+    }
+
+    /// Streaming variant of [`Self::list_all_files`]: invokes `f` for every
+    /// `FileMeta` row without materialising the whole table in memory. The
+    /// read transaction is held for the entire walk, so concurrent writers
+    /// stall at commit time — keep the callback cheap.
+    ///
+    /// v0.4.5: added to let `compute_block_live_info` scale to million-file
+    /// deployments. The row ordering follows redb's B-tree order, **not**
+    /// `create_time`; callers that need chronological order should still
+    /// use `list_all_files`.
+    pub fn for_each_file<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(FileMeta) -> Result<()>,
+    {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let file: FileMeta = decode(v.value())?;
+            f(file)?;
+        }
+        Ok(())
     }
 
     /// List all file IDs in a partition

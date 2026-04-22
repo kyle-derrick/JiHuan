@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
-import { RefreshCw, Trash2, Eye, X, Trash, Shrink, Lock as LockIcon, Info, ChevronDown, ChevronUp } from 'lucide-react'
+import { RefreshCw, Trash2, Eye, X, Trash, Shrink, Lock as LockIcon, Info, ChevronDown, ChevronUp, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
 import {
   listBlocks, getBlockDetail, deleteBlock, triggerGc, compactBlocks, sealActiveBlock,
   type BlockInfo, type BlockDetail,
@@ -141,8 +141,73 @@ export default function Blocks() {
   }
 
   const totalSize = blocks.reduce((acc, b) => acc + b.size, 0)
+  const totalLive = blocks.reduce((acc, b) => acc + (b.live_bytes ?? 0), 0)
   const activeCount = blocks.filter(b => !b.sealed).length
   const orphanCount = blocks.filter(b => b.ref_count === 0).length
+  const lowUtilCount = blocks.filter(b => b.sealed && b.utilization != null && b.utilization < 0.5).length
+
+  /** Colour utilisation % so the operator can spot compaction candidates at a glance. */
+  const utilColor = (u: number | null) => {
+    if (u == null) return 'text-gray-400'
+    if (u < 0.5) return 'text-red-700'
+    if (u < 0.8) return 'text-amber-700'
+    return 'text-emerald-700'
+  }
+  const formatUtil = (u: number | null) =>
+    u == null ? '—' : `${(u * 100).toFixed(1)}%`
+
+  // ── Sorting ───────────────────────────────────────────────────────────
+  // Operators specifically want "utilisation ascending" to find compaction
+  // candidates. We support the common columns via a tiny click-to-sort
+  // model: null key = insertion order (server-side ordering preserved).
+  type SortKey = 'block_id' | 'size' | 'live_bytes' | 'utilization' | 'ref_count' | 'create_time'
+  type SortDir = 'asc' | 'desc'
+  const [sortKey, setSortKey] = useState<SortKey | null>(null)
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+
+  const toggleSort = (k: SortKey) => {
+    if (sortKey !== k) {
+      setSortKey(k)
+      // utilisation defaults to asc (low-util first = most compactable);
+      // size/ref_count/create_time default to desc (biggest/newest first).
+      setSortDir(k === 'utilization' || k === 'block_id' ? 'asc' : 'desc')
+    } else if (sortDir === 'asc') {
+      setSortDir('desc')
+    } else {
+      // Third click resets to server order.
+      setSortKey(null)
+      setSortDir('asc')
+    }
+  }
+
+  const sortedBlocks = useMemo(() => {
+    if (!sortKey) return blocks
+    const mult = sortDir === 'asc' ? 1 : -1
+    // unsealed (utilization == null) sort as -Infinity asc / +Infinity desc
+    // so they cluster predictably at one end and never poison the numeric
+    // ordering of sealed rows.
+    const utilSort = (u: number | null) =>
+      u == null ? (sortDir === 'asc' ? -Infinity : Infinity) : u
+    const out = [...blocks]
+    out.sort((a, b) => {
+      switch (sortKey) {
+        case 'block_id':    return mult * a.block_id.localeCompare(b.block_id)
+        case 'size':        return mult * (a.size - b.size)
+        case 'live_bytes':  return mult * ((a.live_bytes ?? 0) - (b.live_bytes ?? 0))
+        case 'utilization': return mult * (utilSort(a.utilization ?? null) - utilSort(b.utilization ?? null))
+        case 'ref_count':   return mult * (a.ref_count - b.ref_count)
+        case 'create_time': return mult * (a.create_time - b.create_time)
+      }
+    })
+    return out
+  }, [blocks, sortKey, sortDir])
+
+  const SortIndicator = ({ k }: { k: SortKey }) => {
+    if (sortKey !== k) return <ArrowUpDown size={12} className="inline-block ml-1 text-gray-300" />
+    return sortDir === 'asc'
+      ? <ArrowUp size={12} className="inline-block ml-1 text-gray-700" />
+      : <ArrowDown size={12} className="inline-block ml-1 text-gray-700" />
+  }
 
   return (
     <div>
@@ -265,30 +330,73 @@ export default function Blocks() {
       <div className="mb-4 flex gap-4 text-sm text-gray-500 flex-wrap">
         <span>共 <strong className="text-gray-900">{blocks.length}</strong> 个 Block</span>
         <span>总大小 <strong className="text-gray-900">{formatBytes(totalSize)}</strong></span>
+        <span title="所有块中唯一活 chunk 的 compressed_size 之和，与压实扫描使用的口径一致">
+          活数据 <strong className="text-gray-900">{formatBytes(totalLive)}</strong>
+          {totalSize > 0 && (
+            <span className="text-gray-400"> （整体 {(totalLive / totalSize * 100).toFixed(1)}%）</span>
+          )}
+        </span>
         <span>活跃（未 seal）<strong className="text-amber-700">{activeCount}</strong></span>
         <span>孤立（ref=0）<strong className="text-red-700">{orphanCount}</strong></span>
+        <span title="已封存且利用率 < 50% 的块数量，即压实候选">
+          低利用率 <strong className="text-red-700">{lowUtilCount}</strong>
+        </span>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-100 text-left">
-              <th className="px-4 py-3 font-medium text-gray-500">Block ID</th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('block_id')}
+              >
+                Block ID<SortIndicator k="block_id" />
+              </th>
               <th className="px-4 py-3 font-medium text-gray-500">状态</th>
-              <th className="px-4 py-3 font-medium text-gray-500">大小</th>
-              <th className="px-4 py-3 font-medium text-gray-500">引用数</th>
-              <th className="px-4 py-3 font-medium text-gray-500">创建时间</th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('size')}
+              >
+                大小<SortIndicator k="size" />
+              </th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('live_bytes')}
+                title="活 chunk compressed_size 合计（按唯一 hash 去重）"
+              >
+                活数据<SortIndicator k="live_bytes" />
+              </th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('utilization')}
+                title="live_bytes / size  •  点击按升序排序，最低利用率的块排在最前（压实候选）"
+              >
+                利用率<SortIndicator k="utilization" />
+              </th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('ref_count')}
+              >
+                引用数<SortIndicator k="ref_count" />
+              </th>
+              <th
+                className="px-4 py-3 font-medium text-gray-500 cursor-pointer select-none hover:text-gray-900"
+                onClick={() => toggleSort('create_time')}
+              >
+                创建时间<SortIndicator k="create_time" />
+              </th>
               <th className="px-4 py-3 font-medium text-gray-500 w-28">操作</th>
             </tr>
           </thead>
           <tbody>
             {loading && (
-              <tr><td colSpan={6} className="px-4 py-10 text-center text-gray-400">加载中…</td></tr>
+              <tr><td colSpan={8} className="px-4 py-10 text-center text-gray-400">加载中…</td></tr>
             )}
             {!loading && blocks.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-10 text-center text-gray-400">暂无 Block</td></tr>
+              <tr><td colSpan={8} className="px-4 py-10 text-center text-gray-400">暂无 Block</td></tr>
             )}
-            {blocks.map((b) => (
+            {sortedBlocks.map((b) => (
               <tr key={b.block_id} className="border-b border-gray-50 hover:bg-gray-50">
                 <td className="px-4 py-3 font-mono text-xs text-gray-700">{b.block_id}</td>
                 <td className="px-4 py-3">
@@ -299,6 +407,10 @@ export default function Blocks() {
                   </span>
                 </td>
                 <td className="px-4 py-3 text-gray-600">{formatBytes(b.size)}</td>
+                <td className="px-4 py-3 text-gray-600">{formatBytes(b.live_bytes ?? 0)}</td>
+                <td className={`px-4 py-3 font-medium ${utilColor(b.utilization ?? null)}`}>
+                  {formatUtil(b.utilization ?? null)}
+                </td>
                 <td className="px-4 py-3">
                   <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                     b.ref_count === 0 ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-700'
@@ -364,6 +476,7 @@ export default function Blocks() {
                     ['Block ID', detail.block_id],
                     ['状态', detail.sealed ? 'sealed（已封存）' : 'active（写入中）'],
                     ['大小', formatBytes(detail.size)],
+                    ['活数据', `${formatBytes(detail.live_bytes ?? 0)}  ·  利用率 ${formatUtil(detail.utilization ?? null)}`],
                     ['引用数', String(detail.ref_count)],
                     ['路径', detail.path],
                     ['创建时间', formatUnixTime(detail.create_time)],
