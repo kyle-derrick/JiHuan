@@ -16,16 +16,17 @@ gc_threshold       = 0.8
 gc_interval_secs   = 600
 max_open_block_files = 32
 verify_on_read     = true
-# v0.4.4+: big-file workloads have large blocks; rewrite when >50% dead.
-# Large block_file_size means each compacted group copies a lot of bytes,
-# so require a proportionally bigger benefit before running.
-auto_compact_enabled             = true
-auto_compact_threshold           = 0.5
-auto_compact_min_size_bytes      = 16777216   # 16 MiB
-auto_compact_every_gc_ticks      = 6          # 6 × 600 s = once per hour
-auto_compact_min_benefit_bytes   = 134217728  # 128 MiB — only run when the
-                                              # disk savings are sizeable
-auto_compact_disk_headroom_bytes = 2147483648 # 2 GiB free for the 2 GB block
+# v0.4.7: large-file workloads have big blocks; Strategy A conservative
+# because every rewrite moves a lot of bytes. Strategy B ratio low (0.1)
+# so only *very* undersized blocks merge, and min_file_saved high (5) so
+# we only commit when the convergence is meaningful.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.4      # Strategy A — conservative (>60% dead)
+auto_compact_undersize_ratio       = 0.1      # Strategy B — only <10% of block_file_size
+auto_compact_min_file_saved        = 5        # commit on 6→1 collapse
+auto_compact_min_block_age_secs    = 3600     # anti-thrash
+auto_compact_every_gc_ticks        = 6        # 6 × 600 s = once per hour
+auto_compact_disk_headroom_bytes   = 2147483648  # 2 GiB for 2 GB blocks
 
 [server]
 http_addr    = "0.0.0.0:8080"

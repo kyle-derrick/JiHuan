@@ -16,53 +16,114 @@ Drop-in TOML profiles tuned for common scenarios. Pass the chosen file via
 | `archive.toml`    | WORM / backup / evidence store (rare deletes)       | huge   | zstd:19     | on (1 day)   | 4 GB blocks, compact daily only.        |
 | `dedup-heavy.toml`| Container images, VM snapshots, CI caches           | varied | zstd:3      | on (30 min)  | 1 MB chunks, frequent compaction.       |
 
-## Key v0.4.5 knobs
+## Auto-compaction (v0.4.7: dual-strategy)
 
-All compaction behaviour is controlled by six `[storage]` keys:
+v0.4.7 reworks auto-compaction around **two independent strategies**
+that share one scan → pack → commit pipeline:
 
-| Key                                | Meaning                                                         |
-|------------------------------------|-----------------------------------------------------------------|
-| `auto_compact_enabled`             | Master switch for the background loop.                          |
-| `auto_compact_threshold`           | A sealed block is a *candidate* when `live_bytes / size < threshold`. |
-| `auto_compact_min_size_bytes`      | Skip blocks below this size (no point rewriting trivial data).  |
-| `auto_compact_every_gc_ticks`      | Run every N GC passes (actual cadence = `gc_interval_secs × N`).|
-| `auto_compact_min_benefit_bytes`   | Skip a compaction group if projected bytes-saved < this floor.  |
-| `auto_compact_disk_headroom_bytes` | Require `available(data_dir) ≥ group_live_bytes + headroom` before writing the new block. 0 disables the check. |
+- **Strategy A — low-utilisation.** Rewrites blocks whose live/size
+  ratio has drifted below a threshold. Reclaims dead bytes. The
+  commit rule is implicit: any group containing at least one
+  A-candidate always commits, so there is a single knob
+  (`auto_compact_threshold`) for the entire strategy.
+- **Strategy B — undersized.** Merges sealed blocks whose absolute
+  size is a small fraction of `block_file_size`. Converges file
+  count so storage doesn't drift into "many tiny sealed blocks" even
+  when every block is fully utilised. Commit rule is explicit: the
+  merged output must reduce file count by at least
+  `auto_compact_min_file_saved`.
+
+Candidate predicates are disjunctive (`low_util OR undersized`);
+commit rules are also disjunctive (`A` OR `B` OR `force`). An
+**age filter** excludes blocks younger than
+`auto_compact_min_block_age_secs` from both predicates to prevent
+thrash on freshly-sealed or freshly-merged outputs.
+
+### Config keys
+
+| Key                                | Meaning                                                                                               |
+|------------------------------------|-------------------------------------------------------------------------------------------------------|
+| `auto_compact_enabled`             | Master switch for the background loop.                                                                |
+| `auto_compact_threshold`           | **Strategy A.** Candidate when `live_bytes / size < threshold`. Groups with any A-candidate commit.   |
+| `auto_compact_undersize_ratio`     | **Strategy B.** Candidate when `size < block_file_size × ratio`. 0 disables Strategy B.               |
+| `auto_compact_min_file_saved`      | **Strategy B.** Group commits when `source_count − ceil(live_sum / block_file_size) ≥ min_file_saved`. 0 disables the gate. |
+| `auto_compact_min_block_age_secs`  | Anti-thrash. Exclude blocks younger than this from *both* predicates. 0 disables.                     |
+| `auto_compact_every_gc_ticks`      | Run every N GC passes (actual cadence = `gc_interval_secs × N`).                                      |
+| `auto_compact_disk_headroom_bytes` | Require `available(data_dir) ≥ group_live_bytes + headroom` before writing. 0 disables. Always respected — not bypassed by `force=true`. |
 
 ### How the scanner decides what to compact
 
 1. **List sealed, non-pinned blocks** (active writer is never compacted).
-2. **Compute `live_bytes`** per block as the sum of compressed sizes of
+2. **Apply the age filter**: skip blocks whose age (now − `create_time`)
+   is below `min_block_age_secs`.
+3. **Compute `live_bytes`** per block as the sum of compressed sizes of
    the *unique* chunk hashes still referenced by any live file. Dedup
-   references contribute once. This matches the `utilization` column
-   shown in the UI at `/ui/blocks`.
-3. **Keep candidates** where `live_bytes / size < threshold`
-   AND `size ≥ min_size_bytes`.
-4. **Bin-pack** candidates (ascending by `live_bytes`) into groups whose
-   combined live bytes fit within one `block_file_size`.
-5. **Skip groups** whose projected savings fall below
-   `min_benefit_bytes`, or whose new block wouldn't fit with
-   `disk_headroom_bytes` free.
-6. **Merge** each surviving group into one new block via a single redb
-   transaction, then delete the old block files.
+   references contribute once. Matches the `utilization` column shown
+   in the UI at `/ui/blocks`.
+4. **Flag candidates** by the disjunctive predicate:
+   - `low_util`  if `live_bytes / size < threshold`,
+   - `undersized` if `size < block_file_size × undersize_ratio`,
+   - `both`     if both fire.
+5. **Bin-pack** candidates (ascending by `live_bytes`) into groups
+   whose combined live bytes fit within one `block_file_size`.
+6. **Commit rule**: a group commits when it contains any `low_util`
+   candidate, **OR** when `file_count_saved ≥ min_file_saved`, **OR**
+   when `force = true` (admin API only). Skipped groups emit the
+   `jihuan_compactions_skipped_total{reason=…}` counter.
+7. **Disk headroom check**: require `available ≥ live_sum + headroom`
+   before writing each new block. Always applied.
+8. **Merge** each surviving group into one new block via a single
+   redb transaction, then delete the old block files. v0.4.7 adds
+   **same-algorithm passthrough**: when a source chunk's recorded
+   compression byte matches the engine's configured algorithm, the
+   compressed bytes are copied verbatim into the new block without
+   the decompress → recompress round-trip. Cross-algorithm sources
+   (e.g. after changing `compression_algorithm` in config) still pay
+   the full round-trip.
 
 ### Tuning cheatsheet
 
-| Symptom                                              | Knob to turn                                            |
-|------------------------------------------------------|---------------------------------------------------------|
-| Compaction runs but saves only a few bytes           | Raise `auto_compact_min_benefit_bytes`.                 |
-| Disk fills up during compaction                      | Raise `auto_compact_disk_headroom_bytes`.               |
-| Too many half-empty blocks after bulk deletes        | Lower `auto_compact_threshold` (e.g. 0.6 → 0.8).        |
-| Background CPU spikes interfering with requests      | Raise `auto_compact_every_gc_ticks` (less often) or disable. |
-| A specific block is stuck at low utilisation         | `POST /api/admin/compact {"block_id": "<id>"}` — bypasses all filters. |
+| Symptom                                              | Knob to turn                                                                 |
+|------------------------------------------------------|------------------------------------------------------------------------------|
+| Compaction runs but bytes-saved are trivial          | Lower `auto_compact_threshold` (e.g. 0.5 → 0.2) so only very dead blocks qualify. |
+| File count keeps drifting up even at full utilisation | Raise `auto_compact_undersize_ratio` (e.g. 0.25 → 0.5) and/or lower `min_file_saved`. |
+| Disk fills up during compaction                      | Raise `auto_compact_disk_headroom_bytes`.                                    |
+| Too many half-empty blocks after bulk deletes        | Raise `auto_compact_threshold` (e.g. 0.5 → 0.8).                             |
+| Background CPU spikes interfering with requests      | Raise `auto_compact_every_gc_ticks` (less often) or disable entirely.        |
+| New blocks immediately re-selected for compaction    | Raise `auto_compact_min_block_age_secs` (must be ≥ one scheduling cycle).    |
+| A specific block is stuck                            | `POST /api/admin/compact {"block_id": "<id>"}` — bypasses all gates.         |
+| Operator wants to force a full sweep                 | `POST /api/admin/compact {"force": true}` — bypasses A/B commit rules. Still respects headroom and age filters. |
 
-### Deployment tip
+### Migrating from v0.4.6
 
-For new deployments treat the non-default profiles as *starting points* —
-observe the `jihuan_bytes_written_total` counter and the block list
-utilisation column for a week, then adjust `threshold` / `min_benefit_bytes`
-to match your actual deletion pattern. `threshold` is a pre-filter (fast
-but may miss edge cases); `min_benefit_bytes` is the real savings gate.
+v0.4.7 hard-errors on two removed keys — the server refuses to start
+if they appear under `[storage]`:
+
+- `auto_compact_min_size_bytes` → superseded by
+  `auto_compact_undersize_ratio` (expressed as a ratio of
+  `block_file_size` instead of an absolute floor).
+- `auto_compact_min_benefit_bytes` → removed. Tune
+  `auto_compact_threshold` down instead if you want a higher
+  dead-byte bar before committing.
+
+The admin endpoint `/api/admin/compact` accepts the old fields
+(`min_size_bytes`, `min_benefit_bytes`) silently for one release;
+they're logged and ignored. Update your scripts to use the new
+fields (`undersize_ratio`, `min_file_saved`, `force`) at your
+convenience.
+
+### Observability
+
+Six Prometheus counters report what the scanner actually did:
+
+| Counter                                                 | Labels                                              |
+|---------------------------------------------------------|-----------------------------------------------------|
+| `jihuan_compactions_total`                              | `strategy = low_util` / `undersized` / `mixed`      |
+| `jihuan_compactions_skipped_total`                      | `reason = below_file_benefit` / `disk_headroom` / `block_too_young` |
+| `jihuan_compactions_bytes_saved_total`                  | —                                                   |
+| `jihuan_compactions_files_reduced_total`                | —                                                   |
+| `jihuan_compactions_passthrough_chunks_total`           | — (same-algo fast path hits)                        |
+| `jihuan_compactions_recompressed_chunks_total`          | — (cross-algo migrations)                           |
 
 ---
 
@@ -84,14 +145,18 @@ RUST_LOG=info,jihuan_core::engine=debug ./jihuan-server --config ./default.toml
 You'll see one log line per:
 
 - **Candidate block** considered by the scanner — shows `block_id`,
-  `size`, `live_bytes`, computed `utilization`, and whether it was
-  `kept = true/false` relative to the `threshold`.
-- **Group** the candidates were bin-packed into, with `old_sum`,
-  `live_sum`, `benefit`, and the `min_benefit` floor that gated it.
-- **Disk-headroom** rejection (at `warn!`): shows `avail` vs. `required`
-  if a group would have exceeded the free-space safety rail.
-- **Merge completion** (at `info!`): `group_size`, `new_block_id`,
-  and whether extra references slipped in during the redb commit.
+  `size`, `live_bytes`, computed `utilization`, `threshold`,
+  `undersize_bytes`, and the resulting `reason` (`low_util` /
+  `undersized` / `both` / `none`).
+- **Group commit decision** — shows `group_size`, `live_sum`,
+  `file_count_saved`, `min_file_saved`, `has_a_candidate`, the
+  picked `strategy` label, and the binding `commit_reason`
+  (`a_candidate` / `file_benefit` / `forced` / `none`).
+- **Disk-headroom** rejection (at `warn!`): shows `available` vs.
+  `required` if a group would have exceeded the free-space safety
+  rail.
+- **Merge completion** (at `info!`): `group_size`, `strategy`, and
+  the per-block stats returned by `compact_merge_group`.
 
 Together these reproduce every decision the scanner made, so you can
 replay them against a staging dataset with the same config.
@@ -156,11 +221,13 @@ log per `get_bytes` / `get_range` call.
 # Is compaction making progress but savings are trivial?
 RUST_LOG=info,jihuan_core::engine=debug …
 # Does the UI show blocks stuck at low util but nothing gets compacted?
-# → look for "group skipped (benefit < min_benefit)"
+# → look for "compact: group commit decision" with commit=false and
+#   commit_reason=none → the block is undersized-only but the group
+#   didn't save enough files to pass min_file_saved.
 RUST_LOG=info,jihuan_core::engine=debug …
 
 # Is disk filling up unexpectedly?
-# → look for "compact_low_utilization: group skipped due to disk headroom"
+# → look for "compact: group skipped (insufficient disk headroom)"
 RUST_LOG=info,jihuan_core::engine=debug …
 
 # Why didn't GC reclaim this block?

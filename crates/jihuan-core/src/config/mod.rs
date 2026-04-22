@@ -73,27 +73,39 @@ fn default_auto_compact_threshold() -> f64 {
     0.5
 }
 
-fn default_auto_compact_min_size_bytes() -> u64 {
-    // 64 KiB — skip only truly trivial blocks. Previously 4 MiB, which
-    // silently disabled auto-compaction on typical dev/small-file workloads
-    // (blocks rarely exceed a few KiB before being sealed). The operative
-    // gate is `auto_compact_threshold`; this floor only prevents pointless
-    // churn on sub-KiB blocks where the re-encode cost dominates.
-    64 * 1024
-}
-
 fn default_auto_compact_every_gc_ticks() -> u32 {
     12 // with 5-min GC tick → once per hour
 }
 
-fn default_auto_compact_min_benefit_bytes() -> u64 {
-    // v0.4.5: skip compaction groups whose projected byte savings
-    // (sum of old block sizes − sum of live bytes) fall below this
-    // threshold. Prevents re-encoding gigabytes just to reclaim a
-    // handful of KiB on datasets with many near-full blocks. 8 MiB is
-    // conservative: one block's worth of overhead/write amplification
-    // has to actually win us this much real disk back.
-    8 * 1024 * 1024
+fn default_auto_compact_undersize_ratio() -> f64 {
+    // v0.4.7: Strategy B candidate gate. A sealed block whose absolute
+    // size is less than `block_file_size * undersize_ratio` is eligible
+    // for compaction even when its utilisation is high. Drives the
+    // "merge many small sealed blocks" axis that the low-utilisation
+    // scanner cannot see. 0.25 means "blocks below 25% of the
+    // configured block_file_size are candidates".
+    0.25
+}
+
+fn default_auto_compact_min_file_saved() -> u64 {
+    // v0.4.7: Strategy B commit gate. A group is committed when it
+    // reduces the on-disk sealed-block count by at least this many
+    // files (file_count_saved = source_count − ceil(live_sum /
+    // block_file_size)). 3 means "only commit if at least 4 sources
+    // collapse into 1 (or equivalent)". Zero disables the gate
+    // entirely.
+    3
+}
+
+fn default_auto_compact_min_block_age_secs() -> u64 {
+    // v0.4.7: anti-thrash filter. Blocks younger than this are
+    // excluded from both Strategy A and Strategy B candidate
+    // predicates. Prevents (a) freshly-sealed blocks from being
+    // compacted before they accumulate content, and (b) a merge
+    // output that's itself small from being re-selected on the next
+    // tick → infinite thrash loop. 3600 s = one scheduling cycle with
+    // the default gc_interval * every_gc_ticks (300 s * 12).
+    3600
 }
 
 fn default_auto_compact_disk_headroom_bytes() -> u64 {
@@ -194,41 +206,62 @@ pub struct StorageConfig {
     #[serde(default)]
     pub max_storage_bytes: Option<u64>,
 
-    /// v0.4.4 auto-compaction: when enabled, every `auto_compact_every_gc_ticks`
-    /// GC passes runs `compact_low_utilization(auto_compact_threshold,
-    /// auto_compact_min_size_bytes)` to reclaim fragmented space inside
-    /// partially-deleted blocks. Disabled by default because compaction
-    /// re-compresses live chunks and generates write amplification — operators
+    /// Auto-compaction master switch. When enabled, every
+    /// `auto_compact_every_gc_ticks` GC passes runs the dual-strategy
+    /// scanner to reclaim fragmented space (Strategy A:
+    /// low-utilisation) and merge undersized sealed blocks
+    /// (Strategy B: undersized) behind the scenes. Disabled by default
+    /// because compaction can touch large amounts of data — operators
     /// opt in when they care more about disk efficiency than peak CPU.
     #[serde(default)]
     pub auto_compact_enabled: bool,
-    /// Compact any sealed block whose `live_bytes / size` is below this
-    /// ratio. `0.5` means "compact any block more than half-empty".
+
+    /// **Strategy A gate** — compact any sealed block whose `live_bytes
+    /// / size` is below this ratio. `0.5` means "compact any block
+    /// more than half-empty". This is the *only* knob for Strategy A:
+    /// a group containing any A-candidate is always committed; tune
+    /// this down (e.g. to 0.2) to require a higher dead-byte ratio
+    /// before a block is deemed worth rewriting.
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold: f64,
-    /// Skip blocks smaller than this when auto-compacting. Prevents the
-    /// scheduler from churning on tiny blocks where the re-encode cost
-    /// dominates the space saved.
-    #[serde(default = "default_auto_compact_min_size_bytes")]
-    pub auto_compact_min_size_bytes: u64,
-    /// Run auto-compaction every N GC ticks. `1` = every tick (aggressive);
-    /// larger values amortise the I/O cost. Ignored when `auto_compact_enabled`
-    /// is false.
+
+    /// Run auto-compaction every N GC ticks. `1` = every tick
+    /// (aggressive); larger values amortise the I/O cost. Ignored
+    /// when `auto_compact_enabled` is false.
     #[serde(default = "default_auto_compact_every_gc_ticks")]
     pub auto_compact_every_gc_ticks: u32,
 
-    /// v0.4.5: skip a compaction *group* when its projected byte savings
-    /// (sum of old block sizes − sum of live bytes) are below this floor.
-    /// Applies to both single-block groups (the targeted rewrite path is
-    /// unaffected) and multi-block merges. Zero disables the filter.
-    #[serde(default = "default_auto_compact_min_benefit_bytes")]
-    pub auto_compact_min_benefit_bytes: u64,
+    /// **Strategy B candidate gate** (v0.4.7) — sealed blocks whose
+    /// absolute size is below `block_file_size * undersize_ratio` are
+    /// candidates regardless of utilisation. Addresses the
+    /// "many small sealed blocks" drift that Strategy A cannot see.
+    /// `0.25` is a good middle-of-the-road default.
+    #[serde(default = "default_auto_compact_undersize_ratio")]
+    pub auto_compact_undersize_ratio: f64,
 
-    /// v0.4.5: minimum filesystem free-space headroom (bytes) required to
+    /// **Strategy B commit gate** (v0.4.7) — a group must reduce the
+    /// sealed-block count by at least this many files to be
+    /// committed. Formally:
+    /// `file_count_saved = source_count − ceil(live_sum / block_file_size)`.
+    /// Zero disables the gate. `3` = at least 4 sources collapse to 1.
+    #[serde(default = "default_auto_compact_min_file_saved")]
+    pub auto_compact_min_file_saved: u64,
+
+    /// **Anti-thrash filter** (v0.4.7) — blocks younger than this
+    /// are excluded from *both* Strategy A and Strategy B candidate
+    /// predicates. Prevents freshly-sealed blocks and merge outputs
+    /// from being immediately re-selected. Zero disables the check
+    /// (not recommended in production).
+    #[serde(default = "default_auto_compact_min_block_age_secs")]
+    pub auto_compact_min_block_age_secs: u64,
+
+    /// Minimum filesystem free-space headroom (bytes) required to
     /// start a compaction group. Checked as `available(data_dir) >=
-    /// group_live_bytes + auto_compact_disk_headroom_bytes`. Groups that
-    /// don't fit are skipped — individual compactions don't partially apply.
-    /// Zero disables the check.
+    /// group_live_bytes + auto_compact_disk_headroom_bytes`. Groups
+    /// that don't fit are skipped — individual compactions don't
+    /// partially apply. Zero disables the check. This safety check
+    /// is orthogonal to Strategy A/B gates and is *not* bypassed by
+    /// the admin `force=true` flag.
     #[serde(default = "default_auto_compact_disk_headroom_bytes")]
     pub auto_compact_disk_headroom_bytes: u64,
 }
@@ -370,10 +403,53 @@ impl AppConfig {
 
     /// Parse configuration from a TOML string
     pub fn from_toml_str(content: &str) -> Result<Self> {
+        // v0.4.7: pre-scan for deprecated keys so operators get a
+        // clear migration error rather than a silently ignored
+        // setting. We only reject the two keys removed in v0.4.7;
+        // everything else goes through the regular deserializer
+        // which allows unknown fields (forward compat with newer
+        // engines).
+        Self::reject_deprecated_v047_keys(content)?;
         let cfg: AppConfig = toml::from_str(content)
             .map_err(|e| JiHuanError::Config(format!("Failed to parse config: {}", e)))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// v0.4.7: scan raw TOML for two removed keys under `[storage]` and
+    /// reject them with a migration-friendly error message. Matches
+    /// both `storage.key = ...` inline syntax and `[storage]\nkey = ...`
+    /// table syntax.
+    fn reject_deprecated_v047_keys(content: &str) -> Result<()> {
+        let value: toml::Value = content
+            .parse()
+            .map_err(|e| JiHuanError::Config(format!("Failed to parse config: {}", e)))?;
+        let storage = match value.get("storage").and_then(|v| v.as_table()) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        const DEPRECATED: &[(&str, &str)] = &[
+            (
+                "auto_compact_min_size_bytes",
+                "superseded by `auto_compact_undersize_ratio` in v0.4.7 \
+                 (see config/README.md § Auto-compaction). Delete the line to migrate.",
+            ),
+            (
+                "auto_compact_min_benefit_bytes",
+                "removed in v0.4.7 — Strategy A's `auto_compact_threshold` already controls \
+                 commit aggressiveness (see config/README.md § Auto-compaction). \
+                 Delete the line to migrate.",
+            ),
+        ];
+        for (key, hint) in DEPRECATED {
+            if storage.contains_key(*key) {
+                return Err(JiHuanError::Config(format!(
+                    "storage.{}: {}",
+                    key, hint
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Validate configuration values
@@ -396,6 +472,16 @@ impl AppConfig {
         if s.compression_level < 0 || s.compression_level > 22 {
             return Err(JiHuanError::Config(
                 "compression_level must be between 0 and 22".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&s.auto_compact_threshold) {
+            return Err(JiHuanError::Config(
+                "auto_compact_threshold must be between 0.0 and 1.0".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&s.auto_compact_undersize_ratio) {
+            return Err(JiHuanError::Config(
+                "auto_compact_undersize_ratio must be between 0.0 and 1.0".into(),
             ));
         }
         Ok(())
@@ -495,9 +581,10 @@ impl ConfigTemplate {
                 max_storage_bytes: None,
                 auto_compact_enabled: false,
                 auto_compact_threshold: default_auto_compact_threshold(),
-                auto_compact_min_size_bytes: default_auto_compact_min_size_bytes(),
                 auto_compact_every_gc_ticks: default_auto_compact_every_gc_ticks(),
-                auto_compact_min_benefit_bytes: default_auto_compact_min_benefit_bytes(),
+                auto_compact_undersize_ratio: default_auto_compact_undersize_ratio(),
+                auto_compact_min_file_saved: default_auto_compact_min_file_saved(),
+                auto_compact_min_block_age_secs: default_auto_compact_min_block_age_secs(),
                 auto_compact_disk_headroom_bytes: default_auto_compact_disk_headroom_bytes(),
             },
             server: ServerConfig {

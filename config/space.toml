@@ -15,16 +15,17 @@ gc_threshold       = 0.6
 gc_interval_secs   = 600
 max_open_block_files = 32
 verify_on_read     = true
-# v0.4.4+: space profile aggressively reclaims fragmented blocks and
-# bin-packs low-util blocks into as few merged blocks as possible.
-auto_compact_enabled             = true
-auto_compact_threshold           = 0.8        # compact anything <80% full
-auto_compact_min_size_bytes      = 1048576    # 1 MiB
-auto_compact_every_gc_ticks      = 6          # 6 × 600 s = once per hour
-auto_compact_min_benefit_bytes   = 1048576    # 1 MiB — archive tiers care
-                                              # about every megabyte
-auto_compact_disk_headroom_bytes = 2147483648 # 2 GiB free — 2 GB blocks
-                                              # need the room on merge
+# v0.4.7: archive tier maximises space reclamation. Strategy A very
+# aggressive (0.8) to rewrite anything <80% utilised; Strategy B
+# moderate ratio (0.25) to keep file count in check without
+# thrashing.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.8      # Strategy A — very aggressive
+auto_compact_undersize_ratio       = 0.25     # Strategy B — standard
+auto_compact_min_file_saved        = 3        # commit on 4→1 collapse
+auto_compact_min_block_age_secs    = 3600     # anti-thrash
+auto_compact_every_gc_ticks        = 6        # 6 × 600 s = once per hour
+auto_compact_disk_headroom_bytes   = 2147483648  # 2 GiB for 2 GB blocks
 
 [server]
 http_addr    = "0.0.0.0:8080"

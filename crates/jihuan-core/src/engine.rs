@@ -238,6 +238,79 @@ pub struct RepairSummary {
 /// signatures in `engine.rs` readable.
 type CompactSource = (BlockMeta, u64, std::collections::HashSet<std::sync::Arc<str>>);
 
+/// v0.4.7: why the scanner selected a block as a compaction candidate.
+/// Carried alongside each [`CompactSource`] in a parallel map so the
+/// group commit logic can decide whether Strategy A (low-util),
+/// Strategy B (undersized), or both justified the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateReason {
+    LowUtil,
+    Undersized,
+    Both,
+}
+
+impl CandidateReason {
+    fn as_label(self) -> &'static str {
+        match self {
+            CandidateReason::LowUtil => "low_util",
+            CandidateReason::Undersized => "undersized",
+            CandidateReason::Both => "both",
+        }
+    }
+
+    fn has_low_util(self) -> bool {
+        matches!(self, CandidateReason::LowUtil | CandidateReason::Both)
+    }
+}
+
+/// v0.4.7: knobs that drive a compaction pass. Built from
+/// [`AppConfig`](crate::config::AppConfig) for the background loop via
+/// [`CompactionOptions::from_config`], and patched per-call by the
+/// `/api/admin/compact` admin endpoint.
+#[derive(Debug, Clone)]
+pub struct CompactionOptions {
+    /// Strategy A candidate gate: `util = live/size < threshold`
+    /// makes a block eligible. A group containing any A-candidate is
+    /// always committed (Strategy A has no separate commit threshold;
+    /// tune aggressiveness via this single knob).
+    pub threshold: f64,
+    /// Strategy B candidate gate: `size < block_file_size * ratio`
+    /// makes a block eligible even at full utilisation.
+    pub undersize_ratio: f64,
+    /// Strategy B commit gate: a group must reduce the sealed-block
+    /// count by at least this many files. Zero disables the gate
+    /// (useful for legacy low-util-only tests).
+    pub min_file_saved: u64,
+    /// Anti-thrash filter: blocks younger than this are skipped by
+    /// both candidate predicates. Zero disables.
+    pub min_block_age_secs: u64,
+    /// Minimum free disk bytes required above group live-sum before
+    /// a merge is allowed to write. Zero disables. Always respected,
+    /// even under `force = true`.
+    pub disk_headroom_bytes: u64,
+    /// Bypass both Strategy A and Strategy B commit rules, committing
+    /// any non-empty packed group. Intended for operator use via the
+    /// admin endpoint during maintenance windows. Does NOT bypass
+    /// disk-headroom or age filters.
+    pub force: bool,
+}
+
+impl CompactionOptions {
+    /// Read defaults straight from the engine config. This is what
+    /// the background loop uses every tick.
+    pub fn from_config(cfg: &crate::config::AppConfig) -> Self {
+        let s = &cfg.storage;
+        Self {
+            threshold: s.auto_compact_threshold,
+            undersize_ratio: s.auto_compact_undersize_ratio,
+            min_file_saved: s.auto_compact_min_file_saved,
+            min_block_age_secs: s.auto_compact_min_block_age_secs,
+            disk_headroom_bytes: s.auto_compact_disk_headroom_bytes,
+            force: false,
+        }
+    }
+}
+
 /// Result of [`Engine::reseal_orphan_block_static`].
 ///
 /// `chunks_restored` is the number of **unique** chunk hashes whose
@@ -442,6 +515,34 @@ impl Engine {
             "Latency of get_bytes operations in seconds"
         );
 
+        // v0.4.7 compaction metrics
+        metrics::describe_counter!(
+            "jihuan_compactions_total",
+            "Total compaction groups committed (labelled by strategy: low_util/undersized/mixed)"
+        );
+        metrics::describe_counter!(
+            "jihuan_compactions_skipped_total",
+            "Total groups skipped during compaction (labelled by reason: \
+             below_file_benefit/disk_headroom/block_too_young)"
+        );
+        metrics::describe_counter!(
+            "jihuan_compactions_bytes_saved_total",
+            "Total on-disk bytes reclaimed by compaction"
+        );
+        metrics::describe_counter!(
+            "jihuan_compactions_files_reduced_total",
+            "Total net reduction in sealed block files produced by compaction"
+        );
+        metrics::describe_counter!(
+            "jihuan_compactions_passthrough_chunks_total",
+            "Chunks copied verbatim during compaction (same-algorithm passthrough)"
+        );
+        metrics::describe_counter!(
+            "jihuan_compactions_recompressed_chunks_total",
+            "Chunks that required decompress+recompress during compaction \
+             (cross-algorithm migration)"
+        );
+
         tracing::info!("JiHuan engine opened successfully");
 
         Ok(Self {
@@ -466,13 +567,14 @@ impl Engine {
         self.gc.run_once().await
     }
 
-    /// v0.4.4: start the background auto-compaction loop, if enabled in
+    /// v0.4.7: start the background auto-compaction loop, if enabled in
     /// config. Returns `None` when `storage.auto_compact_enabled = false`.
     ///
     /// The cadence is `gc_interval_secs * auto_compact_every_gc_ticks`, so
     /// the default shipped config (300 s × 12) fires once an hour. Each
-    /// tick calls `compact_low_utilization` with the configured threshold
-    /// + minimum size. Errors are logged but never break the loop.
+    /// tick calls `compact_with(CompactionOptions::from_config(cfg))` to
+    /// run the dual-strategy scanner. Errors are logged but never break
+    /// the loop.
     pub fn start_auto_compaction(
         self: &Arc<Self>,
     ) -> Option<tokio::task::JoinHandle<()>> {
@@ -483,8 +585,7 @@ impl Engine {
         let period_secs = s
             .gc_interval_secs
             .saturating_mul(s.auto_compact_every_gc_ticks.max(1) as u64);
-        let threshold = s.auto_compact_threshold;
-        let min_size = s.auto_compact_min_size_bytes;
+        let base_opts = CompactionOptions::from_config(&self.config);
         let engine = self.clone();
         Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period_secs));
@@ -495,10 +596,8 @@ impl Engine {
             loop {
                 ticker.tick().await;
                 let e = engine.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    e.compact_low_utilization(threshold, min_size)
-                })
-                .await;
+                let opts = base_opts.clone();
+                let res = tokio::task::spawn_blocking(move || e.compact_with(opts)).await;
                 match res {
                     Ok(Ok(stats)) => {
                         if !stats.is_empty() {
@@ -2163,36 +2262,67 @@ impl Engine {
         })
     }
 
-    /// Scan all sealed blocks and compact those whose utilization is below
-    /// `threshold` (ratio in `[0.0, 1.0]`, where utilization = `live_bytes /
-    /// size`). Returns a per-block list of stats. The active block is
-    /// always skipped.
+    /// v0.4.7: the unified dual-strategy compaction pass.
     ///
-    /// A minimum block size floor (`min_size_bytes`) protects against
-    /// compacting trivial blocks where the re-write cost dominates.
-    pub fn compact_low_utilization(
-        &self,
-        threshold: f64,
-        min_size_bytes: u64,
-    ) -> Result<Vec<CompactionBlockStats>> {
-        use std::collections::HashSet;
+    /// **Strategy A** (low-utilisation): a block is a candidate when
+    /// `live_bytes / size < opts.threshold`. Value function is
+    /// bytes-saved; any group containing at least one A-candidate is
+    /// committed.
+    ///
+    /// **Strategy B** (undersized): a block is a candidate when
+    /// `size < block_file_size × opts.undersize_ratio`. Value function
+    /// is file-count-saved; a group commits when
+    /// `source_count − ceil(live_sum / block_file_size) ≥ opts.min_file_saved`.
+    ///
+    /// Both strategies share one scan → pack → commit pipeline. The
+    /// two commit rules are joined with **OR**: a group commits if
+    /// either rule (or `opts.force`) fires. Blocks younger than
+    /// `opts.min_block_age_secs` are excluded from both candidate
+    /// predicates to prevent thrash on freshly-sealed or freshly-merged
+    /// blocks.
+    ///
+    /// The active (unsealed) block is always skipped regardless of
+    /// options.
+    pub fn compact_with(&self, opts: CompactionOptions) -> Result<Vec<CompactionBlockStats>> {
+        use std::collections::{HashMap, HashSet};
 
-        let threshold = threshold.clamp(0.0, 1.0);
+        let threshold = opts.threshold.clamp(0.0, 1.0);
+        let undersize_ratio = opts.undersize_ratio.clamp(0.0, 1.0);
+        let block_file_size = self.config.storage.block_file_size;
+        let undersize_bytes = ((block_file_size as f64) * undersize_ratio) as u64;
         let pinned = self.pinned_blocks.lock().clone();
         let all_blocks = self.meta.list_all_blocks()?;
+        let now = now_secs();
 
         // v0.4.5: use the canonical unique-hash live-bytes computation so
         // the scanner and `/api/block/list` never disagree, and dedup-heavy
         // datasets don't falsely report >100% utilisation.
         let live_info = self.compute_block_live_info()?;
 
-        // Filter candidates: sealed, non-pinned, above min_size, below util threshold.
+        // v0.4.7: disjunctive candidate predicate (low_util OR undersized)
+        // with an age filter. We collect a parallel `reasons` map keyed
+        // by block_id so the group commit logic can tell Strategy A
+        // participants from Strategy B participants.
         let mut candidates: Vec<CompactSource> = Vec::new();
+        let mut reasons: HashMap<String, CandidateReason> = HashMap::new();
         for b in all_blocks {
             if pinned.contains(&b.block_id) {
                 continue;
             }
-            if b.size < min_size_bytes {
+            // Anti-thrash: exclude blocks younger than the cooldown.
+            // `create_time` is seconds-since-epoch; use saturating_sub
+            // so a clock skew where `create_time > now` doesn't
+            // accidentally short-circuit the candidate.
+            let age_secs = now.saturating_sub(b.create_time);
+            if opts.min_block_age_secs > 0 && age_secs < opts.min_block_age_secs {
+                tracing::debug!(
+                    block_id = %b.block_id,
+                    age_secs,
+                    min_age = opts.min_block_age_secs,
+                    "compact: candidate scan skipped (too young)"
+                );
+                metrics::counter!("jihuan_compactions_skipped_total", "reason" => "block_too_young")
+                    .increment(1);
                 continue;
             }
             let (live, hashes) = match live_info.get(&b.block_id) {
@@ -2204,20 +2334,28 @@ impl Engine {
             } else {
                 live as f64 / b.size as f64
             };
-            // Per-candidate scan decision. Emits the four numbers an
-            // operator needs to reproduce the scanner's verdict by hand,
-            // plus whether the block was kept or dropped. Enable with
-            // `RUST_LOG=jihuan_core::engine=debug`.
+            let is_low_util = util < threshold;
+            let is_undersized = undersize_ratio > 0.0 && b.size < undersize_bytes;
+            let reason = match (is_low_util, is_undersized) {
+                (true, true) => Some(CandidateReason::Both),
+                (true, false) => Some(CandidateReason::LowUtil),
+                (false, true) => Some(CandidateReason::Undersized),
+                (false, false) => None,
+            };
+            // Per-candidate scan trace. `reason` is present when the
+            // block is kept; absent when rejected by both predicates.
             tracing::debug!(
                 block_id = %b.block_id,
                 size = b.size,
                 live_bytes = live,
                 utilization = %format_args!("{:.3}", util),
                 threshold = %format_args!("{:.3}", threshold),
-                kept = util < threshold,
-                "compact_low_utilization: candidate scan"
+                undersize_bytes,
+                reason = reason.map(|r| r.as_label()).unwrap_or("none"),
+                "compact: candidate scan"
             );
-            if util < threshold {
+            if let Some(r) = reason {
+                reasons.insert(b.block_id.clone(), r);
                 candidates.push((b, live, hashes));
             }
         }
@@ -2225,25 +2363,19 @@ impl Engine {
         if candidates.is_empty() {
             tracing::debug!(
                 threshold = %format_args!("{:.3}", threshold),
-                min_size_bytes,
-                "compact_low_utilization: no candidates below threshold; nothing to do"
+                undersize_ratio = %format_args!("{:.3}", undersize_ratio),
+                "compact: no candidates; nothing to do"
             );
             return Ok(vec![]);
         }
 
-        // v0.4.5 cross-block merge: greedy bin-pack candidates into groups
-        // whose combined live bytes fit within one block_file_size. Each
-        // group gets collapsed into a single new block via a single redb
-        // commit. This prevents the "many partially-full blocks" drift that
-        // single-block rewrite would otherwise accumulate over time.
-        //
-        // Packing heuristic: sort ascending by live_bytes. Small blocks
-        // flock together first; any candidate whose live set alone exceeds
-        // block_file_size becomes its own group (still gets its dead chunks
-        // dropped, just without merging neighbours).
+        // Greedy bin-pack candidates into groups whose combined live
+        // bytes fit within one block_file_size. Block-granular: a
+        // candidate either goes fully into the current group or starts
+        // the next one. This preserves the single-tx atomic swap
+        // invariant in `compact_merge_group`.
         candidates.sort_by_key(|(_, live, _)| *live);
 
-        let block_file_size = self.config.storage.block_file_size;
         let mut groups: Vec<Vec<CompactSource>> = Vec::new();
         let mut current: Vec<CompactSource> = Vec::new();
         let mut current_size: u64 = 0;
@@ -2263,67 +2395,94 @@ impl Engine {
         tracing::info!(
             candidate_count = groups.iter().map(|g| g.len()).sum::<usize>(),
             group_count = groups.len(),
-            "compact_low_utilization: packed candidates into groups"
+            "compact: packed candidates into groups"
         );
 
-        // v0.4.5 pre-filter 1: drop groups whose projected savings fall
-        // below `auto_compact_min_benefit_bytes`. Saves the I/O of
-        // re-encoding a group where dead bytes are noise. Computed
-        // per-group so a trivial single-block group can be skipped while
-        // a rich multi-block merge in the same pass still runs.
-        let min_benefit = self.config.storage.auto_compact_min_benefit_bytes;
-        if min_benefit > 0 {
-            let before = groups.len();
-            groups.retain(|g| {
-                let old_sum: u64 = g.iter().map(|(b, _, _)| b.size).sum();
-                let live_sum: u64 = g.iter().map(|(_, live, _)| *live).sum();
-                let benefit = old_sum.saturating_sub(live_sum);
-                if benefit < min_benefit {
-                    tracing::debug!(
-                        group_size = g.len(),
-                        benefit,
-                        min_benefit,
-                        "compact_low_utilization: group skipped (benefit < min_benefit)"
-                    );
-                    false
-                } else {
-                    // Verbose audit trail for kept groups too — pairs with
-                    // the skip debug above so `RUST_LOG=…engine=debug` gives
-                    // you a per-group keep/skip ledger with the exact
-                    // numbers the scanner used.
-                    tracing::debug!(
-                        group_size = g.len(),
-                        old_sum,
-                        live_sum,
-                        benefit,
-                        min_benefit,
-                        "compact_low_utilization: group kept (benefit >= min_benefit)"
-                    );
-                    true
-                }
-            });
-            if before != groups.len() {
-                tracing::info!(
-                    skipped = before - groups.len(),
-                    remaining = groups.len(),
-                    min_benefit,
-                    "compact_low_utilization: filtered groups by min_benefit"
-                );
+        // v0.4.7 dual-gate commit rule. For each group compute:
+        //   has_a_candidate   — did Strategy A flag any member?
+        //   file_count_saved  — Strategy B value function
+        // Group commits when (A) OR (B) OR (force). Skipped groups
+        // emit a metric labelled with the binding reason.
+        let mut committed_groups: Vec<Vec<CompactSource>> = Vec::new();
+        let mut committed_reasons: Vec<(&'static str, &'static str)> = Vec::new();
+        for group in groups {
+            let has_a = group
+                .iter()
+                .any(|(b, _, _)| reasons.get(&b.block_id).is_some_and(|r| r.has_low_util()));
+            let live_sum: u64 = group.iter().map(|(_, live, _)| *live).sum();
+            // ceil(live_sum / block_file_size). Safe because
+            // block_file_size > 0 by validator guarantee.
+            let output_block_estimate = live_sum.div_ceil(block_file_size.max(1));
+            let file_count_saved = (group.len() as u64).saturating_sub(output_block_estimate);
+
+            let passes_b = opts.min_file_saved > 0 && file_count_saved >= opts.min_file_saved;
+            let commit = opts.force || has_a || passes_b;
+
+            let strategy_label = if has_a && group.iter().any(|(b, _, _)| {
+                matches!(
+                    reasons.get(&b.block_id),
+                    Some(CandidateReason::Undersized) | Some(CandidateReason::Both)
+                )
+            }) {
+                "mixed"
+            } else if has_a {
+                "low_util"
+            } else {
+                "undersized"
+            };
+            let commit_reason = if opts.force {
+                "forced"
+            } else if has_a {
+                "a_candidate"
+            } else if passes_b {
+                "file_benefit"
+            } else {
+                "none"
+            };
+
+            tracing::debug!(
+                group_size = group.len(),
+                live_sum,
+                file_count_saved,
+                min_file_saved = opts.min_file_saved,
+                has_a_candidate = has_a,
+                strategy = strategy_label,
+                commit,
+                commit_reason,
+                "compact: group commit decision"
+            );
+
+            if commit {
+                committed_groups.push(group);
+                committed_reasons.push((strategy_label, commit_reason));
+            } else {
+                metrics::counter!("jihuan_compactions_skipped_total", "reason" => "below_file_benefit")
+                    .increment(1);
             }
         }
 
-        // v0.4.5 pre-filter 2: verify the filesystem has enough free space
-        // to hold each group's new block in addition to the still-present
-        // source blocks (they're only unlinked after the redb commit). We
+        if committed_groups.is_empty() {
+            tracing::debug!("compact: no group passed the commit gates");
+            return Ok(vec![]);
+        }
+
+        // Verify the filesystem has enough free space to hold each
+        // group's new block in addition to the still-present source
+        // blocks (they're only unlinked after the redb commit). We
         // check once per group, greedily accounting for groups we've
-        // already accepted in this pass.
-        let headroom = self.config.storage.auto_compact_disk_headroom_bytes;
-        let groups = if headroom > 0 {
+        // already accepted in this pass. Always respected — even
+        // `force=true` goes through this check.
+        let headroom = opts.disk_headroom_bytes;
+        let (committed_groups, committed_reasons) = if headroom > 0 {
             let data_dir = self.config.storage.data_dir.clone();
             match fs2::available_space(&data_dir) {
                 Ok(mut avail) => {
-                    let mut kept: Vec<_> = Vec::with_capacity(groups.len());
-                    for g in groups {
+                    let mut kept_groups: Vec<Vec<CompactSource>> =
+                        Vec::with_capacity(committed_groups.len());
+                    let mut kept_reasons: Vec<(&'static str, &'static str)> =
+                        Vec::with_capacity(committed_reasons.len());
+                    for (g, r) in committed_groups.into_iter().zip(committed_reasons.into_iter())
+                    {
                         let live_sum: u64 = g.iter().map(|(_, live, _)| *live).sum();
                         let required = live_sum.saturating_add(headroom);
                         if avail < required {
@@ -2332,39 +2491,63 @@ impl Engine {
                                 live_sum,
                                 required,
                                 available = avail,
-                                "compact_low_utilization: group skipped (insufficient disk headroom)"
+                                "compact: group skipped (insufficient disk headroom)"
                             );
+                            metrics::counter!(
+                                "jihuan_compactions_skipped_total",
+                                "reason" => "disk_headroom"
+                            )
+                            .increment(1);
                             continue;
                         }
-                        // Reserve the live bytes; old blocks are unlinked after
-                        // commit so they'll be freed back shortly, but during
-                        // this pass we must assume the peak.
                         avail = avail.saturating_sub(live_sum);
-                        kept.push(g);
+                        kept_groups.push(g);
+                        kept_reasons.push(r);
                     }
-                    kept
+                    (kept_groups, kept_reasons)
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         data_dir = %data_dir.display(),
-                        "compact_low_utilization: could not query filesystem free space; skipping disk-headroom check"
+                        "compact: could not query filesystem free space; skipping disk-headroom check"
                     );
-                    groups
+                    (committed_groups, committed_reasons)
                 }
             }
         } else {
-            groups
+            (committed_groups, committed_reasons)
         };
 
         let mut results = Vec::new();
-        for group in groups {
+        for (group, (strategy, commit_reason)) in
+            committed_groups.into_iter().zip(committed_reasons.into_iter())
+        {
+            tracing::info!(
+                group_size = group.len(),
+                strategy,
+                commit_reason,
+                "compact: committing group"
+            );
+            metrics::counter!("jihuan_compactions_total", "strategy" => strategy).increment(1);
             match self.compact_merge_group(&group) {
-                Ok(mut stats) => results.append(&mut stats),
+                Ok(mut stats) => {
+                    let bytes_saved: i64 = stats.iter().map(|s| s.bytes_saved).sum();
+                    if bytes_saved > 0 {
+                        metrics::counter!("jihuan_compactions_bytes_saved_total")
+                            .increment(bytes_saved as u64);
+                    }
+                    let live_sum: u64 = group.iter().map(|(_, live, _)| *live).sum();
+                    let files_reduced = (group.len() as u64)
+                        .saturating_sub(live_sum.div_ceil(block_file_size.max(1)));
+                    metrics::counter!("jihuan_compactions_files_reduced_total")
+                        .increment(files_reduced);
+                    results.append(&mut stats);
+                }
                 Err(e) => tracing::warn!(
                     group_size = group.len(),
                     error = %e,
-                    "compact_low_utilization: group skipped due to error"
+                    "compact: group skipped due to error"
                 ),
             }
         }
@@ -2496,6 +2679,8 @@ impl Engine {
 
             let mut live_count: u64 = 0;
             let mut contributed: u64 = 0;
+            let target_algo = self.config.storage.compression_algorithm;
+            let target_level = self.config.storage.compression_level;
             for hash in live_hashes {
                 // hash is &Arc<str>; HashMap<String, _>::get wants &str via
                 // String: Borrow<str>. as_ref() yields the &str we need.
@@ -2506,14 +2691,35 @@ impl Engine {
                         hash_str, old_meta.block_id
                     ))
                 })?;
-                let data = old_reader.read_chunk(src_entry, verify)?;
-                let compressed = crate::compression::compress(
-                    &data,
-                    self.config.storage.compression_algorithm,
-                    self.config.storage.compression_level,
-                )?;
-                let new_entry =
-                    writer.append_precompressed_chunk(&compressed, data.len() as u32, hash_str)?;
+                // v0.4.7: read the source's compressed bytes + recorded
+                // algorithm. When they match the engine's configured
+                // target, write verbatim (no decompress → no recompress).
+                // Cross-algorithm sources pay the full round-trip.
+                let (src_compressed, src_algo) = old_reader.read_chunk_raw(src_entry, verify)?;
+                let original_size = src_entry.original_size;
+                let new_entry = if src_algo == target_algo {
+                    metrics::counter!("jihuan_compactions_passthrough_chunks_total").increment(1);
+                    writer.append_precompressed_chunk(
+                        &src_compressed,
+                        original_size,
+                        hash_str,
+                    )?
+                } else {
+                    metrics::counter!("jihuan_compactions_recompressed_chunks_total")
+                        .increment(1);
+                    let data = crate::compression::decompress(
+                        &src_compressed,
+                        src_algo,
+                        original_size as usize,
+                    )?;
+                    let compressed =
+                        crate::compression::compress(&data, target_algo, target_level)?;
+                    writer.append_precompressed_chunk(
+                        &compressed,
+                        data.len() as u32,
+                        hash_str,
+                    )?
+                };
                 chunk_remap.insert(
                     // rewrite_block_references_group's tx layer expects
                     // owned String keys, so pay one allocation here. The
@@ -2641,6 +2847,21 @@ mod tests {
     use crate::config::ConfigTemplate;
     use tempfile::tempdir;
 
+    /// v0.4.7 test helper: `CompactionOptions` that exercises only
+    /// Strategy A (low utilisation). All Strategy B gates are
+    /// disabled so legacy regression tests continue to assert the
+    /// expected low-util-only behaviour.
+    fn low_util_only(threshold: f64) -> CompactionOptions {
+        CompactionOptions {
+            threshold,
+            undersize_ratio: 0.0,
+            min_file_saved: 0,
+            min_block_age_secs: 0,
+            disk_headroom_bytes: 0,
+            force: false,
+        }
+    }
+
     fn open_engine(tmp: &tempfile::TempDir) -> Engine {
         let cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         Engine::open(cfg).unwrap()
@@ -2687,9 +2908,10 @@ mod tests {
         cfg.storage.gc_interval_secs = 1;
         cfg.storage.auto_compact_enabled = true;
         cfg.storage.auto_compact_threshold = 0.75;
-        cfg.storage.auto_compact_min_size_bytes = 0;
         cfg.storage.auto_compact_every_gc_ticks = 1;
-        cfg.storage.auto_compact_min_benefit_bytes = 0;
+        cfg.storage.auto_compact_undersize_ratio = 0.0;
+        cfg.storage.auto_compact_min_file_saved = 0;
+        cfg.storage.auto_compact_min_block_age_secs = 0;
         cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Arc::new(Engine::open(cfg).unwrap());
 
@@ -2837,10 +3059,8 @@ mod tests {
         let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         cfg.storage.chunk_size = 64 * 1024;
         cfg.storage.block_file_size = 16 * 1024 * 1024;
-        // v0.4.5: tests use sub-MB payloads; disable the production
-        // min-benefit/headroom filters so we actually exercise the
-        // scanner path.
-        cfg.storage.auto_compact_min_benefit_bytes = 0;
+        // v0.4.7: tests use sub-MB payloads; disable headroom so we
+        // actually exercise the scanner path.
         cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Engine::open(cfg).unwrap();
 
@@ -2870,7 +3090,7 @@ mod tests {
         engine.delete_file(&id4).unwrap();
 
         // Threshold: compact anything under 75% utilization.
-        let results = engine.compact_low_utilization(0.75, 0).unwrap();
+        let results = engine.compact_with(low_util_only(0.75)).unwrap();
 
         // Exactly the low-util block was compacted.
         assert_eq!(results.len(), 1, "only block_lo should be compacted");
@@ -2895,7 +3115,6 @@ mod tests {
         // candidates end up above threshold).
         cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
         cfg.storage.compression_level = 0;
-        cfg.storage.auto_compact_min_benefit_bytes = 0;
         cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Engine::open(cfg).unwrap();
 
@@ -2933,7 +3152,7 @@ mod tests {
         );
 
         // Compact with threshold=0.75 so each ~50% block qualifies.
-        let stats = engine.compact_low_utilization(0.75, 0).unwrap();
+        let stats = engine.compact_with(low_util_only(0.75)).unwrap();
 
         // All three sources report the SAME new_block_id → proves merge.
         let new_ids: std::collections::HashSet<_> = stats
@@ -3072,51 +3291,242 @@ mod tests {
         );
     }
 
+    // ── v0.4.7: dual-strategy compaction regressions ─────────────────────
+
+    /// Strategy B candidate gate: sealed blocks whose size is below
+    /// `block_file_size * undersize_ratio` must be picked up by the
+    /// scanner even when their utilisation is ≥ threshold. This is
+    /// the anti-small-block-drift axis that Strategy A alone cannot
+    /// address.
     #[test]
-    fn test_compact_low_utilization_respects_min_benefit() {
-        // min_benefit_bytes configured higher than the group's projected
-        // savings → scanner reports "no work" and no new block is written.
+    fn test_compact_undersized_strategy_b_picks_up_high_util_small_blocks() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        // Large block_file_size so our ~150 KB sealed blocks are *way*
+        // below the undersize threshold regardless of content.
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
+        cfg.storage.compression_level = 0;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Build four *fully utilised* sealed blocks (no deletions) —
+        // Strategy A would skip all of these.
+        let mut block_ids = Vec::new();
+        for i in 0..4u8 {
+            let payload: Vec<u8> =
+                (0..150_000u32).map(|j| ((j + i as u32 * 31) % 251) as u8).collect();
+            let id = engine.put_bytes(&payload, &format!("k{}.bin", i), None).unwrap();
+            engine.seal_active_block().unwrap();
+            let bid = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
+                .block_id
+                .clone();
+            block_ids.push(bid);
+        }
+
+        // Strategy A only (undersize disabled) → no candidates.
+        let none = engine.compact_with(low_util_only(0.9)).unwrap();
+        assert!(
+            none.is_empty(),
+            "pure-A with full blocks should find nothing, got {:?}",
+            none
+        );
+
+        // Strategy B: ratio 0.5 → any block under 2 MiB qualifies.
+        // min_file_saved=2 → a 4→1 merge saves 3, passes.
+        let opts = CompactionOptions {
+            threshold: 0.0,          // disable A
+            undersize_ratio: 0.5,
+            min_file_saved: 2,
+            min_block_age_secs: 0,
+            disk_headroom_bytes: 0,
+            force: false,
+        };
+        let stats = engine.compact_with(opts).unwrap();
+        assert_eq!(
+            stats.len(),
+            4,
+            "all four undersized blocks should be merged, got {:?}",
+            stats
+        );
+        let new_ids: std::collections::HashSet<_> =
+            stats.iter().filter_map(|s| s.new_block_id.as_ref()).collect();
+        assert_eq!(
+            new_ids.len(),
+            1,
+            "undersized merge should collapse into a single new block"
+        );
+    }
+
+    /// Strategy B commit gate: when `min_file_saved > file_count_saved`
+    /// the group must be skipped. Single-block merges produce
+    /// `file_count_saved = 0` and therefore never pass gate B.
+    #[test]
+    fn test_compact_undersized_respects_min_file_saved() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
+        cfg.storage.compression_level = 0;
+        let engine = Engine::open(cfg).unwrap();
+
+        // One undersized high-util block.
+        let payload: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
+        let _id = engine.put_bytes(&payload, "solo.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        // Strategy B only, require 3 files saved → group of size 1
+        // yields file_count_saved=0 → no commit.
+        let opts = CompactionOptions {
+            threshold: 0.0,
+            undersize_ratio: 0.5,
+            min_file_saved: 3,
+            min_block_age_secs: 0,
+            disk_headroom_bytes: 0,
+            force: false,
+        };
+        let stats = engine.compact_with(opts).unwrap();
+        assert!(
+            stats.is_empty(),
+            "single-block undersized group should fail gate B, got {:?}",
+            stats
+        );
+    }
+
+    /// `force = true` bypasses both commit gates, allowing single-block
+    /// merges to rewrite. The disk-headroom safety check is NOT
+    /// bypassed — we don't test that here (would require filesystem
+    /// manipulation), but the code path is a simple > comparison.
+    #[test]
+    fn test_compact_force_bypasses_commit_gates() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
+        cfg.storage.compression_level = 0;
+        let engine = Engine::open(cfg).unwrap();
+
+        let payload: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
+        let id = engine.put_bytes(&payload, "solo.bin", None).unwrap();
+        engine.seal_active_block().unwrap();
+        let old_bid = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+
+        // Same gate-B-failing config as above, but with force=true.
+        let opts = CompactionOptions {
+            threshold: 0.0,
+            undersize_ratio: 0.5,
+            min_file_saved: 3,
+            min_block_age_secs: 0,
+            disk_headroom_bytes: 0,
+            force: true,
+        };
+        let stats = engine.compact_with(opts).unwrap();
+        assert_eq!(
+            stats.len(),
+            1,
+            "force=true must commit the single-block group"
+        );
+        assert_eq!(stats[0].old_block_id, old_bid);
+        // File still reads back byte-identical.
+        assert_eq!(engine.get_bytes(&id).unwrap(), payload);
+    }
+
+    /// Anti-thrash filter: blocks whose age is below
+    /// `min_block_age_secs` must be excluded from both candidate
+    /// predicates. The block we just sealed has age ≈ 0, so a high
+    /// cooldown should make the pass a no-op even when the block
+    /// would otherwise be a Strategy A candidate.
+    #[test]
+    fn test_compact_age_filter_excludes_fresh_blocks() {
         let tmp = tempdir().unwrap();
         let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
         cfg.storage.chunk_size = 64 * 1024;
         cfg.storage.block_file_size = 16 * 1024 * 1024;
-        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
-        cfg.storage.compression_level = 0;
-        // Only ~150 KB would be freed — set the floor well above that.
-        cfg.storage.auto_compact_min_benefit_bytes = 8 * 1024 * 1024;
-        cfg.storage.auto_compact_disk_headroom_bytes = 0;
         let engine = Engine::open(cfg).unwrap();
 
-        let keep_payload = vec![1u8; 150_000];
-        let drop_payload = vec![2u8; 150_000];
-        let id_keep = engine.put_bytes(&keep_payload, "keep.bin", None).unwrap();
-        let id_drop = engine.put_bytes(&drop_payload, "drop.bin", None).unwrap();
+        // Build a low-util block: upload two files, delete one.
+        let p1: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
+        let p2: Vec<u8> = (0..150_000u32).map(|j| ((j * 7) % 251) as u8).collect();
+        let _keep = engine.put_bytes(&p1, "k.bin", None).unwrap();
+        let drop_id = engine.put_bytes(&p2, "d.bin", None).unwrap();
         engine.seal_active_block().unwrap();
-        let block_id = engine.meta.get_file(&id_keep).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
-        engine.delete_file(&id_drop).unwrap();
+        engine.delete_file(&drop_id).unwrap();
 
-        let results = engine.compact_low_utilization(0.9, 0).unwrap();
+        // High cooldown — the just-sealed block is younger than 1h.
+        let opts = CompactionOptions {
+            threshold: 0.9,
+            undersize_ratio: 0.0,
+            min_file_saved: 0,
+            min_block_age_secs: 3600,
+            disk_headroom_bytes: 0,
+            force: false,
+        };
+        let stats = engine.compact_with(opts.clone()).unwrap();
         assert!(
-            results.is_empty(),
-            "min_benefit filter should have dropped the group, got {:?}",
-            results
+            stats.is_empty(),
+            "age filter should have excluded the fresh block, got {:?}",
+            stats
         );
-        // Block is untouched.
-        assert!(engine.meta.get_block(&block_id).unwrap().is_some());
 
-        // Flip the filter off → the same call now compacts.
-        let mut cfg2 = engine.config().clone();
-        cfg2.storage.auto_compact_min_benefit_bytes = 0;
-        // Can't mutate engine.config in place; open a fresh engine on same dirs.
-        drop(engine);
-        let engine = Engine::open(cfg2).unwrap();
-        let results = engine.compact_low_utilization(0.9, 0).unwrap();
+        // Same options with cooldown disabled → the low-util block now
+        // compacts, proving the previous skip was driven by the age
+        // filter and not by some other predicate.
+        let opts_no_age = CompactionOptions {
+            min_block_age_secs: 0,
+            ..opts
+        };
+        let stats = engine.compact_with(opts_no_age).unwrap();
         assert_eq!(
-            results.len(),
+            stats.len(),
             1,
-            "without min_benefit, the block should compact"
+            "without age filter the low-util block must compact, got {:?}",
+            stats
+        );
+    }
+
+    /// Deprecated-key detection: parsing a TOML file that still
+    /// contains either of the two v0.4.6 keys must fail with a
+    /// migration-hint error. Belongs-and-fails is better than
+    /// silently-ignored-and-wrong-behavior.
+    #[test]
+    fn test_config_rejects_deprecated_v047_keys() {
+        use crate::config::AppConfig;
+        let base = r#"
+[storage]
+data_dir = "/tmp/x/data"
+meta_dir = "/tmp/x/meta"
+wal_dir  = "/tmp/x/wal"
+block_file_size = 1073741824
+chunk_size = 4194304
+hash_algorithm = "sha256"
+compression_algorithm = "zstd"
+compression_level = 1
+gc_threshold = 0.7
+"#;
+        let with_min_size = format!(
+            "{}auto_compact_min_size_bytes = 65536\n\n[server]\nhttp_addr=\"0.0.0.0:8080\"\ngrpc_addr=\"0.0.0.0:8081\"\nmetrics_addr=\"0.0.0.0:9090\"\n",
+            base
+        );
+        let err = AppConfig::from_toml_str(&with_min_size).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_compact_min_size_bytes"),
+            "expected a migration-hint error for auto_compact_min_size_bytes, got: {}",
+            err
+        );
+
+        let with_min_benefit = format!(
+            "{}auto_compact_min_benefit_bytes = 8388608\n\n[server]\nhttp_addr=\"0.0.0.0:8080\"\ngrpc_addr=\"0.0.0.0:8081\"\nmetrics_addr=\"0.0.0.0:9090\"\n",
+            base
+        );
+        let err = AppConfig::from_toml_str(&with_min_benefit).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_compact_min_benefit_bytes"),
+            "expected a migration-hint error for auto_compact_min_benefit_bytes, got: {}",
+            err
         );
     }
 

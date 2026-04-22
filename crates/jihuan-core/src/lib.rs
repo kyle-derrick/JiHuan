@@ -17,6 +17,7 @@ pub mod utils;
 pub mod wal;
 
 pub use engine::{
-    CompactionBlockStats, ConflictPolicy, Engine, PutOptions, PutOutcome, SealedBlockInfo,
+    CompactionBlockStats, CompactionOptions, ConflictPolicy, Engine, PutOptions, PutOutcome,
+    SealedBlockInfo,
 };
 pub use error::{JiHuanError, Result};

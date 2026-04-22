@@ -137,6 +137,27 @@ impl BlockReader {
 
     /// Read and decompress the chunk at the given entry.
     pub fn read_chunk(&mut self, entry: &ChunkEntry, verify: bool) -> Result<Vec<u8>> {
+        let (compressed, algo) = self.read_chunk_raw(entry, verify)?;
+        decompress(&compressed, algo, entry.original_size as usize)
+    }
+
+    /// v0.4.7: read the **compressed** chunk bytes verbatim along with
+    /// the algorithm byte recorded at write time. Used by the compaction
+    /// merge path to skip decompress + recompress when the source block
+    /// already uses the engine's configured algorithm (same-algo
+    /// passthrough).
+    ///
+    /// The integrity envelope is identical to `read_chunk`: per-chunk
+    /// CRC32 is verified when `verify == true`. Content-hash
+    /// verification would require a decompression pass and is
+    /// deliberately omitted here (matches existing semantics of the
+    /// normal read path — we trust the chunk hash recorded in
+    /// `FileMeta.chunks[i].hash`).
+    pub fn read_chunk_raw(
+        &mut self,
+        entry: &ChunkEntry,
+        verify: bool,
+    ) -> Result<(Vec<u8>, CompressionAlgorithm)> {
         self.file
             .seek(SeekFrom::Start(entry.data_offset))
             .map_err(JiHuanError::Io)?;
@@ -166,7 +187,7 @@ impl BlockReader {
             }
         };
 
-        decompress(&compressed, algo, entry.original_size as usize)
+        Ok((compressed, algo))
     }
 
     /// Read a chunk by its position index (0-based)

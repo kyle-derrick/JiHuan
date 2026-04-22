@@ -16,17 +16,19 @@ gc_threshold       = 0.7
 gc_interval_secs   = 300
 max_open_block_files = 64
 verify_on_read     = true
-# v0.4.4+: small-file workloads fragment quickly under deletions.
-# Compact aggressively to reclaim freed slots; v0.4.5 cross-block merge
-# also collapses the "many half-empty blocks" pattern that small-file +
-# churn produces.
-auto_compact_enabled             = true
-auto_compact_threshold           = 0.6        # compact anything <60% full
-auto_compact_min_size_bytes      = 1048576    # 1 MiB — small-file profile
-auto_compact_every_gc_ticks      = 12         # 12 × 300 s = once per hour
-auto_compact_min_benefit_bytes   = 4194304    # 4 MiB — smaller payoff is
-                                              # acceptable for dense fanout
-auto_compact_disk_headroom_bytes = 536870912  # 512 MiB
+# v0.4.7: small-file workloads fragment quickly under deletions and
+# produce many small sealed blocks. Tune both strategies aggressive:
+#   Strategy A threshold high (0.6) → reclaim as soon as a block is
+#     40% dead.
+#   Strategy B ratio high (0.5) + min_file_saved low (2) → aggressively
+#     merge undersized blocks to keep file-handle-cache pressure down.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.6      # Strategy A — rewrite <60% utilised
+auto_compact_undersize_ratio       = 0.5      # Strategy B — merge <50% of block_file_size
+auto_compact_min_file_saved        = 2        # commit on 3→1 collapse
+auto_compact_min_block_age_secs    = 3600     # anti-thrash
+auto_compact_every_gc_ticks        = 12       # once per hour
+auto_compact_disk_headroom_bytes   = 536870912  # 512 MiB
 
 [server]
 http_addr    = "0.0.0.0:8080"

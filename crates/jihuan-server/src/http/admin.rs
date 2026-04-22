@@ -176,27 +176,50 @@ pub async fn trigger_gc(
     }))
 }
 
-/// POST `/api/admin/compact` — v0.4.3 block compaction.
+/// POST `/api/admin/compact` — dual-strategy block compaction (v0.4.7).
 ///
-/// Body is a JSON object with the following optional fields:
+/// Body is a JSON object with the following optional fields. All values
+/// default to the engine's configured values; supply a field to override
+/// it for this one call.
 ///
-/// * `block_id` — compact exactly this one block. Takes priority over the
-///   threshold-based scan when present.
-/// * `threshold` — `[0.0, 1.0]`, default `0.5`. Blocks whose
-///   `live_bytes / size` is below this ratio are compacted. Ignored when
-///   `block_id` is set.
-/// * `min_size_bytes` — blocks smaller than this are skipped even when
-///   below the threshold, to avoid spending I/O on tiny blocks.
-///   Default `4 MiB`.
+/// * `block_id` — compact exactly this one block. Takes priority over
+///   the dual-strategy scan when present; `threshold`,
+///   `undersize_ratio`, `min_file_saved`, and `force` are ignored.
+/// * `threshold` — Strategy A candidate gate (`[0.0, 1.0]`). Blocks
+///   whose `live_bytes / size` is below this ratio are low-util
+///   candidates.
+/// * `undersize_ratio` — Strategy B candidate gate (`[0.0, 1.0]`).
+///   Blocks whose absolute size is below
+///   `block_file_size × undersize_ratio` are undersized candidates
+///   regardless of utilisation.
+/// * `min_file_saved` — Strategy B commit gate. A packed group
+///   commits when `source_count − ceil(live_sum / block_file_size)
+///   ≥ min_file_saved`. Zero disables gate B.
+/// * `force` — when `true`, bypass both Strategy A and Strategy B
+///   commit rules and commit every packed candidate group. Does NOT
+///   bypass `auto_compact_disk_headroom_bytes` (safety check) or
+///   `auto_compact_min_block_age_secs` (age filter). Use during
+///   maintenance windows to clean up orphan small blocks.
 ///
-/// Returns an array of per-block stats. The active (unsealed) block is
-/// never compacted regardless of parameters.
+/// v0.4.7 removes the legacy `min_size_bytes` and `min_benefit_bytes`
+/// fields; requests containing them are ignored (no error, so old
+/// scripts still run).
+///
+/// Returns an array of per-block stats. The active (unsealed) block
+/// is never compacted regardless of parameters.
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct CompactRequest {
     pub block_id: Option<String>,
     pub threshold: Option<f64>,
+    pub undersize_ratio: Option<f64>,
+    pub min_file_saved: Option<u64>,
+    pub force: Option<bool>,
+    /// Deprecated in v0.4.7 — accepted-and-ignored so existing admin
+    /// scripts keep working for one release.
     pub min_size_bytes: Option<u64>,
+    /// Deprecated in v0.4.7 — accepted-and-ignored.
+    pub min_benefit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,16 +234,19 @@ pub async fn compact(
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
     require_scope(&caller, "admin")?;
-    let threshold = req.threshold.unwrap_or(0.5);
-    let min_size_bytes = req.min_size_bytes.unwrap_or(4 * 1024 * 1024);
 
-    // v0.4.5: mirror the behaviour of /api/gc/trigger — when the
-    // operator is explicitly asking to reclaim space, seal an
-    // active block that's already fully dereferenced so the normal
-    // compaction loop picks it up. (compact_block / compact_low_utilization
-    // both refuse pinned/active blocks by design.) Only runs for the
-    // low-utilisation scan path; targeted `block_id` requests are left
-    // alone since the caller explicitly named which block to compact.
+    if req.min_size_bytes.is_some() || req.min_benefit_bytes.is_some() {
+        tracing::warn!(
+            "/api/admin/compact: ignoring deprecated fields \
+             min_size_bytes / min_benefit_bytes (removed in v0.4.7)"
+        );
+    }
+
+    // Mirror the behaviour of /api/gc/trigger — when the operator is
+    // explicitly asking to reclaim space, seal an active block that's
+    // already fully dereferenced so the normal compaction loop picks
+    // it up. Only runs for the dual-strategy scan path; targeted
+    // `block_id` requests are left alone.
     if req.block_id.is_none() {
         let engine_for_seal = engine.clone();
         let sealed = tokio::task::spawn_blocking(move || engine_for_seal.seal_if_dead())
@@ -236,11 +262,27 @@ pub async fn compact(
         }
     }
 
+    // Build compaction options: config defaults, patched by whatever
+    // fields the caller supplied.
+    let mut opts = jihuan_core::CompactionOptions::from_config(engine.config());
+    if let Some(t) = req.threshold {
+        opts.threshold = t;
+    }
+    if let Some(r) = req.undersize_ratio {
+        opts.undersize_ratio = r;
+    }
+    if let Some(n) = req.min_file_saved {
+        opts.min_file_saved = n;
+    }
+    if let Some(f) = req.force {
+        opts.force = f;
+    }
+
     let compacted = tokio::task::spawn_blocking(move || -> Result<Vec<_>, _> {
         if let Some(id) = req.block_id {
             engine.compact_block(&id).map(|s| vec![s])
         } else {
-            engine.compact_low_utilization(threshold, min_size_bytes)
+            engine.compact_with(opts)
         }
     })
     .await
