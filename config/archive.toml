@@ -18,14 +18,16 @@ gc_interval_secs   = 3600        # hourly is plenty for WORM data
 max_open_block_files = 16
 verify_on_read     = true        # trust but verify for cold storage
 
-# v0.4.5: deletions are rare → fragmentation is rare. When it does happen
-# we want the savings to be substantial before re-encoding gigabytes.
-auto_compact_enabled             = true
-auto_compact_threshold           = 0.4        # only very wasteful blocks
-auto_compact_min_size_bytes      = 67108864   # 64 MiB
-auto_compact_every_gc_ticks      = 24         # 24 × 3600 s = once per day
-auto_compact_min_benefit_bytes   = 536870912  # 512 MiB floor
-auto_compact_disk_headroom_bytes = 4294967296 # 4 GiB — match block size
+# v0.4.7: deletions are rare → fragmentation is rare. Be conservative:
+# Strategy A only triggers on very wasteful blocks, Strategy B requires
+# a big convergence win before we touch gigabyte-sized archival blocks.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.4         # Strategy A — >60% dead before rewrite
+auto_compact_undersize_ratio       = 0.05        # Strategy B — only truly orphan blocks (<5% of 4 GiB ≈ 200 MiB)
+auto_compact_min_file_saved        = 8           # commit only on big file-count wins (9→1 collapse)
+auto_compact_min_block_age_secs    = 86400       # 1 day anti-thrash (matches cadence below)
+auto_compact_every_gc_ticks        = 24          # 24 × 3600 s = once per day
+auto_compact_disk_headroom_bytes   = 4294967296  # 4 GiB — match block size
 
 [server]
 http_addr    = "0.0.0.0:8080"

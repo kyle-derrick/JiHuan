@@ -18,16 +18,18 @@ gc_interval_secs   = 300
 max_open_block_files = 128       # dedup reads hit many historical blocks
 verify_on_read     = true
 
-# v0.4.5: dedup-heavy datasets churn blocks unevenly — some stay near-
+# v0.4.7: dedup-heavy datasets churn blocks unevenly — some stay near-
 # full forever, others empty out fast as their unique bytes are deleted.
-# Run compaction frequently and let cross-block merge pack the
-# low-util survivors together.
-auto_compact_enabled             = true
-auto_compact_threshold           = 0.5
-auto_compact_min_size_bytes      = 4194304    # 4 MiB
-auto_compact_every_gc_ticks      = 6          # 6 × 300 s = every 30 min
-auto_compact_min_benefit_bytes   = 16777216   # 16 MiB
-auto_compact_disk_headroom_bytes = 1073741824 # 1 GiB = one block worth
+# Run compaction frequently. Strategy A handles the high-churn drain;
+# Strategy B converges the long tail of sparse blocks left after dedup
+# references migrate to newer, denser blocks.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.5         # Strategy A — rewrite <50% utilised
+auto_compact_undersize_ratio       = 0.2         # Strategy B — <20% of block_file_size (≈200 MiB)
+auto_compact_min_file_saved        = 3           # commit on 4→1 collapse (matches dedup-heavy fan-out)
+auto_compact_min_block_age_secs    = 1800        # 30 min anti-thrash (matches cadence below)
+auto_compact_every_gc_ticks        = 6           # 6 × 300 s = every 30 min
+auto_compact_disk_headroom_bytes   = 1073741824  # 1 GiB = one block worth
 
 [server]
 http_addr    = "0.0.0.0:8080"
