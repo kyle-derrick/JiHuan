@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 rust-version = "1.75"
 authors = ["JiHuan Contributors"]
@@ -84,6 +84,10 @@ include_dir = "0.7"
 # utils
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
+# Unicode NFC normalization for user-supplied file_ids (v0.4.6).
+# Keeps macOS-originated strings (NFD) and Windows-originated strings (NFC)
+# equivalent when they represent the same visible characters.
+unicode-normalization = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 futures = "0.3"

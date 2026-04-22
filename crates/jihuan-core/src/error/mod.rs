@@ -47,6 +47,14 @@ pub enum JiHuanError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// v0.4.6: the caller supplied a `file_id` that doesn't meet the
+    /// format rules (UTF-8, no control chars, byte length 1..=1024,
+    /// no `..` path segments, etc.). See
+    /// [`crate::utils::normalize_and_validate_file_id`] for the exact
+    /// rules. Maps to HTTP 400.
+    #[error("Invalid file_id: {0}")]
+    InvalidFileId(String),
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 

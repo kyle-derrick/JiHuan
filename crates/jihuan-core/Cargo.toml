@@ -27,6 +27,7 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 lru = { workspace = true }
 uuid = { workspace = true }
+unicode-normalization = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }

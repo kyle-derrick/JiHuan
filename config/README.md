@@ -176,3 +176,91 @@ the existing graceful shutdown path always seals the active block, so
 `RUST_LOG=… kubectl rollout restart` is the right production workflow.
 A runtime reload endpoint is tracked as a future enhancement but is
 intentionally not part of v0.4.5.
+
+---
+
+## Custom `file_id` rules (v0.4.6)
+
+`POST /api/v1/files` (and the gRPC `PutFile` RPC) accept an optional
+caller-supplied `file_id`. If you omit it the server mints a UUID as
+before. The field is validated and **NFC-normalised** before storage.
+
+### Accepted characters
+
+- Any valid UTF-8 (ASCII, CJK, emoji-free text, etc.)
+- S3 key style paths are allowed: `images/2024/cat.jpg`
+- Chinese is fine: `订单-2024/发票.pdf`
+
+### Rejected inputs (→ HTTP 400)
+
+| Pattern                    | Why                                                |
+|----------------------------|----------------------------------------------------|
+| empty string               | must have at least one byte                        |
+| any `c.is_control()` char  | tabs / newlines / NUL / DEL would break HTTP paths |
+| byte length > 1024         | redb key inflation; CJK ~340 chars is plenty       |
+| leading `/`                | reserved for future filesystem-export features     |
+| trailing `/`               | ambiguous with directory prefix                    |
+| consecutive `//`           | same                                               |
+| standalone `.` or `..` segment | path-traversal defence                         |
+
+### NFC normalisation
+
+macOS APIs often hand you **NFD** (decomposed) strings; Windows /
+Linux typically return **NFC** (composed). The same visible
+`"café"` can therefore be two different byte sequences depending on
+the client OS. JiHuan normalises every `file_id` to NFC **on the way
+in**, so clients can upload under `"café"` from a Mac and retrieve
+under `"café"` from Windows without knowing about Unicode internals.
+
+### Conflict policy
+
+Supply `on_conflict` in the multipart form or gRPC `PutFileInfo` to
+control what happens when your `file_id` already exists. Default is
+**`error`** (explicit is safer than silent).
+
+| Value        | Behaviour                                                  | HTTP status |
+|--------------|------------------------------------------------------------|-------------|
+| `error` (default) | reject with `AlreadyExists`                           | **409**     |
+| `skip`       | keep existing record, return its metadata + `outcome=skipped` | 200       |
+| `overwrite`  | atomically replace with the uploaded bytes, return `outcome=overwritten` | 200 |
+
+Success responses carry an `outcome` field (`created` / `skipped` /
+`overwritten`) so clients that need to distinguish the three paths
+can match on the body rather than inspecting what they sent. Error
+responses (409 / 400 / 507) use the standard `{error, code}` shape —
+no `outcome` on 4xx.
+
+### URL encoding
+
+`GET` / `DELETE /api/v1/files/{file_id}` expects the id in the path,
+so non-ASCII or reserved characters must be percent-encoded by the
+client. cURL examples:
+
+```bash
+# Upload with a Chinese id and skip-on-conflict.
+curl -X POST http://localhost:8080/api/v1/files \
+     -H "X-API-Key: $JIHUAN_KEY" \
+     -F "file_id=订单-2024/发票.pdf" \
+     -F "on_conflict=skip" \
+     -F "file=@invoice.pdf"
+
+# Download the same file (client must percent-encode the id).
+curl -H "X-API-Key: $JIHUAN_KEY" \
+     "http://localhost:8080/api/v1/files/%E8%AE%A2%E5%8D%95-2024%2F%E5%8F%91%E7%A5%A8.pdf" \
+     -o invoice.pdf
+
+# Overwrite an existing record.
+curl -X POST http://localhost:8080/api/v1/files \
+     -H "X-API-Key: $JIHUAN_KEY" \
+     -F "file_id=orders/42" \
+     -F "on_conflict=overwrite" \
+     -F "file=@new-receipt.pdf"
+```
+
+### Idempotent overwrite
+
+Overwriting with **identical bytes** is cheap: deduplication means
+every chunk ref-count nets to zero across old and new, so the swap
+commit rewrites the `FileMeta` row but touches no block data.
+Uploading the same content under `on_conflict=overwrite` is
+effectively free and safe to do in retry loops.

@@ -94,16 +94,10 @@ pub struct ApiKeyMeta {
     /// Whether this key is currently active
     pub enabled: bool,
     /// Granted permission scopes. Known values: "read" / "write" / "admin".
-    /// Missing in records from older builds — default to full access for
-    /// backward compatibility via [`default_legacy_scopes`].
-    #[serde(default = "default_legacy_scopes")]
+    /// Always populated by `AuthEngine::create_key` — never empty in records
+    /// written by this codebase.
+    #[serde(default)]
     pub scopes: Vec<String>,
-}
-
-/// Legacy-compat default for [`ApiKeyMeta::scopes`]: pre-scopes records had
-/// no restriction, so we reconstitute them as full-access keys.
-fn default_legacy_scopes() -> Vec<String> {
-    vec!["read".to_string(), "write".to_string(), "admin".to_string()]
 }
 
 /// A dedup index entry: maps a content hash → block location

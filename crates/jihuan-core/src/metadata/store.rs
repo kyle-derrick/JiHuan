@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableError,
+};
 
 use crate::error::{JiHuanError, Result};
 use crate::metadata::types::{ApiKeyMeta, AuditEvent, BlockMeta, DedupEntry, FileMeta};
@@ -11,8 +14,13 @@ const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const BLOCKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 const DEDUP_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("dedup");
 const PARTITIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
-/// Maps partition_id → list of file_ids (stored as bincode Vec<String>)
-const PARTITION_FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partition_files");
+/// Maps partition_id →→ file_id (one-to-many). v0.4.6: switched from
+/// `TableDefinition<&str, Vec<String>>` to multimap so that a single
+/// partition holding 10k+ files no longer rewrites a multi-MB row on
+/// every insert/delete. The key space is unchanged; only the value
+/// representation flips from "encoded vec" to "independent entries".
+const PARTITION_FILES_TABLE: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("partition_files");
 /// Maps key_id → ApiKeyMeta (JSON-encoded)
 const APIKEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("apikeys");
 /// Maps key_hash → key_id (for fast lookup by raw key hash)
@@ -62,8 +70,29 @@ impl MetadataStore {
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(PARTITIONS_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            tx.open_table(PARTITION_FILES_TABLE)
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            // v0.4.6: partition_files is now a MultimapTable. If the
+            // on-disk database was produced by an earlier build its
+            // partition_files table has a scalar value type — redb
+            // surfaces this as `TableTypeMismatch`. Translate that into
+            // a human-actionable error so operators don't have to grep
+            // through redb source.
+            match tx.open_multimap_table(PARTITION_FILES_TABLE) {
+                Ok(_) => (),
+                Err(TableError::TableTypeMismatch { .. }) => {
+                    return Err(JiHuanError::Database(format!(
+                        "redb schema mismatch — table `partition_files` has an \
+                         incompatible definition (pre-v0.4.6 layout detected).\n\n\
+                         RESOLUTION (development only):\n  \
+                         1. Stop jihuan-server.\n  \
+                         2. Delete the data directory:  rm -rf {}\n  \
+                         3. Restart the server; a fresh database will be created.\n\n\
+                         IMPORTANT: this WILL DISCARD ALL DATA. Do not run this in \
+                         production — a proper migration tool is not yet shipped.",
+                        path.display()
+                    )));
+                }
+                Err(e) => return Err(JiHuanError::Database(e.to_string())),
+            }
             tx.open_table(APIKEYS_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(APIKEY_HASH_TABLE)
@@ -83,55 +112,6 @@ impl MetadataStore {
     // ─────────────────────────────────────────────────────────────────────────
     // File operations
     // ─────────────────────────────────────────────────────────────────────────
-
-    /// Insert a new file record. Errors if the file_id already exists.
-    pub fn insert_file(&self, file: &FileMeta) -> Result<()> {
-        tracing::debug!(file_id = %file.file_id, "MetadataStore::insert_file");
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(FILES_TABLE)
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-
-            if table
-                .get(file.file_id.as_str())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?
-                .is_some()
-            {
-                return Err(JiHuanError::AlreadyExists(format!(
-                    "File '{}' already exists",
-                    file.file_id
-                )));
-            }
-
-            let bytes = encode(file)?;
-            table
-                .insert(file.file_id.as_str(), bytes.as_slice())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        }
-        {
-            // Update partition → file list
-            let mut pt = tx
-                .open_table(PARTITION_FILES_TABLE)
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            let pid = file.partition_id.to_string();
-            let mut ids: Vec<String> = pt
-                .get(pid.as_str())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?
-                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
-                .unwrap_or_default();
-            ids.push(file.file_id.clone());
-            let bytes = encode(&ids)?;
-            pt.insert(pid.as_str(), bytes.as_slice())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        Ok(())
-    }
 
     /// Atomic per-file commit (v0.4.2 P5).
     ///
@@ -190,19 +170,13 @@ impl MetadataStore {
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
         }
         {
-            // 2) Partition → file_ids index
+            // 2) Partition →→ file_id multimap (v0.4.6): single O(log n)
+            // insert per file, no decode/encode of a growing Vec.
             let mut pt = tx
-                .open_table(PARTITION_FILES_TABLE)
+                .open_multimap_table(PARTITION_FILES_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             let pid = file.partition_id.to_string();
-            let mut ids: Vec<String> = pt
-                .get(pid.as_str())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?
-                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
-                .unwrap_or_default();
-            ids.push(file.file_id.clone());
-            let bytes = encode(&ids)?;
-            pt.insert(pid.as_str(), bytes.as_slice())
+            pt.insert(pid.as_str(), file.file_id.as_str())
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
         }
         {
@@ -258,6 +232,151 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Atomic replace-in-place for an existing `file_id` (v0.4.6).
+    ///
+    /// Used by the `on_conflict = Overwrite` branch of
+    /// [`crate::Engine::put_stream_with`]. Semantics:
+    ///
+    /// 1. `old.chunks` contribute `-1` ref-count deltas that are folded
+    ///    into `ref_count_deltas` (same block appearing on both sides
+    ///    can net to zero, which is the hot path for a truly idempotent
+    ///    overwrite).
+    /// 2. `FILES_TABLE[new.file_id]` is overwritten with the new row
+    ///    (same key as `old.file_id` — overwrites are identity-preserving
+    ///    on `file_id`).
+    /// 3. If `new.partition_id != old.partition_id` the partition index
+    ///    is migrated: remove from the old partition's multimap entry,
+    ///    insert into the new one.
+    /// 4. The merged ref-count deltas are applied to `BLOCKS_TABLE`
+    ///    exactly once each — after the merge in (1) no block appears
+    ///    twice in the delta map.
+    /// 5. New dedup entries are inserted (caller must already have
+    ///    filtered out ones that were present before this call).
+    ///
+    /// All five steps land in one redb write transaction: one fsync,
+    /// all-or-nothing visibility. If the caller crashes after step (1)
+    /// in the engine (i.e. bytes were streamed into the active block
+    /// but this function never ran) the old FileMeta remains fully
+    /// intact and the orphan slack bytes are compacted out later.
+    pub fn commit_file_batch_swap(
+        &self,
+        new_file: &FileMeta,
+        old_file: &FileMeta,
+        mut ref_count_deltas: std::collections::HashMap<String, i64>,
+        new_dedup_entries: &[DedupEntry],
+    ) -> Result<()> {
+        debug_assert_eq!(
+            new_file.file_id, old_file.file_id,
+            "swap requires identical file_id"
+        );
+        tracing::debug!(
+            file_id = %new_file.file_id,
+            old_size = old_file.file_size,
+            new_size = new_file.file_size,
+            deltas = ref_count_deltas.len(),
+            new_dedups = new_dedup_entries.len(),
+            "MetadataStore::commit_file_batch_swap"
+        );
+
+        // Merge old.chunks -1 decrements — each chunk reference in old
+        // must be released. The hot path is the idempotent overwrite
+        // where new chunks dedup onto the same blocks, so +1 − 1 nets
+        // to 0 for that block and we skip the whole redb rewrite.
+        for chunk in &old_file.chunks {
+            *ref_count_deltas
+                .entry(chunk.block_id.clone())
+                .or_insert(0) -= 1;
+        }
+
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        {
+            // 1) Overwrite FILES_TABLE[file_id] with the new row. `insert`
+            //    on the same key replaces the value.
+            let mut files = tx
+                .open_table(FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let file_bytes = encode(new_file)?;
+            files
+                .insert(new_file.file_id.as_str(), file_bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+
+        // 2) Partition index migration — only if the partition changed.
+        if new_file.partition_id != old_file.partition_id {
+            let mut pt = tx
+                .open_multimap_table(PARTITION_FILES_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let old_pid = old_file.partition_id.to_string();
+            let new_pid = new_file.partition_id.to_string();
+            pt.remove(old_pid.as_str(), old_file.file_id.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            pt.insert(new_pid.as_str(), new_file.file_id.as_str())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+
+        {
+            // 3) Apply merged ref-count deltas. Zero-net entries are
+            //    skipped to avoid touching blocks that don't need
+            //    updating — this is what makes idempotent overwrite
+            //    free.
+            let mut blocks = tx
+                .open_table(BLOCKS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            for (block_id, delta) in &ref_count_deltas {
+                if *delta == 0 {
+                    continue;
+                }
+                let current: Option<BlockMeta> = {
+                    let guard = blocks
+                        .get(block_id.as_str())
+                        .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    match guard {
+                        Some(v) => Some(decode(v.value())?),
+                        None => None,
+                    }
+                };
+                match current {
+                    Some(mut meta) => {
+                        let new_count = (meta.ref_count as i64 + *delta).max(0) as u64;
+                        meta.ref_count = new_count;
+                        let bytes = encode(&meta)?;
+                        blocks
+                            .insert(block_id.as_str(), bytes.as_slice())
+                            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                    }
+                    None => {
+                        tracing::warn!(
+                            block_id = %block_id,
+                            delta,
+                            "commit_file_batch_swap: block missing for ref-count delta"
+                        );
+                    }
+                }
+            }
+        }
+
+        {
+            // 4) New dedup entries (caller already filtered existing ones).
+            let mut dedup = tx
+                .open_table(DEDUP_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            for entry in new_dedup_entries {
+                let bytes = encode(entry)?;
+                dedup
+                    .insert(entry.hash.as_str(), bytes.as_slice())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Get a file by its ID
     pub fn get_file(&self, file_id: &str) -> Result<Option<FileMeta>> {
         tracing::debug!(file_id = %file_id, "MetadataStore::get_file");
@@ -301,18 +420,12 @@ impl MetadataStore {
         };
 
         if let Some(ref file) = file_opt {
+            // v0.4.6 multimap: O(log n) single-entry removal, no Vec roundtrip.
             let mut pt = tx
-                .open_table(PARTITION_FILES_TABLE)
+                .open_multimap_table(PARTITION_FILES_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             let pid = file.partition_id.to_string();
-            let mut ids: Vec<String> = pt
-                .get(pid.as_str())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?
-                .map(|v| decode::<Vec<String>>(v.value()).unwrap_or_default())
-                .unwrap_or_default();
-            ids.retain(|id| id != file_id);
-            let bytes = encode(&ids)?;
-            pt.insert(pid.as_str(), bytes.as_slice())
+            pt.remove(pid.as_str(), file_id)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
         }
 
@@ -380,23 +493,47 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// List all file IDs in a partition
+    /// List all file IDs in a partition.
+    ///
+    /// v0.4.6: backed by a `MultimapTable`, so this streams entries from
+    /// the B-tree without decoding a growing `Vec<String>` blob. The
+    /// returned `Vec` is materialised for caller convenience; callers
+    /// expecting very large partitions should prefer
+    /// [`Self::count_files_in_partition`] when they only need the count.
     pub fn list_files_in_partition(&self, partition_id: u64) -> Result<Vec<String>> {
         let tx = self
             .db
             .begin_read()
             .map_err(|e| JiHuanError::Database(e.to_string()))?;
         let table = tx
-            .open_table(PARTITION_FILES_TABLE)
+            .open_multimap_table(PARTITION_FILES_TABLE)
             .map_err(|e| JiHuanError::Database(e.to_string()))?;
         let pid = partition_id.to_string();
-        match table
+        let iter = table
             .get(pid.as_str())
-            .map_err(|e| JiHuanError::Database(e.to_string()))?
-        {
-            Some(v) => decode(v.value()),
-            None => Ok(vec![]),
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in iter {
+            let v = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            out.push(v.value().to_string());
         }
+        Ok(out)
+    }
+
+    /// Count files in a partition without materialising the id list.
+    pub fn count_files_in_partition(&self, partition_id: u64) -> Result<u64> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_multimap_table(PARTITION_FILES_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let pid = partition_id.to_string();
+        let iter = table
+            .get(pid.as_str())
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(iter.count() as u64)
     }
 
     /// Delete all files in a partition. Returns the list of deleted FileMeta.
@@ -920,25 +1057,6 @@ impl MetadataStore {
         }
     }
 
-    pub fn insert_dedup_entry(&self, entry: &DedupEntry) -> Result<()> {
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        {
-            let mut table = tx
-                .open_table(DEDUP_TABLE)
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            let bytes = encode(entry)?;
-            table
-                .insert(entry.hash.as_str(), bytes.as_slice())
-                .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|e| JiHuanError::Database(e.to_string()))?;
-        Ok(())
-    }
-
     /// Enumerate every dedup entry (hash → block_id pairs only).
     ///
     /// Used by [`Engine::repair`](crate::Engine::repair) to find dedup
@@ -1434,11 +1552,18 @@ mod tests {
         }
     }
 
+    /// Test-only helper: insert a file via `commit_file_batch` with empty
+    /// deltas and dedups. Mirrors the semantics of the removed
+    /// `insert_file` method (duplicate → `AlreadyExists`).
+    fn insert_file_for_test(store: &MetadataStore, file: &FileMeta) -> Result<()> {
+        store.commit_file_batch(file, &std::collections::HashMap::new(), &[])
+    }
+
     #[test]
     fn test_insert_and_get_file() {
         let (store, _tmp) = make_store();
         let file = make_file("file1", 0);
-        store.insert_file(&file).unwrap();
+        insert_file_for_test(&store, &file).unwrap();
         let got = store.get_file("file1").unwrap();
         assert_eq!(got, Some(file));
     }
@@ -1447,14 +1572,14 @@ mod tests {
     fn test_insert_duplicate_file_errors() {
         let (store, _tmp) = make_store();
         let file = make_file("dup", 0);
-        store.insert_file(&file).unwrap();
-        assert!(store.insert_file(&file).is_err());
+        insert_file_for_test(&store, &file).unwrap();
+        assert!(insert_file_for_test(&store, &file).is_err());
     }
 
     #[test]
     fn test_delete_file() {
         let (store, _tmp) = make_store();
-        store.insert_file(&make_file("f1", 0)).unwrap();
+        insert_file_for_test(&store, &make_file("f1", 0)).unwrap();
         let deleted = store.delete_file("f1").unwrap();
         assert!(deleted.is_some());
         assert_eq!(store.get_file("f1").unwrap(), None);
@@ -1463,21 +1588,47 @@ mod tests {
     #[test]
     fn test_partition_file_listing() {
         let (store, _tmp) = make_store();
-        store.insert_file(&make_file("f1", 5)).unwrap();
-        store.insert_file(&make_file("f2", 5)).unwrap();
-        store.insert_file(&make_file("f3", 6)).unwrap();
+        insert_file_for_test(&store, &make_file("f1", 5)).unwrap();
+        insert_file_for_test(&store, &make_file("f2", 5)).unwrap();
+        insert_file_for_test(&store, &make_file("f3", 6)).unwrap();
 
         let p5 = store.list_files_in_partition(5).unwrap();
         assert_eq!(p5.len(), 2);
         let p6 = store.list_files_in_partition(6).unwrap();
         assert_eq!(p6.len(), 1);
+        assert_eq!(store.count_files_in_partition(5).unwrap(), 2);
+        assert_eq!(store.count_files_in_partition(6).unwrap(), 1);
+        assert_eq!(store.count_files_in_partition(999).unwrap(), 0);
+    }
+
+    /// v0.4.6 regression: the multimap partition_files schema must hold
+    /// up under thousands of entries without per-insert amplification
+    /// (pre-v0.4.6 this would rewrite a multi-MB bincode Vec on every
+    /// insert). We don't assert timing here — just that CRUD stays
+    /// correct at 1k entries in a single partition.
+    #[test]
+    fn test_partition_large_multimap() {
+        let (store, _tmp) = make_store();
+        const N: usize = 1_000;
+        for i in 0..N {
+            insert_file_for_test(&store, &make_file(&format!("big_{i}"), 42)).unwrap();
+        }
+        assert_eq!(store.count_files_in_partition(42).unwrap(), N as u64);
+        let ids = store.list_files_in_partition(42).unwrap();
+        assert_eq!(ids.len(), N);
+
+        // Remove half, confirm count tracks.
+        for i in 0..N / 2 {
+            store.delete_file(&format!("big_{i}")).unwrap();
+        }
+        assert_eq!(store.count_files_in_partition(42).unwrap(), (N / 2) as u64);
     }
 
     #[test]
     fn test_delete_partition() {
         let (store, _tmp) = make_store();
-        store.insert_file(&make_file("f1", 3)).unwrap();
-        store.insert_file(&make_file("f2", 3)).unwrap();
+        insert_file_for_test(&store, &make_file("f1", 3)).unwrap();
+        insert_file_for_test(&store, &make_file("f2", 3)).unwrap();
         let deleted = store.delete_partition(3).unwrap();
         assert_eq!(deleted.len(), 2);
         assert_eq!(store.list_files_in_partition(3).unwrap().len(), 0);
@@ -1523,7 +1674,12 @@ mod tests {
             original_size: 4096,
             compressed_size: 2000,
         };
-        store.insert_dedup_entry(&entry).unwrap();
+        // Insert via commit_file_batch (the production path; supersedes the
+        // removed standalone `insert_dedup_entry`).
+        let dummy_file = make_file("_dedup_test_anchor", 0);
+        store
+            .commit_file_batch(&dummy_file, &std::collections::HashMap::new(), std::slice::from_ref(&entry))
+            .unwrap();
         let got = store.get_dedup_entry("sha256abc").unwrap();
         assert!(got.is_some());
         store.remove_dedup_entry("sha256abc").unwrap();

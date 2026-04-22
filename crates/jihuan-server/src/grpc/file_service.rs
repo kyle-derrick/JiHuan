@@ -5,14 +5,30 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use jihuan_core::Engine;
+use jihuan_core::{ConflictPolicy, Engine, JiHuanError, PutOptions};
 
 use crate::grpc::auth_interceptor::require_scope_grpc;
 use crate::grpc::pb::{
     file_service_server::FileService, get_file_response, put_file_request, DeleteFileRequest,
     DeleteFileResponse, GetFileMetaRequest, GetFileMetaResponse, GetFileRequest, GetFileResponse,
-    PutFileRequest, PutFileResponse,
+    PutConflictPolicy, PutFileRequest, PutFileResponse,
 };
+
+/// v0.4.6: map a `JiHuanError` to a `tonic::Status` with the right code.
+/// Mirrors `http::AppError::from_jihuan` so HTTP and gRPC return
+/// semantically equivalent errors for the same upload scenarios.
+fn jihuan_error_to_status(e: JiHuanError) -> Status {
+    match e {
+        JiHuanError::NotFound(msg) => Status::not_found(msg),
+        JiHuanError::AlreadyExists(msg) => Status::already_exists(msg),
+        JiHuanError::InvalidArgument(msg) => Status::invalid_argument(msg),
+        JiHuanError::InvalidFileId(msg) => {
+            Status::invalid_argument(format!("Invalid file_id: {}", msg))
+        }
+        e @ JiHuanError::StorageFull { .. } => Status::resource_exhausted(e.to_string()),
+        other => Status::internal(other.to_string()),
+    }
+}
 
 pub struct FileServiceImpl {
     engine: Arc<Engine>,
@@ -37,6 +53,8 @@ impl FileService for FileServiceImpl {
         let mut file_name = String::new();
         let mut _file_size = 0u64;
         let mut content_type = String::new();
+        let mut custom_file_id: Option<String> = None;
+        let mut on_conflict: ConflictPolicy = ConflictPolicy::Error;
         let mut data_buf: Vec<u8> = Vec::new();
 
         while let Some(msg) = stream.message().await? {
@@ -46,6 +64,19 @@ impl FileService for FileServiceImpl {
                     _file_size = info.file_size;
                     content_type = info.content_type;
                     data_buf.reserve(_file_size as usize);
+                    // v0.4.6: Info may carry a caller-supplied id and conflict
+                    // policy. Proto3 string defaults to "" — treat that as "no id".
+                    let fid_trimmed = info.file_id.trim();
+                    if !fid_trimmed.is_empty() {
+                        custom_file_id = Some(fid_trimmed.to_string());
+                    }
+                    // Enum decodes from i32; unknown values become the default
+                    // Error variant (0), which matches the HTTP default.
+                    on_conflict = match PutConflictPolicy::try_from(info.on_conflict) {
+                        Ok(PutConflictPolicy::Skip) => ConflictPolicy::Skip,
+                        Ok(PutConflictPolicy::Overwrite) => ConflictPolicy::Overwrite,
+                        Ok(PutConflictPolicy::Error) | Err(_) => ConflictPolicy::Error,
+                    };
                 }
                 Some(put_file_request::Payload::ChunkData(chunk)) => {
                     data_buf.extend_from_slice(&chunk);
@@ -65,19 +96,27 @@ impl FileService for FileServiceImpl {
             Some(content_type.as_str().to_string())
         };
         let fn_clone = file_name.clone();
+        let id_clone = custom_file_id.clone();
         let stored_size = data_buf.len() as u64;
 
-        let file_id = tokio::task::spawn_blocking(move || {
-            engine.put_bytes(&data_buf, &fn_clone, ct.as_deref())
+        let (file_id, outcome) = tokio::task::spawn_blocking(move || {
+            let opts = PutOptions {
+                file_name: &fn_clone,
+                content_type: ct.as_deref(),
+                file_id: id_clone.as_deref(),
+                on_conflict,
+            };
+            engine.put_bytes_with(&data_buf, opts)
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(jihuan_error_to_status)?;
 
         Ok(Response::new(PutFileResponse {
             file_id,
             stored_size,
             deduplicated: false,
+            outcome: outcome.as_str().to_string(),
         }))
     }
 

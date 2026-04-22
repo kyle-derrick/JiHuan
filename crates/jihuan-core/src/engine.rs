@@ -17,8 +17,88 @@ use crate::error::{JiHuanError, Result};
 use crate::gc::{cleanup_incomplete_blocks, GcConfig, GcService};
 use crate::metadata::store::MetadataStore;
 use crate::metadata::types::{BlockMeta, ChunkMeta, DedupEntry, FileMeta};
-use crate::utils::{current_partition_id, ensure_dir, new_id, now_secs};
+use crate::utils::{
+    current_partition_id, ensure_dir, new_id, normalize_and_validate_file_id, now_secs,
+};
 use crate::wal::{WalOperation, WriteAheadLog};
+
+/// v0.4.6: Policy for resolving a client-supplied `file_id` that already
+/// exists in the store. Selected by HTTP multipart `on_conflict` field,
+/// gRPC `PutConflictPolicy` enum, or CLI `--on-conflict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// Reject the upload with [`JiHuanError::AlreadyExists`]. HTTP layer
+    /// maps this to `409 Conflict`. **Default** — explicit is safer.
+    Error,
+    /// Keep the existing file and discard the new upload silently.
+    /// Returns the pre-existing `file_id` and [`PutOutcome::Skipped`].
+    /// Useful for retry idempotency when the client can't tell whether
+    /// a previous attempt succeeded.
+    Skip,
+    /// Replace the existing file's content with the uploaded bytes.
+    /// Old block ref-counts are released atomically; if the new content
+    /// is identical, dedup makes the whole thing a no-op on the block
+    /// layer.
+    Overwrite,
+}
+
+impl Default for ConflictPolicy {
+    fn default() -> Self {
+        Self::Error
+    }
+}
+
+/// v0.4.6: outcome tag returned alongside the `file_id` from
+/// [`Engine::put_stream_with`] / [`Engine::put_bytes_with`]. Clients use
+/// it to distinguish "newly created" from "returned the pre-existing
+/// record" without having to compare the `file_id` to whatever they
+/// supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutOutcome {
+    Created,
+    Skipped,
+    Overwritten,
+}
+
+impl PutOutcome {
+    /// Stable snake-case rendering used by the HTTP / gRPC / CLI layers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Skipped => "skipped",
+            Self::Overwritten => "overwritten",
+        }
+    }
+}
+
+/// v0.4.6: optional upload parameters carried through the put path.
+///
+/// The legacy `put_bytes(data, name, content_type)` / `put_stream(reader,
+/// name, content_type)` entry points remain for callers that don't care
+/// about custom ids; they delegate to `put_*_with` with `file_id = None`
+/// and `on_conflict = Error`.
+#[derive(Debug, Clone)]
+pub struct PutOptions<'a> {
+    pub file_name: &'a str,
+    pub content_type: Option<&'a str>,
+    /// If `Some`, use this id instead of generating a UUID. Subject to
+    /// [`normalize_and_validate_file_id`] rules.
+    pub file_id: Option<&'a str>,
+    pub on_conflict: ConflictPolicy,
+}
+
+impl<'a> PutOptions<'a> {
+    /// Shorthand for the legacy "always generate a new id, fail on collision"
+    /// behaviour. Used by the thin-wrapper `put_bytes` / `put_stream` impls.
+    pub fn new(file_name: &'a str, content_type: Option<&'a str>) -> Self {
+        Self {
+            file_name,
+            content_type,
+            file_id: None,
+            on_conflict: ConflictPolicy::Error,
+        }
+    }
+}
 
 /// The central storage engine.
 ///
@@ -447,18 +527,49 @@ impl Engine {
 
     /// Store a file from a byte slice. Returns the assigned file_id.
     ///
-    /// Phase 6b-P1: this now delegates to [`put_stream`] so the in-RAM
-    /// footprint is bounded to one `chunk_size` regardless of `data.len()`,
-    /// unifying the historical `put_reader` / `put_stream` paths that both
-    /// used to chunk-then-write. The byte-slice variant keeps its precise
-    /// quota check (we know the exact size, unlike a live `Read`).
+    /// Phase 6b-P1: delegates to [`put_stream`] so the in-RAM footprint
+    /// is bounded to one `chunk_size` regardless of `data.len()`. The
+    /// byte-slice variant keeps its precise quota check (we know the
+    /// exact size, unlike a live `Read`).
+    ///
+    /// **v0.4.6:** legacy signature preserved. For custom `file_id` or
+    /// conflict-policy control, call [`Self::put_bytes_with`] instead.
     pub fn put_bytes(
         &self,
         data: &[u8],
         file_name: &str,
         content_type: Option<&str>,
     ) -> Result<String> {
+        self.put_bytes_with(data, PutOptions::new(file_name, content_type))
+            .map(|(id, _)| id)
+    }
+
+    /// Store a file from a streaming reader. Memory usage is bounded to
+    /// `storage.chunk_size` (default 4 MB) regardless of file size.
+    /// This is the preferred entry-point for large uploads.
+    ///
+    /// **v0.4.6:** legacy signature preserved. For custom `file_id` or
+    /// conflict-policy control, call [`Self::put_stream_with`] instead.
+    pub fn put_stream<R: Read>(
+        &self,
+        reader: R,
+        file_name: &str,
+        content_type: Option<&str>,
+    ) -> Result<String> {
+        self.put_stream_with(reader, PutOptions::new(file_name, content_type))
+            .map(|(id, _)| id)
+    }
+
+    /// v0.4.6: byte-slice variant of [`Self::put_stream_with`]. Performs
+    /// a precise pre-upload quota check before streaming into the engine.
+    pub fn put_bytes_with(
+        &self,
+        data: &[u8],
+        opts: PutOptions<'_>,
+    ) -> Result<(String, PutOutcome)> {
         // Precise quota check — we know the exact payload size here.
+        // Only applies to insert / overwrite; skip paths return early in
+        // put_stream_with Phase 0 without writing.
         if let Some(cap) = self.config.storage.max_storage_bytes {
             let used = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
             let needed = data.len() as u64;
@@ -469,31 +580,77 @@ impl Engine {
                 });
             }
         }
-        self.put_stream(std::io::Cursor::new(data), file_name, content_type)
+        self.put_stream_with(std::io::Cursor::new(data), opts)
     }
 
-    /// Store a file from a streaming reader. Memory usage is bounded to
-    /// `storage.chunk_size` (default 4 MB) regardless of file size.
-    /// This is the preferred entry-point for large uploads.
-    pub fn put_stream<R: Read>(
+    /// v0.4.6: streaming upload with optional caller-supplied `file_id`
+    /// and conflict-resolution policy. See [`PutOptions`] /
+    /// [`ConflictPolicy`].
+    ///
+    /// Three phases — crash safety relies on their separation:
+    ///
+    /// **Phase 0** — pre-flight. Normalise and validate `file_id`,
+    /// probe [`MetadataStore::get_file`] for a collision, and short-
+    /// circuit on `Error` / `Skip` **without writing any bytes to
+    /// disk**. Overwrite proceeds but remembers the old `FileMeta`.
+    ///
+    /// **Phase 1** — stream the incoming reader into the active block
+    /// via [`Self::store_chunk_batched`], accumulating deferred ref-
+    /// count / dedup changes in `FileBatch`. Identical to the
+    /// pre-v0.4.6 path.
+    ///
+    /// **Phase 2** — commit atomically. Insert path uses
+    /// [`MetadataStore::commit_file_batch`]; overwrite path uses
+    /// [`MetadataStore::commit_file_batch_swap`], which folds the old
+    /// file's `-1` decrements into the new deltas in a single redb
+    /// write transaction. A mid-stream crash therefore always leaves
+    /// the old FileMeta intact — any bytes written in Phase 1 are just
+    /// orphan slack that compaction reaps later.
+    pub fn put_stream_with<R: Read>(
         &self,
         mut reader: R,
-        file_name: &str,
-        content_type: Option<&str>,
-    ) -> Result<String> {
+        opts: PutOptions<'_>,
+    ) -> Result<(String, PutOutcome)> {
         let t0 = std::time::Instant::now();
         let chunk_size = self.config.storage.chunk_size as usize;
         let algo = self.config.storage.hash_algorithm;
 
-        // Pre-upload quota check. Performed once per call: we measure current
-        // on-disk bytes and reject when already at/over the configured cap.
-        // We don't know the incoming stream length here (it may come from an
-        // axum body), so "needed" is reported as 0 — the `available` figure
-        // still gives the operator actionable context in the error.
-        //
-        // Known limitation: concurrent uploads can each observe the same
-        // `available` and all proceed. This is acceptable for a single-tenant
-        // deployment; a precise enforcer would use an atomic reservation.
+        // ── Phase 0: resolve effective id + conflict policy ──────────────
+        let effective_id = match opts.file_id {
+            Some(raw) => normalize_and_validate_file_id(raw)?,
+            None => new_id(),
+        };
+
+        // Pre-existing-row probe. When the caller supplied a custom id,
+        // collisions can actually happen; when we generated a UUID we
+        // still do the probe (in the astronomically unlikely case of a
+        // collision) but the normal path just returns None and falls
+        // through to the insert branch.
+        let existing = self.meta.get_file(&effective_id)?;
+        let overwrite_target: Option<FileMeta> = match (existing, opts.on_conflict) {
+            (None, _) => None,
+            (Some(_), ConflictPolicy::Error) => {
+                metrics::counter!("jihuan_puts_conflict_total", "policy" => "error").increment(1);
+                return Err(JiHuanError::AlreadyExists(format!(
+                    "File '{}' already exists",
+                    effective_id
+                )));
+            }
+            (Some(_), ConflictPolicy::Skip) => {
+                metrics::counter!("jihuan_puts_conflict_total", "policy" => "skip").increment(1);
+                tracing::info!(
+                    file_id = %effective_id,
+                    "put_stream_with: conflict + skip \u{2192} zero-byte short-circuit"
+                );
+                return Ok((effective_id, PutOutcome::Skipped));
+            }
+            (Some(old), ConflictPolicy::Overwrite) => Some(old),
+        };
+
+        // Pre-upload quota check. Concurrent uploads can each observe
+        // the same "available" and all proceed — acceptable for a
+        // single-tenant deployment. Only runs on insert / overwrite
+        // paths; skip / error returned above.
         if let Some(cap) = self.config.storage.max_storage_bytes {
             let used = crate::utils::disk_usage_bytes(&self.config.storage.data_dir);
             if used >= cap {
@@ -504,7 +661,7 @@ impl Engine {
             }
         }
 
-        let file_id = new_id();
+        // ── Phase 1: stream the reader into the active block ────────────
         let create_time = now_secs();
         let partition_id = current_partition_id(self.config.storage.time_partition_hours);
 
@@ -512,8 +669,6 @@ impl Engine {
         let mut file_size: u64 = 0;
         let mut index: u32 = 0;
         let mut buf = vec![0u8; chunk_size];
-        // v0.4.2 P5: accumulate all metadata mutations for one atomic
-        // end-of-file redb commit.
         let mut batch = FileBatch::default();
 
         loop {
@@ -565,33 +720,67 @@ impl Engine {
         }
 
         let file_meta = FileMeta {
-            file_id: file_id.clone(),
-            file_name: file_name.to_string(),
+            file_id: effective_id.clone(),
+            file_name: opts.file_name.to_string(),
             file_size,
             create_time,
             partition_id,
             chunks: chunk_metas,
-            content_type: content_type.map(|s| s.to_string()),
+            content_type: opts.content_type.map(|s| s.to_string()),
         };
 
-        self.wal.lock().append(WalOperation::InsertFile {
-            file_id: file_id.clone(),
-        })?;
-        // v0.4.2 P5: one transaction for file insert + partition index +
-        // block ref-count deltas + new dedup entries. Replaces the old
-        // pattern of `insert_file` + per-chunk `update_block_ref_count` +
-        // per-new-chunk `insert_dedup_entry`.
-        self.meta.commit_file_batch(
-            &file_meta,
-            &batch.ref_count_deltas,
-            &batch.new_dedup_entries,
-        )?;
+        // ── Phase 2: atomic commit ───────────────────────────────────────
+        let outcome = match overwrite_target {
+            None => {
+                self.wal.lock().append(WalOperation::InsertFile {
+                    file_id: effective_id.clone(),
+                })?;
+                self.meta.commit_file_batch(
+                    &file_meta,
+                    &batch.ref_count_deltas,
+                    &batch.new_dedup_entries,
+                )?;
+                PutOutcome::Created
+            }
+            Some(old) => {
+                // WAL: emit delete+insert so crash replay is a no-op
+                // superset of what the committed redb tx already did.
+                // Order matters only for human grep; redb is the source
+                // of truth.
+                {
+                    let mut w = self.wal.lock();
+                    w.append(WalOperation::DeleteFile {
+                        file_id: effective_id.clone(),
+                    })?;
+                    w.append(WalOperation::InsertFile {
+                        file_id: effective_id.clone(),
+                    })?;
+                }
+                let old_size = old.file_size;
+                // Move the deltas into the swap commit so it can fold
+                // old.chunks' -1 decrements in without re-hashing.
+                self.meta.commit_file_batch_swap(
+                    &file_meta,
+                    &old,
+                    batch.ref_count_deltas.clone(),
+                    &batch.new_dedup_entries,
+                )?;
+                tracing::info!(
+                    file_id = %effective_id,
+                    old_size,
+                    new_size = file_size,
+                    "put_stream_with: overwrite committed"
+                );
+                metrics::counter!("jihuan_puts_overwrite_total").increment(1);
+                PutOutcome::Overwritten
+            }
+        };
 
         metrics::counter!("jihuan_puts_total").increment(1);
         metrics::counter!("jihuan_bytes_written_total").increment(file_size);
         metrics::histogram!("jihuan_put_duration_seconds").record(t0.elapsed().as_secs_f64());
 
-        Ok(file_id)
+        Ok((effective_id, outcome))
     }
 
     /// v0.4.2 P5: chunk-processing helper that accumulates pending metadata
@@ -3502,5 +3691,197 @@ mod tests {
         // After graceful drop the block is sealed; data should be readable
         assert!(got.is_ok());
         assert_eq!(got.unwrap(), b"survive crash");
+    }
+
+    // ── v0.4.6: Custom file_id + conflict policy ─────────────────────────
+
+    fn opts<'a>(name: &'a str, id: &'a str, policy: ConflictPolicy) -> PutOptions<'a> {
+        PutOptions {
+            file_name: name,
+            content_type: None,
+            file_id: Some(id),
+            on_conflict: policy,
+        }
+    }
+
+    #[test]
+    fn test_put_with_custom_id_created() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let (id, outcome) = engine
+            .put_bytes_with(b"hello", opts("a.txt", "orders/1001", ConflictPolicy::Error))
+            .unwrap();
+        assert_eq!(id, "orders/1001");
+        assert_eq!(outcome, PutOutcome::Created);
+        assert_eq!(engine.get_bytes(&id).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_put_with_custom_id_conflict_error() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine
+            .put_bytes_with(b"first", opts("a.txt", "same-id", ConflictPolicy::Error))
+            .unwrap();
+
+        // Second put with same id must reject.
+        let err = engine
+            .put_bytes_with(b"second", opts("a.txt", "same-id", ConflictPolicy::Error))
+            .unwrap_err();
+        assert!(matches!(err, JiHuanError::AlreadyExists(_)));
+
+        // And the original content must be untouched.
+        assert_eq!(engine.get_bytes("same-id").unwrap(), b"first");
+    }
+
+    #[test]
+    fn test_put_with_custom_id_conflict_skip() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine
+            .put_bytes_with(b"keep-me", opts("a.txt", "sticky", ConflictPolicy::Error))
+            .unwrap();
+
+        // Skip must return the existing id + Skipped, content unchanged.
+        let (id, outcome) = engine
+            .put_bytes_with(b"ignored", opts("a.txt", "sticky", ConflictPolicy::Skip))
+            .unwrap();
+        assert_eq!(id, "sticky");
+        assert_eq!(outcome, PutOutcome::Skipped);
+        assert_eq!(engine.get_bytes("sticky").unwrap(), b"keep-me");
+    }
+
+    #[test]
+    fn test_put_with_custom_id_conflict_overwrite_different_content() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine
+            .put_bytes_with(
+                b"old content",
+                opts("a.txt", "mutable", ConflictPolicy::Error),
+            )
+            .unwrap();
+
+        let new_payload = vec![0xABu8; 16 * 1024];
+        let (id, outcome) = engine
+            .put_bytes_with(
+                &new_payload,
+                opts("a.txt", "mutable", ConflictPolicy::Overwrite),
+            )
+            .unwrap();
+        assert_eq!(id, "mutable");
+        assert_eq!(outcome, PutOutcome::Overwritten);
+        assert_eq!(engine.get_bytes("mutable").unwrap(), new_payload);
+    }
+
+    #[test]
+    fn test_put_with_custom_id_overwrite_same_content_is_idempotent() {
+        // Hot path: uploading identical bytes to the same file_id must
+        // succeed, produce PutOutcome::Overwritten, and leave the block
+        // layer untouched beyond at most a trivial ref-count increment
+        // + decrement that net to zero.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let payload = vec![0x42u8; 8 * 1024];
+        engine
+            .put_bytes_with(
+                &payload,
+                opts("a.txt", "idempotent", ConflictPolicy::Error),
+            )
+            .unwrap();
+
+        let blocks_before = engine.meta.block_count().unwrap();
+
+        let (_id, outcome) = engine
+            .put_bytes_with(
+                &payload,
+                opts("a.txt", "idempotent", ConflictPolicy::Overwrite),
+            )
+            .unwrap();
+        assert_eq!(outcome, PutOutcome::Overwritten);
+        let blocks_after = engine.meta.block_count().unwrap();
+        assert_eq!(
+            blocks_before, blocks_after,
+            "idempotent overwrite must not spawn extra blocks"
+        );
+        assert_eq!(engine.get_bytes("idempotent").unwrap(), payload);
+    }
+
+    #[test]
+    fn test_put_with_invalid_file_id_rejected() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        for bad in ["", "bad\nid", "/leading", "trailing/", "a//b", "..", "a/../b"] {
+            let err = engine
+                .put_bytes_with(b"x", opts("a.txt", bad, ConflictPolicy::Error))
+                .unwrap_err();
+            assert!(
+                matches!(err, JiHuanError::InvalidFileId(_)),
+                "expected InvalidFileId for {:?}, got {:?}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_put_with_nfc_normalisation() {
+        // NFD input ("cafe\u{0301}.txt") must resolve to the same id as
+        // NFC input ("caf\u{00E9}.txt") — second call with the NFD form
+        // hits the already-stored record.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let nfc_id = "caf\u{00E9}.txt";
+        let nfd_id = "cafe\u{0301}.txt";
+
+        let (id1, o1) = engine
+            .put_bytes_with(b"first", opts("a.txt", nfc_id, ConflictPolicy::Error))
+            .unwrap();
+        assert_eq!(id1, nfc_id);
+        assert_eq!(o1, PutOutcome::Created);
+
+        // NFD input must collide with the existing NFC row.
+        let err = engine
+            .put_bytes_with(b"second", opts("a.txt", nfd_id, ConflictPolicy::Error))
+            .unwrap_err();
+        assert!(matches!(err, JiHuanError::AlreadyExists(_)));
+
+        // …and Skip via NFD must return the NFC id.
+        let (id2, o2) = engine
+            .put_bytes_with(b"ignored", opts("a.txt", nfd_id, ConflictPolicy::Skip))
+            .unwrap();
+        assert_eq!(id2, nfc_id);
+        assert_eq!(o2, PutOutcome::Skipped);
+    }
+
+    #[test]
+    fn test_put_with_chinese_file_id() {
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let (id, o) = engine
+            .put_bytes_with(
+                b"hello world",
+                opts("\u{53d1}\u{7968}.pdf", "\u{8ba2}\u{5355}-2024/\u{53d1}\u{7968}.pdf", ConflictPolicy::Error),
+            )
+            .unwrap();
+        assert_eq!(id, "\u{8ba2}\u{5355}-2024/\u{53d1}\u{7968}.pdf");
+        assert_eq!(o, PutOutcome::Created);
+        assert_eq!(engine.get_bytes(&id).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn test_put_auto_id_when_no_file_id_supplied() {
+        // When file_id is None, the engine mints a UUID and returns Created.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        let (id, o) = engine
+            .put_bytes_with(
+                b"auto",
+                PutOptions::new("x.txt", None),
+            )
+            .unwrap();
+        assert_eq!(o, PutOutcome::Created);
+        assert_eq!(id.len(), 32, "UUID simple form is 32 hex chars");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

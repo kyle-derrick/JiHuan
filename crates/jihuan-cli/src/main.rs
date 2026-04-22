@@ -46,6 +46,15 @@ enum Commands {
         /// Content-Type header (e.g. image/jpeg)
         #[arg(long)]
         content_type: Option<String>,
+        /// v0.4.6: caller-supplied file_id. S3-key style / UTF-8 (incl.
+        /// Chinese) accepted; subject to NFC normalisation + length
+        /// and path-safety rules. Omit for server-generated UUID.
+        #[arg(long)]
+        file_id: Option<String>,
+        /// v0.4.6: action to take when `file_id` collides with an
+        /// existing record. Default `error` (HTTP 409).
+        #[arg(long, default_value = "error", value_parser = ["error", "skip", "overwrite"])]
+        on_conflict: String,
     },
     /// Download a file by ID
     Get {
@@ -114,6 +123,9 @@ struct UploadResponse {
     file_id: String,
     file_name: String,
     file_size: u64,
+    /// v0.4.6: "created" / "skipped" / "overwritten".
+    #[serde(default)]
+    outcome: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +234,8 @@ async fn main() -> Result<()> {
             file,
             name,
             content_type,
+            file_id,
+            on_conflict,
         } => {
             let data = std::fs::read(file)
                 .with_context(|| format!("Cannot read file: {}", file.display()))?;
@@ -240,7 +254,15 @@ async fn main() -> Result<()> {
             let part = reqwest::multipart::Part::bytes(data)
                 .file_name(file_name.clone())
                 .mime_str(&mime)?;
-            let form = reqwest::multipart::Form::new().part("file", part);
+            // v0.4.6: build multipart with optional file_id / on_conflict
+            // text parts before the file part. Order is preserved by
+            // reqwest; server reads text parts before the file stream.
+            let mut form = reqwest::multipart::Form::new();
+            if let Some(ref fid) = file_id {
+                form = form.text("file_id", fid.clone());
+            }
+            form = form.text("on_conflict", on_conflict.clone());
+            let form = form.part("file", part);
 
             let resp = authed!(client
                 .post(format!("{}/api/v1/files", base))
@@ -254,6 +276,9 @@ async fn main() -> Result<()> {
             println!("file_id:   {}", r.file_id);
             println!("file_name: {}", r.file_name);
             println!("file_size: {} bytes", r.file_size);
+            if !r.outcome.is_empty() {
+                println!("outcome:   {}", r.outcome);
+            }
         }
 
         // ── get ───────────────────────────────────────────────────────────────

@@ -40,16 +40,33 @@ message PutFileRequest {
   }
 }
 
+// v0.4.6: policy for resolving a client-supplied file_id that already
+// exists. See jihuan_core::ConflictPolicy for the Rust-side counterpart.
+enum PutConflictPolicy {
+  PUT_CONFLICT_POLICY_ERROR = 0;       // default — reject with AlreadyExists
+  PUT_CONFLICT_POLICY_SKIP = 1;        // keep existing, return its id + Skipped
+  PUT_CONFLICT_POLICY_OVERWRITE = 2;   // replace atomically
+}
+
 message PutFileInfo {
   string file_name = 1;
   uint64 file_size = 2;
   string content_type = 3;
+  // v0.4.6: optional caller-supplied file_id. Empty string = auto-generate
+  // a UUID. Subject to NFC normalisation + length/format rules; see
+  // jihuan_core::utils::normalize_and_validate_file_id.
+  string file_id = 4;
+  // v0.4.6: conflict policy when `file_id` collides with an existing row.
+  PutConflictPolicy on_conflict = 5;
 }
 
 message PutFileResponse {
   string file_id = 1;
   uint64 stored_size = 2;
   bool deduplicated = 3;
+  // v0.4.6: "created" / "skipped" / "overwritten". Lets clients distinguish
+  // the three success paths without needing to remember what they supplied.
+  string outcome = 4;
 }
 
 message GetFileRequest {

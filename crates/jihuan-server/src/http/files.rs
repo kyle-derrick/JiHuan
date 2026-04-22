@@ -10,7 +10,7 @@ use axum::{
 use serde::Deserialize;
 use serde::Serialize;
 
-use jihuan_core::{Engine, JiHuanError};
+use jihuan_core::{ConflictPolicy, Engine, JiHuanError, PutOptions, PutOutcome};
 
 use crate::http::auth::{require_scope, AuthedKey};
 
@@ -85,6 +85,23 @@ pub struct UploadResponse {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
+    /// v0.4.6: "created" / "skipped" / "overwritten". Lets clients tell
+    /// idempotent-skip from a fresh insert when both return HTTP 200.
+    pub outcome: String,
+}
+
+/// Parse the multipart `on_conflict` text field into a [`ConflictPolicy`].
+/// Unknown values 400. Missing field → default `Error`.
+fn parse_conflict_policy(raw: &str) -> Result<ConflictPolicy, AppError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "error" => Ok(ConflictPolicy::Error),
+        "skip" => Ok(ConflictPolicy::Skip),
+        "overwrite" => Ok(ConflictPolicy::Overwrite),
+        other => Err(AppError::bad_request(format!(
+            "on_conflict must be one of 'error' | 'skip' | 'overwrite', got '{}'",
+            other
+        ))),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -204,28 +221,61 @@ pub async fn list_files(
 /// Upload a file via multipart form data — streams the body directly into the
 /// engine without buffering the whole file in memory. Memory usage stays bounded
 /// to roughly one chunk (`storage.chunk_size`) plus a small mpsc queue.
+///
+/// v0.4.6: reads **all** multipart fields up front, extracting optional
+/// `file_id` / `on_conflict` text fields before locating the file stream.
+/// Text fields are small and fit in memory; the `file` field is always
+/// streamed. Field order is not significant — the two control fields may
+/// appear before or after the file, as long as all three are in the same
+/// request.
 pub async fn upload_file(
     State(engine): State<Arc<Engine>>,
     caller: AuthedKey,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
     require_scope(&caller, "write")?;
-    // Find the first file field
-    let mut field = loop {
-        let f = multipart
+
+    let mut file_id_field: Option<String> = None;
+    let mut on_conflict_field: Option<String> = None;
+    // We hold the file field as the first match — multipart iterators
+    // can't be rewound, so once we find a file field we enter the
+    // streaming pump immediately. Control fields we already saw before
+    // the file apply; anything after the file is rejected (multipart
+    // doesn't let us buffer the remaining fields cheaply and order-
+    // agnostic support would require temp-file staging).
+    let field = loop {
+        let opt = multipart
             .next_field()
             .await
             .map_err(|e| AppError::bad_request(format!("Multipart error: {}", e)))?;
-        match f {
-            Some(f) => {
-                let name = f.name().unwrap_or("");
-                if name == "file" || f.file_name().is_some() {
-                    break f;
-                }
-                // skip non-file fields
+        let f = match opt {
+            Some(f) => f,
+            None => return Err(AppError::bad_request("No file field found")),
+        };
+        let name = f.name().unwrap_or("").to_string();
+        let is_file_part = name == "file" || f.file_name().is_some();
+        if is_file_part {
+            break f;
+        }
+        match name.as_str() {
+            "file_id" => {
+                let text = f
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("file_id read: {}", e)))?;
+                file_id_field = Some(text);
+            }
+            "on_conflict" => {
+                let text = f
+                    .text()
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("on_conflict read: {}", e)))?;
+                on_conflict_field = Some(text);
+            }
+            _ => {
+                // Drain unknown non-file fields silently.
                 let _ = f.bytes().await;
             }
-            None => return Err(AppError::bad_request("No file field found")),
         }
     };
 
@@ -235,20 +285,44 @@ pub async fn upload_file(
         .unwrap_or_else(|| "unknown".to_string());
     let content_type = field.content_type().map(|s| s.to_string());
 
+    // Resolve the conflict policy before we start consuming bytes —
+    // surfacing a 400 right away is cheaper than buffering and then
+    // failing. Empty string (field present but blank) → default Error.
+    let policy = match on_conflict_field.as_deref() {
+        None | Some("") => ConflictPolicy::Error,
+        Some(raw) => parse_conflict_policy(raw)?,
+    };
+
+    // Trim + guard the user-supplied file_id. Empty string after trim
+    // means "field present but blank" — treat as absent.
+    let file_id_owned: Option<String> = file_id_field
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     // Bridge async → sync via bounded mpsc of Bytes; blocking worker reads via StreamReader.
     let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<bytes::Bytes>>(8);
 
     let fn_clone = file_name.clone();
     let ct_clone = content_type.clone();
+    let id_clone = file_id_owned.clone();
     let engine_clone = engine.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let reader = ChannelReader::new(rx);
-        engine_clone.put_stream(reader, &fn_clone, ct_clone.as_deref())
+        let opts = PutOptions {
+            file_name: &fn_clone,
+            content_type: ct_clone.as_deref(),
+            file_id: id_clone.as_deref(),
+            on_conflict: policy,
+        };
+        engine_clone.put_stream_with(reader, opts)
     });
 
     // Pump bytes from the multipart field into the channel.
     let mut total_bytes: u64 = 0;
     let pump_result: Result<(), AppError> = async {
+        let mut field = field;
         while let Some(chunk) = field
             .chunk()
             .await
@@ -267,16 +341,35 @@ pub async fn upload_file(
     drop(tx);
 
     // Propagate multipart error only if the worker didn't already fail with a clearer error.
-    let file_id = worker
+    let (file_id, outcome) = worker
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?;
     pump_result?;
 
+    // For Skipped the total_bytes pumped is 0 (Phase 0 short-circuit —
+    // the worker returned before consuming the body); report the *stored*
+    // size from the existing file instead so clients see meaningful
+    // numbers. For Created / Overwritten total_bytes is authoritative.
+    let file_size = match outcome {
+        PutOutcome::Skipped => {
+            let id = file_id.clone();
+            let e = engine.clone();
+            tokio::task::spawn_blocking(move || e.get_file_meta(&id))
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?
+                .map_err(AppError::from_jihuan)?
+                .map(|m| m.file_size)
+                .unwrap_or(0)
+        }
+        _ => total_bytes,
+    };
+
     Ok(Json(UploadResponse {
         file_id,
         file_name,
-        file_size: total_bytes,
+        file_size,
+        outcome: outcome.as_str().to_string(),
     }))
 }
 
@@ -586,6 +679,11 @@ impl AppError {
             JiHuanError::InvalidArgument(msg) => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: msg,
+            },
+            // v0.4.6: user-supplied file_id format violation → 400.
+            JiHuanError::InvalidFileId(msg) => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("Invalid file_id: {}", msg),
             },
             // 507 Insufficient Storage is the standard code for "server knows
             // the request is valid but cannot store the representation". Maps

@@ -95,6 +95,84 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// Maximum byte length of a user-supplied `file_id` after NFC normalization
+/// (v0.4.6). UTF-8 bounds the character count: ~340 CJK chars or ~1024 ASCII.
+pub const MAX_FILE_ID_BYTES: usize = 1024;
+
+/// Normalise and validate a user-supplied `file_id` (v0.4.6).
+///
+/// Rules:
+/// 1. Must be valid UTF-8 (enforced by `&str` input).
+/// 2. **NFC normalized** on return so that macOS NFD and Windows NFC
+///    renderings of the same visible characters compare equal.
+/// 3. No [`char::is_control`] code points (tabs, newlines, DEL, etc.).
+/// 4. Byte length (post-NFC) must be in `1..=MAX_FILE_ID_BYTES`.
+/// 5. No leading `/`, no `//` segments, no `.`/`..` path segments —
+///    defends against filesystem-export features that might resolve
+///    the id as a path in the future.
+///
+/// Returns the NFC-normalised form for use as the canonical storage key.
+/// Rejects with [`JiHuanError::InvalidFileId`] on any rule failure.
+pub fn normalize_and_validate_file_id(input: &str) -> Result<String> {
+    use unicode_normalization::UnicodeNormalization;
+
+    if input.is_empty() {
+        return Err(JiHuanError::InvalidFileId("must not be empty".into()));
+    }
+
+    // NFC normalisation — cheap for already-NFC input (the common case).
+    let normalized: String = input.nfc().collect();
+
+    let bytes = normalized.len();
+    if bytes > MAX_FILE_ID_BYTES {
+        return Err(JiHuanError::InvalidFileId(format!(
+            "byte length {} exceeds limit {}",
+            bytes, MAX_FILE_ID_BYTES
+        )));
+    }
+
+    // Control-character scan in a single pass over chars.
+    for c in normalized.chars() {
+        if c.is_control() {
+            return Err(JiHuanError::InvalidFileId(format!(
+                "contains control character U+{:04X}",
+                c as u32
+            )));
+        }
+    }
+
+    // Path-segment safety rules.
+    if normalized.starts_with('/') {
+        return Err(JiHuanError::InvalidFileId(
+            "must not start with '/'".into(),
+        ));
+    }
+    if normalized.contains("//") {
+        return Err(JiHuanError::InvalidFileId(
+            "must not contain consecutive '/' characters".into(),
+        ));
+    }
+    for segment in normalized.split('/') {
+        if segment == "." || segment == ".." {
+            return Err(JiHuanError::InvalidFileId(format!(
+                "must not contain '{}' path segment",
+                segment
+            )));
+        }
+        // A trailing slash produces an empty segment. Disallow it too;
+        // the "no //" rule already covers the internal case, and leading
+        // '/' is already rejected, so the only remaining source is a
+        // trailing slash.
+        if segment.is_empty() {
+            return Err(JiHuanError::InvalidFileId(
+                "must not end with '/'".into(),
+            ));
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Encode bytes as lowercase hex string
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)
@@ -155,5 +233,102 @@ mod tests {
         let nested = tmp.path().join("a").join("b").join("c");
         assert!(ensure_dir(&nested).is_ok());
         assert!(nested.is_dir());
+    }
+
+    // ── v0.4.6: file_id validation ────────────────────────────────────────
+
+    #[test]
+    fn test_validate_file_id_accepts_uuid_like() {
+        let out = normalize_and_validate_file_id("ab12cd34ef56").unwrap();
+        assert_eq!(out, "ab12cd34ef56");
+    }
+
+    #[test]
+    fn test_validate_file_id_accepts_s3_key_style() {
+        let out = normalize_and_validate_file_id("images/2024/cat.jpg").unwrap();
+        assert_eq!(out, "images/2024/cat.jpg");
+    }
+
+    #[test]
+    fn test_validate_file_id_accepts_chinese() {
+        let out = normalize_and_validate_file_id("订单-2024/发票.pdf").unwrap();
+        assert_eq!(out, "订单-2024/发票.pdf");
+    }
+
+    #[test]
+    fn test_validate_file_id_nfc_normalizes() {
+        // "é" as NFD (e + U+0301) should normalise to NFC (U+00E9) — two
+        // inputs that render the same must produce the same stored key.
+        let nfd = "caf\u{0065}\u{0301}.txt"; // e + combining acute
+        let nfc = "caf\u{00E9}.txt"; // precomposed é
+        let a = normalize_and_validate_file_id(nfd).unwrap();
+        let b = normalize_and_validate_file_id(nfc).unwrap();
+        assert_eq!(a, b, "NFD and NFC of 'café.txt' must normalise identically");
+        assert_eq!(a, nfc);
+    }
+
+    #[test]
+    fn test_validate_file_id_rejects_empty() {
+        assert!(matches!(
+            normalize_and_validate_file_id(""),
+            Err(JiHuanError::InvalidFileId(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_id_rejects_control_chars() {
+        for bad in ["a\nb", "a\tb", "a\0b", "a\x7fb"] {
+            assert!(
+                matches!(
+                    normalize_and_validate_file_id(bad),
+                    Err(JiHuanError::InvalidFileId(_))
+                ),
+                "expected reject for {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_file_id_rejects_path_traversal() {
+        for bad in [".", "..", "a/..", "../b", "a/./b", "a/../b"] {
+            assert!(
+                matches!(
+                    normalize_and_validate_file_id(bad),
+                    Err(JiHuanError::InvalidFileId(_))
+                ),
+                "expected reject for {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_file_id_rejects_slash_edges() {
+        for bad in ["/leading", "trailing/", "a//b"] {
+            assert!(
+                matches!(
+                    normalize_and_validate_file_id(bad),
+                    Err(JiHuanError::InvalidFileId(_))
+                ),
+                "expected reject for {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_file_id_rejects_overlong() {
+        let big = "a".repeat(MAX_FILE_ID_BYTES + 1);
+        assert!(matches!(
+            normalize_and_validate_file_id(&big),
+            Err(JiHuanError::InvalidFileId(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_id_accepts_boundary_length() {
+        let exact = "a".repeat(MAX_FILE_ID_BYTES);
+        assert!(normalize_and_validate_file_id(&exact).is_ok());
     }
 }
