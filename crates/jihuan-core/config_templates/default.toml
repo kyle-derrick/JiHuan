@@ -19,9 +19,9 @@ verify_on_read = true
 # v0.4.4 auto-compaction: rewrite partially-deleted blocks in the background
 # so freed space can be reused. Opt-in because compaction re-compresses live
 # chunks (extra CPU + write amplification).
-auto_compact_enabled = false
+auto_compact_enabled = true             # flip on by default for general use
 auto_compact_threshold = 0.5
-auto_compact_min_size_bytes = 4194304   # 4 MiB
+auto_compact_min_size_bytes = 65536     # 64 KiB — skip only truly trivial blocks
 auto_compact_every_gc_ticks = 12        # with gc_interval_secs=300 → hourly
 
 [server]

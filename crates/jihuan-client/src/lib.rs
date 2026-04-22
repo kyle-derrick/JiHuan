@@ -33,11 +33,13 @@
 
 mod embedded;
 mod error;
+mod http;
 mod types;
 
 pub use embedded::EmbeddedClient;
 pub use error::{ClientError, ClientResult};
-pub use types::{FileInfo, FileId, PutOptions, StorageStats};
+pub use http::HttpClient;
+pub use types::{FileId, FileInfo, PutOptions, StorageStats};
 
 use async_trait::async_trait;
 
@@ -92,4 +94,42 @@ pub trait StorageClient: Send + Sync {
 
     /// Return system-wide storage statistics.
     async fn stats(&self) -> ClientResult<StorageStats>;
+
+    // ── v0.5.1 Batch API ──────────────────────────────────────────────────
+    //
+    // Default implementations fall back to the per-item async methods so
+    // that any `StorageClient` gains batch support for free. Backends with
+    // cheaper bulk paths (embedded: single `spawn_blocking`; future HTTP
+    // backend: one multi-part POST) should override these defaults.
+    //
+    // Results are returned as `Vec<ClientResult<_>>` rather than
+    // `ClientResult<Vec<_>>` so that partial failures remain visible to
+    // the caller — matching the underlying `Engine::*_batch` contract.
+
+    /// Batch-store N files. Returns per-item results in input order.
+    async fn put_batch(&self, items: Vec<(Vec<u8>, String)>) -> Vec<ClientResult<FileId>> {
+        let mut out = Vec::with_capacity(items.len());
+        for (data, name) in items {
+            out.push(self.put(data, &name).await);
+        }
+        out
+    }
+
+    /// Batch-fetch N files. Returns per-item results in input order.
+    async fn get_batch(&self, ids: &[FileId]) -> Vec<ClientResult<Vec<u8>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get(id).await);
+        }
+        out
+    }
+
+    /// Batch-delete N files. Returns per-item results in input order.
+    async fn delete_batch(&self, ids: &[FileId]) -> Vec<ClientResult<()>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.delete(id).await);
+        }
+        out
+    }
 }

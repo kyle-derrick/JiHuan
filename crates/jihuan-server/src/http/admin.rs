@@ -131,6 +131,27 @@ pub async fn trigger_gc(
     caller: AuthedKey,
 ) -> Result<Json<GcResponse>, AppError> {
     require_scope(&caller, "admin")?;
+
+    // v0.4.5: an explicit GC trigger is the operator asking for
+    // "reclaim everything you can right now". If the active block is
+    // currently holding only dead data (ref_count==0, e.g. the user
+    // deleted the file whose chunks lived there), seal it first so
+    // the GC pass below can physically delete it. Without this step
+    // that dead data would stick around until new writes organically
+    // filled the block past the rollover threshold.
+    let engine_for_seal = engine.clone();
+    let sealed = tokio::task::spawn_blocking(move || engine_for_seal.seal_if_dead())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if let Some(info) = sealed {
+        tracing::info!(
+            block_id = %info.block_id,
+            size = info.size,
+            "/api/gc/trigger: auto-sealed dead active block before GC"
+        );
+    }
+
     let stats = engine
         .trigger_gc()
         .await
@@ -181,6 +202,28 @@ pub async fn compact(
     require_scope(&caller, "admin")?;
     let threshold = req.threshold.unwrap_or(0.5);
     let min_size_bytes = req.min_size_bytes.unwrap_or(4 * 1024 * 1024);
+
+    // v0.4.5: mirror the behaviour of /api/gc/trigger — when the
+    // operator is explicitly asking to reclaim space, seal an
+    // active block that's already fully dereferenced so the normal
+    // compaction loop picks it up. (compact_block / compact_low_utilization
+    // both refuse pinned/active blocks by design.) Only runs for the
+    // low-utilisation scan path; targeted `block_id` requests are left
+    // alone since the caller explicitly named which block to compact.
+    if req.block_id.is_none() {
+        let engine_for_seal = engine.clone();
+        let sealed = tokio::task::spawn_blocking(move || engine_for_seal.seal_if_dead())
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        if let Some(info) = sealed {
+            tracing::info!(
+                block_id = %info.block_id,
+                size = info.size,
+                "/api/admin/compact: auto-sealed dead active block before scan"
+            );
+        }
+    }
 
     let compacted = tokio::task::spawn_blocking(move || -> Result<Vec<_>, _> {
         if let Some(id) = req.block_id {

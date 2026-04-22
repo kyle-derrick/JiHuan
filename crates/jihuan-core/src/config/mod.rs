@@ -74,7 +74,12 @@ fn default_auto_compact_threshold() -> f64 {
 }
 
 fn default_auto_compact_min_size_bytes() -> u64 {
-    4 * 1024 * 1024
+    // 64 KiB — skip only truly trivial blocks. Previously 4 MiB, which
+    // silently disabled auto-compaction on typical dev/small-file workloads
+    // (blocks rarely exceed a few KiB before being sealed). The operative
+    // gate is `auto_compact_threshold`; this floor only prevents pointless
+    // churn on sub-KiB blocks where the re-encode cost dominates.
+    64 * 1024
 }
 
 fn default_auto_compact_every_gc_ticks() -> u32 {

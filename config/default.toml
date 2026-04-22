@@ -24,7 +24,10 @@ verify_on_read     = true
 # re-compresses live chunks (extra CPU + write amplification).
 auto_compact_enabled       = true        # flip on by default for general use
 auto_compact_threshold     = 0.5         # rewrite blocks <50% utilised
-auto_compact_min_size_bytes = 4194304    # 4 MiB — skip tiny blocks
+auto_compact_min_size_bytes = 65536      # 64 KiB — skip only truly trivial blocks
+                                         # (lower default: typical workloads rarely
+                                         #  fill a block past a few KiB before sealing,
+                                         #  a larger floor silently disables the feature)
 auto_compact_every_gc_ticks = 12         # 12 × 300 s = once per hour
 
 [server]

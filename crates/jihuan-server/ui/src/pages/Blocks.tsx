@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
-import { RefreshCw, Trash2, Eye, X, Trash, Shrink, Lock as LockIcon } from 'lucide-react'
+import { RefreshCw, Trash2, Eye, X, Trash, Shrink, Lock as LockIcon, Info, ChevronDown, ChevronUp } from 'lucide-react'
 import {
   listBlocks, getBlockDetail, deleteBlock, triggerGc, compactBlocks, sealActiveBlock,
   type BlockInfo, type BlockDetail,
@@ -17,6 +17,7 @@ export default function Blocks() {
   const [gcing, setGcing] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [sealing, setSealing] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const load = async () => {
@@ -109,13 +110,20 @@ export default function Blocks() {
     setCompacting(true)
     setError('')
     try {
+      // NB: min_size_bytes=0 so that typical dev/small workloads (where
+      // blocks rarely exceed a few KiB before sealing) are not silently
+      // filtered out. The real gate is the utilisation threshold.
       const r = await compactBlocks(
         blockId
           ? { block_id: blockId }
-          : { threshold: 0.5, min_size_bytes: 4 * 1024 * 1024 },
+          : { threshold: 0.5, min_size_bytes: 0 },
       )
       if (r.compacted.length === 0) {
-        setInfo(`压实完成：${label} 无需重写`)
+        // v0.4.5: /api/admin/compact now auto-seals a dead active block
+        // before scanning, so hitting this branch really does mean every
+        // sealed block is above threshold. No more "please seal first"
+        // nudge — the backend handles it.
+        setInfo('压实完成：没有块的利用率低于 50%，当前空间已足够紧凑')
       } else {
         const savedStr = formatBytes(Math.abs(r.total_bytes_saved))
         const sign = r.total_bytes_saved >= 0 ? '节省' : '增长'
@@ -157,7 +165,13 @@ export default function Blocks() {
           <button
             onClick={() => handleCompact()}
             disabled={compacting}
-            title="扫描并压实利用率低于 50% 且大小 ≥ 4 MiB 的 Block"
+            title={
+              '扫描并压实利用率低于 50% 的已封存 Block。\n' +
+              '· 命中的块按活数据大小贪心装箱，合并写入尽可能少的新 Block\n' +
+              '· N 个低利用率块 → ≤ N 个新块（受 block_file_size 限制）\n' +
+              '· 每个合并组是一次 redb 事务，全部成功或全部不变\n' +
+              '· 活跃 Block 默认跳过；若它已无活引用，后端会先自动封存再合并'
+            }
             className="flex items-center gap-1.5 px-3 py-2 text-sm text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 disabled:opacity-50"
           >
             <Shrink size={14} className={compacting ? 'animate-spin' : ''} />
@@ -180,6 +194,59 @@ export default function Blocks() {
             刷新
           </button>
         </div>
+      </div>
+
+      {/* v0.4.5: make the compact / GC strategy explicit in-UI so operators
+          don't expect cross-block merging. Collapsed by default to keep the
+          toolbar uncluttered. */}
+      <div className="mb-4 border border-gray-200 rounded-lg bg-white">
+        <button
+          type="button"
+          onClick={() => setHelpOpen(v => !v)}
+          className="w-full flex items-center justify-between px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg"
+        >
+          <span className="flex items-center gap-2">
+            <Info size={14} className="text-gray-500" />
+            <span>压实 / GC 策略说明（点击展开）</span>
+          </span>
+          {helpOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+        {helpOpen && (
+          <div className="px-4 pb-4 pt-1 text-sm text-gray-700 leading-relaxed space-y-3 border-t border-gray-100">
+            <div>
+              <div className="font-semibold text-gray-900 mb-1">1. 压实是"重写 + 跨块合并"</div>
+              <p>
+                每次"压实低利用率"会扫描所有利用率低于 50% 的 sealed Block，
+                按各块的活数据量<b>升序贪心装箱</b>：多个小块的活 chunks 被<b>合并写入同一个新 Block</b>，
+                直到其活数据总量接近 <code>block_file_size</code> 上限才开启下一个新块。
+                每个合并组是一次 redb 事务，要么全部生效、要么全部不变 —— 崩溃恢复路径和单块重写一致（孤儿新块下次 GC 清理）。
+              </p>
+            </div>
+            <div>
+              <div className="font-semibold text-gray-900 mb-1">2. 活跃 Block 的处理</div>
+              <p>
+                活跃 Block 通常不参与压实/GC（它随时在被写入）。例外：
+                <b>若活跃块的 ref_count == 0</b>（例如删除了里面唯一一个文件），
+                点"压实低利用率"或"触发 GC"时，后端会先自动封存它，然后正常合并 —— 无需手动先点"封存活跃 Block"。
+              </p>
+            </div>
+            <div>
+              <div className="font-semibold text-gray-900 mb-1">3. 单块定向压实（指定 block_id）</div>
+              <p>
+                如果通过 <code>/api/admin/compact</code> 指定 <code>block_id</code>，则走<b>单块重写</b>路径：
+                只丢弃该块的死 chunks，不跨块合并。这是对某个特定块精准操作的场景。
+              </p>
+            </div>
+            <div>
+              <div className="font-semibold text-gray-900 mb-1">4. 阈值与最小尺寸语义</div>
+              <p>
+                · <b>threshold</b>：块利用率 <code>live_bytes / size</code> 低于此值才算候选。你的 64% 利用率块在 0.5 下会被跳过，要调到 0.8+ 才能触发。
+                <br />· <b>min_size_bytes</b>：小于该值的块直接跳过（UI 默认 0 不过滤；CLI/HTTP 默认 4 MiB）。
+                <br />· <b>block_file_size</b>：合并组输出块的软上限。越大越容易把小块全部装进同一个新块。
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {error && (

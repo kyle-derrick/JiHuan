@@ -746,6 +746,50 @@ impl Engine {
         Ok(())
     }
 
+    /// v0.4.5: Seal the active block **iff** it currently has zero live
+    /// references (i.e. every chunk in it has already been dereferenced by
+    /// `delete_file`). This is the single trigger that unblocks reclaim of
+    /// dead data sitting in the active writer — without it, GC can't touch
+    /// the block (it's pinned) and `compact_block` refuses it outright, so
+    /// deleted data in the active block would remain on disk until the
+    /// block organically filled up via new writes.
+    ///
+    /// Called opportunistically from the admin GC and compact endpoints so
+    /// an explicit operator action reclaims *all* reclaimable space, not
+    /// just the portion sitting in already-sealed blocks.
+    ///
+    /// Safety: reading `ref_count` and acquiring the `active_writer` lock
+    /// are separate steps, but `seal_active_block` internally re-locks and
+    /// seals whichever writer is current — so a concurrent upload that
+    /// rolled over during the window simply seals an empty/fresh block
+    /// (harmless, reaped on next GC) instead of the one we checked. The
+    /// only invariant that matters is "don't seal a block that has live
+    /// references"; that's enforced by the ref_count guard below.
+    pub fn seal_if_dead(&self) -> Result<Option<SealedBlockInfo>> {
+        // Snapshot the current active block's id under its own lock.
+        let active_id = {
+            let guard = self.active_writer.lock();
+            match guard.as_ref() {
+                None => return Ok(None),
+                Some(ab) => ab.writer.block_id().to_string(),
+            }
+        };
+
+        // Cheap metadata check: only seal when ref_count is literally 0.
+        // This is the safe, narrow trigger; richer util-based auto-seal is
+        // intentionally deferred to keep behaviour predictable.
+        match self.meta.get_block(&active_id)? {
+            Some(b) if b.ref_count == 0 => {
+                tracing::info!(
+                    block_id = %active_id,
+                    "seal_if_dead: active block has ref_count=0, sealing for reclaim"
+                );
+                self.seal_active_block()
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Seal (finish) the active block writer, making it accessible to `BlockReader`.
     /// After sealing, the block is added to the reader cache.
     ///
@@ -1200,6 +1244,43 @@ impl Engine {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // v0.5.1 Batch wrappers
+    //
+    // These exist primarily so that callers (e.g. `jihuan-client::EmbeddedClient`)
+    // can amortise per-call overhead: one `spawn_blocking` for N files instead
+    // of N. The internal hot path still uses the existing per-file code so the
+    // atomicity guarantees (per-file one redb commit) are preserved exactly.
+    //
+    // We intentionally return a `Vec<Result<_>>` rather than short-circuiting
+    // on the first error: batch users generally want to know *which* items
+    // failed so they can retry selectively. Callers that prefer all-or-none
+    // semantics can collapse the Vec themselves with `.into_iter().collect()`.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Store a list of byte payloads. See [`put_bytes`] for per-item semantics.
+    pub fn put_bytes_batch(
+        &self,
+        items: &[(Vec<u8>, String, Option<String>)],
+    ) -> Vec<Result<String>> {
+        items
+            .iter()
+            .map(|(data, name, ct)| self.put_bytes(data, name, ct.as_deref()))
+            .collect()
+    }
+
+    /// Fetch a list of files by id. Each entry is an independent [`get_bytes`]
+    /// call; failures do not abort the batch.
+    pub fn get_bytes_batch(&self, ids: &[String]) -> Vec<Result<Vec<u8>>> {
+        ids.iter().map(|id| self.get_bytes(id)).collect()
+    }
+
+    /// Delete a list of files. Each entry is an independent [`delete_file`]
+    /// call.
+    pub fn delete_file_batch(&self, ids: &[String]) -> Vec<Result<()>> {
+        ids.iter().map(|id| self.delete_file(id)).collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Delete path
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1346,6 +1427,18 @@ impl Engine {
     /// entry whose `block_id == old_block_id`*. Chunks whose hash is no
     /// longer referenced by any file are dropped — this is where the disk
     /// savings come from.
+    ///
+    /// ## Scope: single block (targeted API)
+    ///
+    /// This function rewrites ONE explicitly-identified block into ONE new
+    /// block. It never reads from, writes to, or merges with any other
+    /// block. This is the right semantics for `/api/admin/compact?block_id=X`
+    /// — the caller named a specific target.
+    ///
+    /// For the unscoped "reclaim everywhere" path use
+    /// [`Engine::compact_low_utilization`], which v0.4.5+ bin-packs multiple
+    /// low-util blocks into shared new blocks (cross-block merge) to keep
+    /// the block count from drifting up over time.
     ///
     /// Returns the per-block statistics. Callers should treat this as an
     /// administrative maintenance operation: it's safe to run alongside
@@ -1577,46 +1670,333 @@ impl Engine {
         threshold: f64,
         min_size_bytes: u64,
     ) -> Result<Vec<CompactionBlockStats>> {
+        use std::collections::{HashMap, HashSet};
+
         let threshold = threshold.clamp(0.0, 1.0);
         let pinned = self.pinned_blocks.lock().clone();
         let all_blocks = self.meta.list_all_blocks()?;
         let all_files = self.meta.list_all_files()?;
 
-        // Per-block live-byte sum from FileMeta.chunks.
-        let mut live_bytes: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
+        // Per-block live-byte sum + live hash set from FileMeta.chunks.
+        let mut live_bytes: HashMap<String, u64> = HashMap::new();
+        let mut live_hashes_per_block: HashMap<String, HashSet<String>> = HashMap::new();
         for f in &all_files {
             for c in &f.chunks {
                 *live_bytes.entry(c.block_id.clone()).or_insert(0) += c.compressed_size;
+                live_hashes_per_block
+                    .entry(c.block_id.clone())
+                    .or_default()
+                    .insert(c.hash.clone());
             }
         }
 
-        let mut results = Vec::new();
-        for b in &all_blocks {
+        // Filter candidates: sealed, non-pinned, above min_size, below util threshold.
+        let mut candidates: Vec<(BlockMeta, u64, HashSet<String>)> = Vec::new();
+        for b in all_blocks {
             if pinned.contains(&b.block_id) {
                 continue;
             }
             if b.size < min_size_bytes {
                 continue;
             }
-            let live = *live_bytes.get(&b.block_id).unwrap_or(&0);
+            let live = live_bytes.get(&b.block_id).copied().unwrap_or(0);
             let util = if b.size == 0 {
                 1.0
             } else {
                 live as f64 / b.size as f64
             };
             if util < threshold {
-                match self.compact_block(&b.block_id) {
-                    Ok(stats) => results.push(stats),
-                    Err(e) => tracing::warn!(
-                        block_id = %b.block_id,
-                        error = %e,
-                        "compact_low_utilization: block skipped due to error"
-                    ),
-                }
+                let hashes = live_hashes_per_block
+                    .get(&b.block_id)
+                    .cloned()
+                    .unwrap_or_default();
+                candidates.push((b, live, hashes));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // v0.4.5 cross-block merge: greedy bin-pack candidates into groups
+        // whose combined live bytes fit within one block_file_size. Each
+        // group gets collapsed into a single new block via a single redb
+        // commit. This prevents the "many partially-full blocks" drift that
+        // single-block rewrite would otherwise accumulate over time.
+        //
+        // Packing heuristic: sort ascending by live_bytes. Small blocks
+        // flock together first; any candidate whose live set alone exceeds
+        // block_file_size becomes its own group (still gets its dead chunks
+        // dropped, just without merging neighbours).
+        candidates.sort_by_key(|(_, live, _)| *live);
+
+        let block_file_size = self.config.storage.block_file_size;
+        let mut groups: Vec<Vec<(BlockMeta, u64, HashSet<String>)>> = Vec::new();
+        let mut current: Vec<(BlockMeta, u64, HashSet<String>)> = Vec::new();
+        let mut current_size: u64 = 0;
+        for cand in candidates {
+            let cand_live = cand.1;
+            if !current.is_empty() && current_size + cand_live > block_file_size {
+                groups.push(std::mem::take(&mut current));
+                current_size = 0;
+            }
+            current_size += cand_live;
+            current.push(cand);
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        tracing::info!(
+            candidate_count = groups.iter().map(|g| g.len()).sum::<usize>(),
+            group_count = groups.len(),
+            "compact_low_utilization: packed candidates into groups"
+        );
+
+        let mut results = Vec::new();
+        for group in groups {
+            match self.compact_merge_group(&group) {
+                Ok(mut stats) => results.append(&mut stats),
+                Err(e) => tracing::warn!(
+                    group_size = group.len(),
+                    error = %e,
+                    "compact_low_utilization: group skipped due to error"
+                ),
             }
         }
         Ok(results)
+    }
+
+    /// v0.4.5: merge `group` (one or more sealed, non-pinned, low-util
+    /// blocks) into a **single** new block. Writes live chunks from every
+    /// source sequentially into one new block file, then atomically swaps
+    /// all references (FileMeta chunks, DedupEntry rows, BlockMeta rows) in
+    /// a single redb tx via `rewrite_block_references_group`.
+    ///
+    /// Emits one `CompactionBlockStats` **per source block** so callers
+    /// still see per-block attribution; all members of the same group share
+    /// the same `new_block_id`. `new_size_bytes` on each stat is that
+    /// source's live contribution (sum of compressed chunk sizes it
+    /// provided), and `bytes_saved = old_size - contribution`; summed
+    /// across the group this approximately equals the group's net savings
+    /// (minus the single shared block header/trailer of ~500-1000 B).
+    fn compact_merge_group(
+        &self,
+        group: &[(BlockMeta, u64, std::collections::HashSet<String>)],
+    ) -> Result<Vec<CompactionBlockStats>> {
+        use std::collections::HashMap;
+
+        if group.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Partition: sources with zero live chunks are GC candidates — emit
+        // their stats directly without copying. Everyone else goes into the
+        // merge writer.
+        let mut stats: Vec<CompactionBlockStats> = Vec::new();
+        let mut effective: Vec<&(BlockMeta, u64, std::collections::HashSet<String>)> = Vec::new();
+        for entry in group {
+            if entry.2.is_empty() {
+                stats.push(CompactionBlockStats {
+                    old_block_id: entry.0.block_id.clone(),
+                    new_block_id: None,
+                    old_size_bytes: entry.0.size,
+                    new_size_bytes: 0,
+                    bytes_saved: entry.0.size as i64,
+                    live_chunks: 0,
+                    dropped_chunks: 0, // unknown without opening the reader
+                });
+            } else {
+                effective.push(entry);
+            }
+        }
+        if effective.is_empty() {
+            return Ok(stats);
+        }
+
+        // Allocate a single new block for the whole group.
+        let new_block_id = new_id();
+        self.pinned_blocks.lock().insert(new_block_id.clone());
+        struct PinGuard<'a> {
+            pins: &'a crate::gc::PinnedBlocks,
+            id: String,
+        }
+        impl<'a> Drop for PinGuard<'a> {
+            fn drop(&mut self) {
+                self.pins.lock().remove(&self.id);
+            }
+        }
+        let _pin_guard = PinGuard {
+            pins: &self.pinned_blocks,
+            id: new_block_id.clone(),
+        };
+
+        let new_path = self.block_path(&new_block_id);
+        if let Some(parent) = new_path.parent() {
+            ensure_dir(parent)?;
+        }
+
+        // Cap the writer at the larger of configured block_file_size or the
+        // sum of source live bytes + slack, so we never reject mid-merge on
+        // a packed group that fits by construction.
+        let group_live_sum: u64 = effective.iter().map(|e| e.1).sum();
+        let mut writer = BlockWriter::create(
+            &new_path,
+            &new_block_id,
+            self.config.storage.compression_algorithm,
+            self.config.storage.compression_level,
+            self.config.storage.hash_algorithm,
+            self.config
+                .storage
+                .block_file_size
+                .max(group_live_sum + 65_536),
+        )?;
+
+        // Per-source bookkeeping for attribution in the returned stats.
+        struct SourceOutcome {
+            block_id: String,
+            old_size: u64,
+            old_chunks: u64,
+            live_chunks: u64,
+            contributed_bytes: u64,
+        }
+        let mut outcomes: Vec<SourceOutcome> = Vec::new();
+        let mut chunk_remap: HashMap<String, (String, u64, u64, u64)> = HashMap::new();
+        let verify = self.config.storage.verify_on_read;
+
+        // Stream each source's live chunks into the shared writer.
+        for entry in &effective {
+            let (old_meta, _live_bytes_hint, live_hashes) = *entry;
+            let old_path = PathBuf::from(&old_meta.path);
+            if !old_path.exists() {
+                return Err(JiHuanError::DataCorruption(format!(
+                    "block {} metadata exists but file {} is missing",
+                    old_meta.block_id,
+                    old_path.display()
+                )));
+            }
+            if !BlockReader::is_complete(&old_path) {
+                return Err(JiHuanError::DataCorruption(format!(
+                    "block {} is not sealed — refusing to compact",
+                    old_meta.block_id
+                )));
+            }
+
+            let mut old_reader = BlockReader::open(&old_path)?;
+            let hash_to_entry: HashMap<String, crate::block::format::ChunkEntry> = old_reader
+                .entries
+                .iter()
+                .map(|e| (e.hash_str(), e.clone()))
+                .collect();
+            let old_chunks = old_reader.entries.len() as u64;
+
+            let mut live_count: u64 = 0;
+            let mut contributed: u64 = 0;
+            for hash in live_hashes {
+                let src_entry = hash_to_entry.get(hash).ok_or_else(|| {
+                    JiHuanError::DataCorruption(format!(
+                        "compact_merge_group: live hash {} missing from block {}'s index",
+                        hash, old_meta.block_id
+                    ))
+                })?;
+                let data = old_reader.read_chunk(src_entry, verify)?;
+                let compressed = crate::compression::compress(
+                    &data,
+                    self.config.storage.compression_algorithm,
+                    self.config.storage.compression_level,
+                )?;
+                let new_entry =
+                    writer.append_precompressed_chunk(&compressed, data.len() as u32, hash)?;
+                chunk_remap.insert(
+                    hash.clone(),
+                    (
+                        new_block_id.clone(),
+                        new_entry.data_offset,
+                        new_entry.original_size as u64,
+                        new_entry.compressed_size as u64,
+                    ),
+                );
+                live_count += 1;
+                contributed += new_entry.compressed_size as u64;
+            }
+
+            outcomes.push(SourceOutcome {
+                block_id: old_meta.block_id.clone(),
+                old_size: old_meta.size,
+                old_chunks,
+                live_chunks: live_count,
+                contributed_bytes: contributed,
+            });
+        }
+
+        // Seal the merged new block.
+        let summary = writer.finish()?;
+        let new_block_meta = BlockMeta {
+            block_id: new_block_id.clone(),
+            ref_count: 0, // filled by rewrite_block_references_group
+            create_time: now_secs(),
+            path: summary.path.to_string_lossy().into_owned(),
+            size: summary.total_size,
+        };
+
+        // Single-tx atomic swap for the whole group.
+        let old_ids: Vec<String> = outcomes.iter().map(|o| o.block_id.clone()).collect();
+        let actual_ref_count =
+            self.meta
+                .rewrite_block_references_group(&old_ids, &new_block_meta, &chunk_remap)?;
+        let committed_live: u64 = outcomes.iter().map(|o| o.live_chunks).sum();
+        if actual_ref_count != committed_live {
+            tracing::info!(
+                group_size = effective.len(),
+                new = %new_block_id,
+                pre_scan_live = committed_live,
+                committed_ref_count = actual_ref_count,
+                "compact_merge_group: additional references landed during rewrite"
+            );
+        }
+
+        // Evict old readers and delete old files (best-effort; orphans get
+        // reaped later).
+        {
+            let mut cache = self.reader_cache.lock();
+            for outcome in &outcomes {
+                let old_path = self.block_path(&outcome.block_id);
+                let key = old_path.to_string_lossy().into_owned();
+                cache.pop(&key);
+            }
+        }
+        for outcome in &outcomes {
+            let old_path = self.block_path(&outcome.block_id);
+            match std::fs::remove_file(&old_path) {
+                Ok(()) => tracing::info!(
+                    old = %outcome.block_id,
+                    new = %new_block_id,
+                    "compact_merge_group: deleted old block file"
+                ),
+                Err(e) => tracing::warn!(
+                    old = %outcome.block_id,
+                    error = %e,
+                    "compact_merge_group: could not delete old block file; will be reaped later"
+                ),
+            }
+        }
+
+        // Emit per-source stats.
+        for outcome in outcomes {
+            let dropped = outcome.old_chunks.saturating_sub(outcome.live_chunks);
+            let bytes_saved = (outcome.old_size as i64) - (outcome.contributed_bytes as i64);
+            stats.push(CompactionBlockStats {
+                old_block_id: outcome.block_id,
+                new_block_id: Some(new_block_id.clone()),
+                old_size_bytes: outcome.old_size,
+                new_size_bytes: outcome.contributed_bytes,
+                bytes_saved,
+                live_chunks: outcome.live_chunks,
+                dropped_chunks: dropped,
+            });
+        }
+
+        Ok(stats)
     }
 
     fn block_path(&self, block_id: &str) -> PathBuf {
@@ -1875,6 +2255,139 @@ mod tests {
         assert_eq!(results[0].old_block_id, block_lo);
         // And block_hi was untouched.
         assert!(engine.meta.get_block(&block_hi).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_compact_low_utilization_merges_multiple_blocks_into_one() {
+        // v0.4.5 cross-block merge regression: three sealed blocks each
+        // below utilization threshold should bin-pack into ONE new block,
+        // not three. All surviving files remain byte-identical afterwards.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        // Pick a block_file_size large enough to fit all three sources'
+        // live chunks combined. 4 MiB easily holds ~6 * 100 KB payloads.
+        cfg.storage.block_file_size = 4 * 1024 * 1024;
+        // Disable compression so the 50% util math below is deterministic
+        // (otherwise zstd collapses the test's patterned payloads and the
+        // candidates end up above threshold).
+        cfg.storage.compression_algorithm = crate::config::CompressionAlgorithm::None;
+        cfg.storage.compression_level = 0;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Build 3 blocks, each with 2 files, delete 1 per block → each
+        // lands at ~50% utilization.
+        let mut keepers: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut old_block_ids: Vec<String> = Vec::new();
+        for i in 0..3u8 {
+            let keep_payload: Vec<u8> = (0..100_000u32).map(|j| ((j + i as u32) % 251) as u8).collect();
+            let drop_payload: Vec<u8> = vec![i.wrapping_add(128); 100_000];
+            let keep_name = format!("keep_{i}.bin");
+            let drop_name = format!("drop_{i}.bin");
+            let keep_id = engine.put_bytes(&keep_payload, &keep_name, None).unwrap();
+            let drop_id = engine.put_bytes(&drop_payload, &drop_name, None).unwrap();
+            engine.seal_active_block().unwrap();
+            let block_id = engine
+                .meta
+                .get_file(&keep_id)
+                .unwrap()
+                .unwrap()
+                .chunks[0]
+                .block_id
+                .clone();
+            engine.delete_file(&drop_id).unwrap();
+            keepers.push((keep_id, keep_payload));
+            old_block_ids.push(block_id);
+        }
+
+        let before = engine.meta.list_all_blocks().unwrap();
+        let sealed_before: Vec<_> = before.iter().filter(|b| b.size > 0).collect();
+        assert_eq!(
+            sealed_before.len(),
+            3,
+            "setup precondition: 3 sealed candidate blocks"
+        );
+
+        // Compact with threshold=0.75 so each ~50% block qualifies.
+        let stats = engine.compact_low_utilization(0.75, 0).unwrap();
+
+        // All three sources report the SAME new_block_id → proves merge.
+        let new_ids: std::collections::HashSet<_> = stats
+            .iter()
+            .filter_map(|s| s.new_block_id.as_ref())
+            .collect();
+        assert_eq!(
+            new_ids.len(),
+            1,
+            "expected a single merged new block id, got {:?}",
+            new_ids
+        );
+
+        // And the block list now has exactly one sealed block (the merged one).
+        let after = engine.meta.list_all_blocks().unwrap();
+        let sealed_after: Vec<_> = after.iter().filter(|b| b.size > 0).collect();
+        assert_eq!(sealed_after.len(), 1, "all three merged into one sealed block");
+
+        // None of the original block ids should still exist.
+        for old in &old_block_ids {
+            assert!(
+                engine.meta.get_block(old).unwrap().is_none(),
+                "old block {} should have been replaced by merge",
+                old
+            );
+        }
+
+        // Every surviving file remains byte-identical.
+        for (id, expected) in &keepers {
+            let got = engine.get_bytes(id).unwrap();
+            assert_eq!(got, *expected, "file {} corrupted after merge compact", id);
+        }
+    }
+
+    #[test]
+    fn test_seal_if_dead_unblocks_reclaim_of_active_block() {
+        // Regression for v0.4.5 bug: user deletes the only file referencing
+        // the active block → ref_count==0, but GC skipped it (pinned) and
+        // compact_block refused it (active), so its disk bytes stuck around
+        // forever. `seal_if_dead` is the narrow trigger that flips it to
+        // sealed so the normal reclaim paths can touch it.
+        use tokio::runtime::Runtime;
+        let rt = Runtime::new().unwrap();
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.chunk_size = 64 * 1024;
+        cfg.storage.block_file_size = 16 * 1024 * 1024;
+        let engine = Engine::open(cfg).unwrap();
+
+        // Upload one file, don't seal — active block has ref_count=1.
+        let payload = vec![7u8; 100_000];
+        let id = engine.put_bytes(&payload, "only.bin", None).unwrap();
+        let active_id = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
+            .block_id
+            .clone();
+
+        // seal_if_dead is a no-op while the file still references the block.
+        assert!(
+            engine.seal_if_dead().unwrap().is_none(),
+            "must not seal a block with live references"
+        );
+
+        // Delete the file → ref_count goes to 0 on the active block.
+        engine.delete_file(&id).unwrap();
+        assert_eq!(
+            engine.meta.get_block(&active_id).unwrap().unwrap().ref_count,
+            0
+        );
+
+        // Now seal_if_dead should seal it.
+        let sealed = engine.seal_if_dead().unwrap();
+        assert!(sealed.is_some(), "active block with ref_count=0 must seal");
+        assert_eq!(sealed.unwrap().block_id, active_id);
+
+        // And a subsequent GC pass physically reclaims the newly-sealed block.
+        let stats = rt.block_on(async { engine.trigger_gc().await.unwrap() });
+        assert_eq!(stats.blocks_deleted, 1, "GC must reclaim the sealed block");
+        assert!(engine.meta.get_block(&active_id).unwrap().is_none());
     }
 
     #[test]

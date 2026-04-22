@@ -16,7 +16,11 @@ futures = { workspace = true }
 
 # (de)serialisation of shared DTOs
 serde = { workspace = true }
+serde_json = { workspace = true }
 bytes = { workspace = true }
+
+# HTTP backend
+reqwest = { workspace = true }
 
 # error + logging
 thiserror = { workspace = true }

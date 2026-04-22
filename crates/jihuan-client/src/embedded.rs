@@ -47,8 +47,8 @@ impl EmbeddedClient {
     /// as a client. Performs full crash recovery + WAL replay before
     /// returning.
     pub fn open(config: AppConfig) -> ClientResult<Self> {
-        let engine = Engine::open(config)
-            .map_err(|e| ClientError::Backend(format!("open: {e}")))?;
+        let engine =
+            Engine::open(config).map_err(|e| ClientError::Backend(format!("open: {e}")))?;
         Ok(Self {
             engine: Arc::new(engine),
         })
@@ -58,9 +58,7 @@ impl EmbeddedClient {
     /// directory. Equivalent to
     /// `EmbeddedClient::open(ConfigTemplate::general(dir.into()))`.
     pub fn open_with_defaults(data_dir: impl AsRef<Path>) -> ClientResult<Self> {
-        let cfg = jihuan_core::config::ConfigTemplate::general(
-            data_dir.as_ref().to_path_buf(),
-        );
+        let cfg = jihuan_core::config::ConfigTemplate::general(data_dir.as_ref().to_path_buf());
         Self::open(cfg)
     }
 
@@ -170,6 +168,80 @@ impl StorageClient for EmbeddedClient {
                 chunk_count: m.chunks.len(),
             })
             .collect())
+    }
+
+    /// Override: one `spawn_blocking` covers the entire batch, so the
+    /// Tokio → engine → Tokio dispatch overhead is paid once instead of
+    /// N times. Internally this still delegates to `Engine::put_bytes`
+    /// per item, preserving per-file atomicity.
+    async fn put_batch(&self, items: Vec<(Vec<u8>, String)>) -> Vec<ClientResult<FileId>> {
+        // Cheap upfront validation — stays consistent with single `put`.
+        if items.iter().any(|(_, n)| n.is_empty()) {
+            return items
+                .into_iter()
+                .map(|(_, n)| {
+                    if n.is_empty() {
+                        Err(ClientError::InvalidArgument(
+                            "file_name must not be empty".into(),
+                        ))
+                    } else {
+                        // Not reached — we only hit this branch if at least
+                        // one name is empty, but we still have to return the
+                        // right shape. Match engine semantics: reject the
+                        // entire batch atomically on any empty name.
+                        Err(ClientError::InvalidArgument(
+                            "batch rejected: another item had empty file_name".into(),
+                        ))
+                    }
+                })
+                .collect();
+        }
+        let engine = self.engine.clone();
+        let prepared: Vec<(Vec<u8>, String, Option<String>)> =
+            items.into_iter().map(|(d, n)| (d, n, None)).collect();
+        let results = tokio::task::spawn_blocking(move || engine.put_bytes_batch(&prepared))
+            .await
+            .unwrap_or_else(|e| {
+                vec![Err(jihuan_core::JiHuanError::Internal(format!(
+                    "put_batch join: {e}"
+                )))]
+            });
+        results
+            .into_iter()
+            .map(|r| r.map(FileId).map_err(ClientError::from))
+            .collect()
+    }
+
+    async fn get_batch(&self, ids: &[FileId]) -> Vec<ClientResult<Vec<u8>>> {
+        let engine = self.engine.clone();
+        let id_strings: Vec<String> = ids.iter().map(|f| f.0.clone()).collect();
+        let results = tokio::task::spawn_blocking(move || engine.get_bytes_batch(&id_strings))
+            .await
+            .unwrap_or_else(|e| {
+                vec![Err(jihuan_core::JiHuanError::Internal(format!(
+                    "get_batch join: {e}"
+                )))]
+            });
+        results
+            .into_iter()
+            .map(|r| r.map_err(ClientError::from))
+            .collect()
+    }
+
+    async fn delete_batch(&self, ids: &[FileId]) -> Vec<ClientResult<()>> {
+        let engine = self.engine.clone();
+        let id_strings: Vec<String> = ids.iter().map(|f| f.0.clone()).collect();
+        let results = tokio::task::spawn_blocking(move || engine.delete_file_batch(&id_strings))
+            .await
+            .unwrap_or_else(|e| {
+                vec![Err(jihuan_core::JiHuanError::Internal(format!(
+                    "delete_batch join: {e}"
+                )))]
+            });
+        results
+            .into_iter()
+            .map(|r| r.map_err(ClientError::from))
+            .collect()
     }
 
     async fn stats(&self) -> ClientResult<StorageStats> {

@@ -6,7 +6,7 @@
 //! behavioural equivalence across backends — critical since apps bind
 //! against the trait and expect matching semantics.
 
-use jihuan_client::{ClientError, EmbeddedClient, StorageClient};
+use jihuan_client::{ClientError, EmbeddedClient, HttpClient, StorageClient};
 use jihuan_core::config::ConfigTemplate;
 
 /// Build an embedded client pointed at a fresh tempdir.
@@ -79,6 +79,54 @@ async fn run_contract_list_and_stats(c: &impl StorageClient) {
     assert!(s.file_count <= 2, "stats should not over-count");
 }
 
+async fn run_contract_batch_roundtrip(c: &impl StorageClient) {
+    let items: Vec<(Vec<u8>, String)> = (0..5)
+        .map(|i| (format!("payload-{i}").into_bytes(), format!("file-{i}.bin")))
+        .collect();
+    let put_results = c.put_batch(items).await;
+    assert_eq!(put_results.len(), 5);
+    let ids: Vec<_> = put_results
+        .into_iter()
+        .map(|r| r.expect("every put in batch should succeed"))
+        .collect();
+
+    let get_results = c.get_batch(&ids).await;
+    for (i, r) in get_results.into_iter().enumerate() {
+        let bytes = r.expect("batch get should succeed");
+        assert_eq!(bytes, format!("payload-{i}").as_bytes());
+    }
+
+    let del_results = c.delete_batch(&ids).await;
+    for r in del_results {
+        r.expect("batch delete should succeed");
+    }
+    // After deletion, the batch's own files must not appear in listing.
+    // (We can't assert a globally empty list — other tests may share the
+    // same backend instance; this is why HTTP tests ran against a single
+    // server process whereas embedded tests use per-test tempdirs.)
+    let remaining = c.list_files().await.unwrap();
+    for id in &ids {
+        assert!(
+            !remaining.iter().any(|f| &f.file_id == id),
+            "deleted file id {id} unexpectedly still listed",
+        );
+    }
+}
+
+async fn run_contract_batch_partial_failure(c: &impl StorageClient) {
+    use jihuan_client::FileId;
+
+    // Put one real file.
+    let good = c.put(b"real".to_vec(), "real.bin").await.unwrap();
+
+    // Ask for one good id + one missing — expect Ok + NotFound, per input order.
+    let ids = vec![good.clone(), FileId("0".repeat(32))];
+    let results = c.get_batch(&ids).await;
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_ok());
+    matches!(results[1].as_ref().unwrap_err(), ClientError::NotFound(_));
+}
+
 // ── Embedded backend wrappers ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -114,6 +162,18 @@ async fn embedded_list_and_stats() {
 // ── Embedded-only fast-path tests ────────────────────────────────────────────
 
 #[tokio::test]
+async fn embedded_batch_roundtrip() {
+    let (c, _d) = make_embedded();
+    run_contract_batch_roundtrip(&c).await;
+}
+
+#[tokio::test]
+async fn embedded_batch_partial_failure() {
+    let (c, _d) = make_embedded();
+    run_contract_batch_partial_failure(&c).await;
+}
+
+#[tokio::test]
 async fn embedded_clone_shares_engine() {
     // Cloning the client must share the underlying engine. A file uploaded
     // via one clone is visible to the other with no extra sync.
@@ -132,4 +192,50 @@ async fn embedded_engine_accessor_returns_same_instance() {
     let a = c.engine();
     let b = c.engine();
     assert!(std::sync::Arc::ptr_eq(&a, &b));
+}
+
+// ── HTTP backend (opt-in via env) ────────────────────────────────────────────
+//
+// Set both of the following to enable:
+//   JIHUAN_TEST_SERVER_URL   — e.g. http://127.0.0.1:8080
+//   JIHUAN_TEST_API_KEY      — any admin-scoped key
+//
+// Absent either, these tests return early. This keeps the default
+// `cargo test` run hermetic while letting CI / dev exercise the real
+// remote path against a running `jihuan-server`.
+
+fn make_http() -> Option<HttpClient> {
+    let url = std::env::var("JIHUAN_TEST_SERVER_URL").ok()?;
+    let key = std::env::var("JIHUAN_TEST_API_KEY").ok();
+    Some(HttpClient::new(url, key).expect("HttpClient::new"))
+}
+
+#[tokio::test]
+async fn http_roundtrip() {
+    if let Some(c) = make_http() {
+        run_contract_roundtrip(&c).await;
+    }
+}
+
+#[tokio::test]
+async fn http_not_found() {
+    if let Some(c) = make_http() {
+        run_contract_not_found(&c).await;
+    }
+}
+
+#[tokio::test]
+async fn http_empty_filename() {
+    if let Some(c) = make_http() {
+        run_contract_empty_filename_rejected(&c).await;
+    }
+}
+
+#[tokio::test]
+async fn http_batch_roundtrip() {
+    if let Some(c) = make_http() {
+        // HTTP uses the default sequential put_batch / get_batch / delete_batch
+        // impl from the trait — this test verifies that path works end-to-end.
+        run_contract_batch_roundtrip(&c).await;
+    }
 }
