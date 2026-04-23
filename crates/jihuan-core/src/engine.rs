@@ -738,9 +738,12 @@ impl Engine {
             return Ok(false);
         }
 
-        wal.sync()?; // ensure any buffered bytes are on disk before we truncate
-        wal.truncate()?;
-        tracing::info!("WAL checkpoint: truncated");
+        wal.sync()?; // ensure any buffered bytes are on disk before we rotate
+        // `rotate(0)` delegates to `truncate()` for callers that want
+        // the legacy "discard in place" behaviour. Positive values
+        // keep archival segments alongside the active file.
+        wal.rotate(w.keep_old_logs)?;
+        tracing::info!(keep_old_logs = w.keep_old_logs, "WAL checkpoint: rotated");
         Ok(true)
     }
 
@@ -1261,76 +1264,97 @@ impl Engine {
         compressed: &[u8],
         hash: &str,
     ) -> Result<(String, ChunkEntry)> {
-        let mut guard = self.active_writer.lock();
+        // Phase 6b-P2 — rollover fsync happens **outside** the
+        // `active_writer` lock. We carry the old `ActiveBlock` out of
+        // the critical section and finalize it after other writers can
+        // proceed on the freshly-created active block. The full "shard
+        // by chunk-size bucket" refactor is deferred pending benchmark
+        // evidence of append-path contention — append is microseconds,
+        // but `finish()` + `sync_all()` can take single-digit ms on
+        // NVMe, which used to block every concurrent upload.
+        let (block_id, entry, rolled_over) = {
+            let mut guard = self.active_writer.lock();
 
-        // Check if we need a new block. Rollover uses uncompressed size as
-        // a conservative upper bound — same as the old path.
-        let need_new_block = match guard.as_ref() {
-            None => true,
-            Some(ab) => ab.writer.is_full(data.len()),
+            // Check if we need a new block. Rollover uses uncompressed size
+            // as a conservative upper bound — same as the old path.
+            let need_new_block = match guard.as_ref() {
+                None => true,
+                Some(ab) => ab.writer.is_full(data.len()),
+            };
+
+            // Capture the old block (if any) so we can finalize it after
+            // releasing the lock. Setting up the new block stays under
+            // the lock because it mutates `*guard` — but `BlockWriter::
+            // create` is a cheap `File::create` + a header write, not an
+            // fsync, so the critical section remains microsecond-scale.
+            let rolled_over = if need_new_block {
+                let old = guard.take();
+                let block_id = new_id();
+                self.pinned_blocks.lock().insert(block_id.clone());
+                let block_path = self.block_path(&block_id);
+                let writer = BlockWriter::create(
+                    &block_path,
+                    &block_id,
+                    self.config.storage.compression_algorithm,
+                    self.config.storage.compression_level,
+                    self.config.storage.hash_algorithm,
+                    self.config.storage.block_file_size,
+                )?;
+                let block_meta = BlockMeta::new(
+                    &block_id,
+                    block_path.to_str().unwrap_or_default(),
+                    0,
+                    now_secs(),
+                );
+                self.wal.lock().append(WalOperation::InsertBlock {
+                    block_id: block_id.clone(),
+                })?;
+                self.meta.insert_block(&block_meta)?;
+                *guard = Some(ActiveBlock {
+                    writer,
+                    chunk_cache: BoundedChunkCache::new(active_chunk_cache_budget()),
+                });
+                old
+            } else {
+                None
+            };
+
+            let ab = guard.as_mut().unwrap();
+            let entry = ab
+                .writer
+                .append_precompressed_chunk(compressed, data.len() as u32, hash)?;
+            let block_id = ab.writer.block_id().to_string();
+
+            // Store a copy of the raw data for in-memory reads of the active block
+            ab.chunk_cache.insert(
+                entry.data_offset,
+                CachedChunk {
+                    data: data.to_vec(),
+                },
+            );
+            (block_id, entry, rolled_over)
+            // ↑ lock drops here
         };
 
-        if need_new_block {
-            // Finish the previous block (if any) and move it into the reader cache
-            if let Some(ab) = guard.take() {
-                let sealed_id = ab.writer.block_id().to_string();
-                let summary = ab.writer.finish()?;
-                self.register_block(&summary)?;
-                // Populate the reader cache with the just-sealed block
-                if let Ok(reader) = BlockReader::open(&summary.path) {
-                    let mut cache = self.reader_cache.lock();
-                    cache.put(summary.path.to_string_lossy().into_owned(), reader);
-                }
-                // Unpin the sealed block — it's either referenced by at least
-                // one chunk (ref_count > 0 → naturally GC-safe) or was never
-                // written to and will be reaped cleanly on the next tick.
-                self.pinned_blocks.lock().remove(&sealed_id);
+        // Phase 6b-P2 — finalize the rolled-over block without blocking
+        // the next writer. `finish()` is the fsync-heavy step; having
+        // it outside the critical section means small-file concurrent
+        // writers no longer pay the tail latency of a GB-scale block
+        // sealing. Errors surface as the active call's return but the
+        // new active block is already live and usable.
+        if let Some(ab) = rolled_over {
+            let sealed_id = ab.writer.block_id().to_string();
+            let summary = ab.writer.finish()?;
+            self.register_block(&summary)?;
+            if let Ok(reader) = BlockReader::open(&summary.path) {
+                let mut cache = self.reader_cache.lock();
+                cache.put(summary.path.to_string_lossy().into_owned(), reader);
             }
-            // Create a new block. **Pin before any metadata commit** so a
-            // concurrent GC tick that snapshots between `insert_block` and
-            // the first ref-count increment still sees this block as active.
-            let block_id = new_id();
-            self.pinned_blocks.lock().insert(block_id.clone());
-            let block_path = self.block_path(&block_id);
-            let writer = BlockWriter::create(
-                &block_path,
-                &block_id,
-                self.config.storage.compression_algorithm,
-                self.config.storage.compression_level,
-                self.config.storage.hash_algorithm,
-                self.config.storage.block_file_size,
-            )?;
-            // Register block metadata immediately (ref_count starts at 0)
-            let block_meta = BlockMeta::new(
-                &block_id,
-                block_path.to_str().unwrap_or_default(),
-                0,
-                now_secs(),
-            );
-            self.wal.lock().append(WalOperation::InsertBlock {
-                block_id: block_id.clone(),
-            })?;
-            self.meta.insert_block(&block_meta)?;
-
-            *guard = Some(ActiveBlock {
-                writer,
-                chunk_cache: BoundedChunkCache::new(active_chunk_cache_budget()),
-            });
+            // Unpin the sealed block — ref_count > 0 already (at least
+            // one chunk made it in before rollover) or it was empty and
+            // will be reaped cleanly on the next GC tick.
+            self.pinned_blocks.lock().remove(&sealed_id);
         }
-
-        let ab = guard.as_mut().unwrap();
-        let entry = ab
-            .writer
-            .append_precompressed_chunk(compressed, data.len() as u32, hash)?;
-        let block_id = ab.writer.block_id().to_string();
-
-        // Store a copy of the raw data for in-memory reads of the active block
-        ab.chunk_cache.insert(
-            entry.data_offset,
-            CachedChunk {
-                data: data.to_vec(),
-            },
-        );
 
         // v0.4.2 P5: ref-count bookkeeping is now deferred to the
         // end-of-file batch commit in `put_stream`. The pin in
@@ -1605,74 +1629,77 @@ impl Engine {
     pub fn scrub(&self) -> Result<ScrubReport> {
         use crate::block::reader::BlockReader;
         use crate::dedup::hash_chunk;
+        use rayon::prelude::*;
         use std::time::Instant;
 
         const MAX_REPORTED_ERRORS: usize = 100;
 
         let started = Instant::now();
-        let mut report = ScrubReport::default();
         let blocks = self.meta.list_all_blocks()?;
         let hash_algo = self.config.storage.hash_algorithm;
 
-        for block in blocks {
-            let path = std::path::Path::new(&block.path);
-            // Skip the active block — it has no footer yet. Also skip
-            // anything that doesn't exist on disk: that's a metadata/
-            // filesystem mismatch which `repair()` is the right tool
-            // for, not `scrub()`.
-            if !path.exists() || !BlockReader::is_complete(path) {
-                continue;
-            }
+        // Phase 6b-P3 — scan each block independently. A per-block
+        // `BlockReader` is its own file handle + its own read buffer,
+        // so rayon can hand out as many blocks as it has cores and
+        // they never contend on anything except the global error cap.
+        // Each worker produces a lightweight `ScrubReport` which we
+        // reduce at the end.
+        let per_block: Vec<ScrubReport> = blocks
+            .par_iter()
+            .map(|block| {
+                let mut local = ScrubReport::default();
+                let path = std::path::Path::new(&block.path);
+                // Skip the active block — it has no footer yet. Also skip
+                // anything that doesn't exist on disk: that's a metadata/
+                // filesystem mismatch which `repair()` is the right tool
+                // for, not `scrub()`.
+                if !path.exists() || !BlockReader::is_complete(path) {
+                    return local;
+                }
 
-            let mut reader = match BlockReader::open(path) {
-                Ok(r) => r,
-                Err(e) => {
-                    report.blocks_failed += 1;
-                    tracing::warn!(
-                        block_id = %block.block_id,
-                        error = %e,
-                        "scrub: block header/footer/index verification failed"
-                    );
-                    if report.errors.len() < MAX_REPORTED_ERRORS {
-                        report.errors.push(ScrubError {
+                let mut reader = match BlockReader::open(path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        local.blocks_failed += 1;
+                        tracing::warn!(
+                            block_id = %block.block_id,
+                            error = %e,
+                            "scrub: block header/footer/index verification failed"
+                        );
+                        local.errors.push(ScrubError {
                             block_id: block.block_id.clone(),
                             chunk_hash: String::new(),
                             kind: "block_open".into(),
                             detail: e.to_string(),
                         });
+                        return local;
                     }
-                    continue;
-                }
-            };
-            report.blocks_checked += 1;
+                };
+                local.blocks_checked += 1;
 
-            // Clone the entries so we can drop the borrow on `reader`
-            // between iterations (`read_chunk` needs `&mut reader`).
-            let entries = reader.entries.clone();
-            for entry in entries {
-                let chunk_hash_stored = entry.hash_str();
-                match reader.read_chunk(&entry, true) {
-                    Ok(plain) => {
-                        report.chunks_checked += 1;
-                        // Content-hash cross-check — only meaningful when
-                        // dedup hashing is on AND the stored hash is
-                        // non-empty (pre-hash-algo=none blocks).
-                        if !chunk_hash_stored.is_empty()
-                            && !matches!(hash_algo, crate::config::HashAlgorithm::None)
-                        {
-                            let recomputed = hash_chunk(&plain, hash_algo);
-                            if recomputed != chunk_hash_stored {
-                                report.chunks_corrupt += 1;
-                                tracing::warn!(
-                                    block_id = %block.block_id,
-                                    stored = %chunk_hash_stored,
-                                    recomputed = %recomputed,
-                                    "scrub: chunk content hash mismatch"
-                                );
-                                if report.errors.len() < MAX_REPORTED_ERRORS {
+                // Clone entries so we can drop the borrow on `reader`
+                // between iterations (`read_chunk` needs `&mut reader`).
+                let entries = reader.entries.clone();
+                for entry in entries {
+                    let chunk_hash_stored = entry.hash_str();
+                    match reader.read_chunk(&entry, true) {
+                        Ok(plain) => {
+                            local.chunks_checked += 1;
+                            if !chunk_hash_stored.is_empty()
+                                && !matches!(hash_algo, crate::config::HashAlgorithm::None)
+                            {
+                                let recomputed = hash_chunk(&plain, hash_algo);
+                                if recomputed != chunk_hash_stored {
+                                    local.chunks_corrupt += 1;
+                                    tracing::warn!(
+                                        block_id = %block.block_id,
+                                        stored = %chunk_hash_stored,
+                                        recomputed = %recomputed,
+                                        "scrub: chunk content hash mismatch"
+                                    );
                                     let detail =
                                         format!("expected={chunk_hash_stored}, got={recomputed}");
-                                    report.errors.push(ScrubError {
+                                    local.errors.push(ScrubError {
                                         block_id: block.block_id.clone(),
                                         chunk_hash: chunk_hash_stored,
                                         kind: "hash_mismatch".into(),
@@ -1681,17 +1708,15 @@ impl Engine {
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        report.chunks_corrupt += 1;
-                        tracing::warn!(
-                            block_id = %block.block_id,
-                            chunk_hash = %chunk_hash_stored,
-                            error = %e,
-                            "scrub: chunk read/decompress failed"
-                        );
-                        if report.errors.len() < MAX_REPORTED_ERRORS {
-                            report.errors.push(ScrubError {
+                        Err(e) => {
+                            local.chunks_corrupt += 1;
+                            tracing::warn!(
+                                block_id = %block.block_id,
+                                chunk_hash = %chunk_hash_stored,
+                                error = %e,
+                                "scrub: chunk read/decompress failed"
+                            );
+                            local.errors.push(ScrubError {
                                 block_id: block.block_id.clone(),
                                 chunk_hash: chunk_hash_stored,
                                 kind: "crc_or_decompress".into(),
@@ -1700,6 +1725,24 @@ impl Engine {
                         }
                     }
                 }
+                local
+            })
+            .collect();
+
+        // Fold per-block reports into one. The `errors` vec is capped
+        // at `MAX_REPORTED_ERRORS` during reduce so the final HTTP
+        // response stays bounded regardless of concurrency.
+        let mut report = ScrubReport::default();
+        for b in per_block {
+            report.blocks_checked += b.blocks_checked;
+            report.blocks_failed += b.blocks_failed;
+            report.chunks_checked += b.chunks_checked;
+            report.chunks_corrupt += b.chunks_corrupt;
+            for e in b.errors {
+                if report.errors.len() >= MAX_REPORTED_ERRORS {
+                    break;
+                }
+                report.errors.push(e);
             }
         }
 

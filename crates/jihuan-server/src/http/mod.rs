@@ -12,7 +12,11 @@ use axum::{
 };
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::json;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    governor::{GovernorConfig, GovernorConfigBuilder},
+    key_extractor::{PeerIpKeyExtractor, SmartIpKeyExtractor},
+    GovernorLayer,
+};
 use tower_http::timeout::TimeoutLayer;
 
 use jihuan_core::Engine;
@@ -109,32 +113,82 @@ pub fn router(
     // config's internal state keyed by peer IP). Probe routes, login,
     // and the metrics endpoint are merged *without* this layer so a
     // locked-out operator or orchestrator can always reach them.
+    //
+    // Phase 4.3 follow-up — two key-extractor variants. `PeerIpKeyExtractor`
+    // keys buckets by the TCP peer IP (safe default; header-spoof proof).
+    // `SmartIpKeyExtractor` honours `Forwarded` / `X-Forwarded-For` /
+    // `X-Real-IP` first, which is what reverse-proxy deployments need —
+    // but is *only* safe when an upstream proxy rewrites the header.
+    // We return a single closure that folds either branch into a
+    // uniform `Router → Router` application; downstream code doesn't
+    // care which extractor is active.
+    type RateLimitApply = Box<dyn Fn(Router) -> Router + Send + Sync>;
     let rate_cfg = &engine.config().server.rate_limit;
-    let governor_config = if rate_cfg.enabled {
+    let apply_rate_limit: RateLimitApply = if rate_cfg.enabled {
         let per_second = rate_cfg.per_ip_per_sec.max(1) as u64;
         let burst = rate_cfg.burst.max(1);
-        match GovernorConfigBuilder::default()
-            .per_second(per_second)
-            .burst_size(burst)
-            .finish()
-        {
-            Some(conf) => Some(Arc::new(conf)),
-            None => {
-                // Defensive degrade — validate() + the clamps above
-                // should guarantee `Some(_)`, but if tower_governor's
-                // internal invariants change we prefer plaintext over
-                // a crash loop.
-                tracing::warn!(
-                    "tower_governor rejected rate_limit config ({} per second, burst {}), \
-                     rate limiting disabled",
-                    per_second,
-                    burst
-                );
-                None
+        if rate_cfg.trust_forwarded_for {
+            let built = GovernorConfigBuilder::default()
+                .key_extractor(SmartIpKeyExtractor)
+                .per_second(per_second)
+                .burst_size(burst)
+                .finish();
+            match built {
+                Some(conf) => {
+                    tracing::info!(
+                        per_second,
+                        burst,
+                        "rate limit enabled (SmartIp: Forwarded / X-Forwarded-For / X-Real-IP)"
+                    );
+                    let shared = Arc::new(conf);
+                    let _: &GovernorConfig<SmartIpKeyExtractor, _> = &shared;
+                    Box::new(move |r: Router| {
+                        r.layer(GovernorLayer { config: shared.clone() })
+                    })
+                }
+                None => {
+                    tracing::warn!(
+                        per_second,
+                        burst,
+                        "tower_governor rejected SmartIp rate_limit config, rate limiting disabled"
+                    );
+                    Box::new(|r: Router| r)
+                }
+            }
+        } else {
+            let built = GovernorConfigBuilder::default()
+                .per_second(per_second)
+                .burst_size(burst)
+                .finish();
+            match built {
+                Some(conf) => {
+                    tracing::info!(
+                        per_second,
+                        burst,
+                        "rate limit enabled (PeerIp; set trust_forwarded_for=true behind a trusted proxy)"
+                    );
+                    let shared = Arc::new(conf);
+                    let _: &GovernorConfig<PeerIpKeyExtractor, _> = &shared;
+                    Box::new(move |r: Router| {
+                        r.layer(GovernorLayer { config: shared.clone() })
+                    })
+                }
+                None => {
+                    // Defensive degrade — validate() + the clamps above
+                    // should guarantee `Some(_)`, but if tower_governor's
+                    // internal invariants change we prefer plaintext over
+                    // a crash loop.
+                    tracing::warn!(
+                        per_second,
+                        burst,
+                        "tower_governor rejected PeerIp rate_limit config, rate limiting disabled"
+                    );
+                    Box::new(|r: Router| r)
+                }
             }
         }
     } else {
-        None
+        Box::new(|r: Router| r)
     };
 
     // Streaming-path routers: upload (configurable body limit, no timeout)
@@ -255,25 +309,14 @@ pub fn router(
     }
 
     // Apply the rate-limit layer to the three request-serving routers
-    // but *not* to the auth or probe routers. Each `GovernorLayer`
-    // instance points at the shared `Arc<GovernorConfig>` so all
+    // but *not* to the auth or probe routers. The `apply_rate_limit`
+    // closure is a no-op when rate limiting is disabled; otherwise
+    // each call wraps the given router in a `GovernorLayer` that
+    // points at the same shared `Arc<GovernorConfig>` so all
     // sub-routers hit the same per-IP buckets.
-    let (upload_router, download_router) = if let Some(cfg) = governor_config.as_ref() {
-        let u = upload_router.layer(GovernorLayer {
-            config: cfg.clone(),
-        });
-        let d = download_router.layer(GovernorLayer {
-            config: cfg.clone(),
-        });
-        (u, d)
-    } else {
-        (upload_router, download_router)
-    };
-    if let Some(cfg) = governor_config.as_ref() {
-        main_router = main_router.layer(GovernorLayer {
-            config: cfg.clone(),
-        });
-    }
+    let upload_router = apply_rate_limit(upload_router);
+    let download_router = apply_rate_limit(download_router);
+    main_router = apply_rate_limit(main_router);
 
     // Liveness / readiness probes (k8s-compatible). Served outside the
     // auth and CORS layers so orchestrators can hit them without a
@@ -350,6 +393,23 @@ mod probe_tests {
             .burst_size(100)
             .finish();
         assert!(conf.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_governor_config_builds_with_smart_ip_extractor() {
+        // Phase 4.3 follow-up: the reverse-proxy code path must also
+        // accept the same knobs. Type annotation pins the extractor so
+        // a future refactor can't silently drop it back to PeerIp.
+        use tower_governor::governor::{GovernorConfig, GovernorConfigBuilder};
+        use tower_governor::key_extractor::SmartIpKeyExtractor;
+        let conf = GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
+            .per_second(50)
+            .burst_size(100)
+            .finish();
+        assert!(conf.is_some());
+        let conf = conf.unwrap();
+        let _: &GovernorConfig<SmartIpKeyExtractor, _> = &conf;
     }
 
     #[tokio::test]

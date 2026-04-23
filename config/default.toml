@@ -89,6 +89,13 @@ auto_selfsigned = false
 checkpoint_enabled      = true
 checkpoint_interval_secs = 300
 max_file_size_mb         = 64
+# keep_old_logs = N renames jihuan.wal → jihuan.wal.1 on every
+# checkpoint, shifting .1 → .2, …, pruning anything past .{N}.
+# `0` restores legacy in-place truncation (no archival copies).
+# Rotated segments are archive-only — redb's per-tx fsync is the
+# durability source of truth; replay on startup reads only the
+# active file.
+keep_old_logs            = 3
 
 # Phase 4.3 — per-IP token-bucket rate limiting. Disabled by default.
 # When enabled, the limiter drops flood traffic with HTTP 429 +
@@ -99,3 +106,9 @@ max_file_size_mb         = 64
 enabled        = false
 per_ip_per_sec = 50
 burst          = 100
+# When true, honour `Forwarded` / `X-Forwarded-For` / `X-Real-IP`
+# before the TCP peer IP when keying token buckets. **Only enable
+# behind a trusted reverse proxy that overwrites the header** —
+# otherwise any client can spoof an arbitrary IP and bypass the
+# limiter. Leave false for direct-socket deployments.
+trust_forwarded_for = false

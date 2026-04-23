@@ -13,10 +13,6 @@ Last audited: 2026-04-23 (after Phase 4 closeout).
 
 | Item | Why it matters | Size |
 |---|---|---|
-| **WAL multi-segment rotation** (`keep_old_logs`) | Current `checkpoint_wal` truncates in place. For forensic replay we want `jihuan.wal.1/.2/.3` kept side-by-side, oldest pruned once `keep_old_logs` is exceeded. | ~2-3 h (new segment file naming + replay path) |
-| **Backup incremental / delta** | `jihuan export` is full-snapshot only; big stores re-ship every byte. Delta requires a manifest of source block ids + timestamps and skip-writes on import. | ~1 day |
-| **tower_governor XFF extractor** | Default uses peer IP; behind a reverse proxy every client collapses to the proxy's IP. Swap to `SmartIpKeyExtractor` or similar and pick up `X-Forwarded-For` / `X-Real-IP`. | ~1 h + docs |
-| **Audit log auto-purge scheduler** | `audit::purge_older_than` exists; no tick calls it. Drives unbounded growth on long-lived instances. | ~30 lines |
 
 ---
 
@@ -24,8 +20,6 @@ Last audited: 2026-04-23 (after Phase 4 closeout).
 
 | Item | Why it matters | Size |
 |---|---|---|
-| **UI audit-log page** | `GET /api/admin/audit` returns structured records but the SPA has no reader. Operators have to `curl` to see lockouts / SA use. | ~1 day |
-| **gRPC session cookies** | Intentionally **not planned** — gRPC = API keys only. Delete this row once README/operator-guide confirms the stance. | docs-only |
 
 ---
 
@@ -33,10 +27,8 @@ Last audited: 2026-04-23 (after Phase 4 closeout).
 
 | Item | Why it matters | Size |
 |---|---|---|
-| **P1: unify `put_bytes` through `put_stream`** | Currently two code paths; `put_bytes` can't benefit from streaming quota checks. Straightforward inline. | ~1 h |
-| **P2: shard `active_writer` across chunk-size buckets** | Single `Mutex<Option<ActiveBlock>>` pins all uploads; large-file writers block small-file traffic. | ~4-6 h |
-| **P3: parallel chunk hashing** | Per-chunk SHA256 is the current bottleneck for dedup-heavy workloads. Move into rayon pool with tuned chunk group size. | ~half-day |
-| **P5: compression level auto-tune** | Default zstd level is a fixed constant. Profile-based autotune (file size / type) could trade 5-10% latency for 20% size on large media. | exploratory |
+| **P2: shard `active_writer` across chunk-size buckets** | Already **partly shipped** — rollover fsync happens outside the lock so sealing a 1 GiB block no longer blocks the next writer. Full per-bucket sharding **deferred** pending a benchmark showing append-path contention. Append itself is microsecond-scale on a buffered writer, so this is speculative until measured. | deferred |
+| **P5: compression level auto-tune** | Default zstd level is a fixed constant. Profile-based autotune (file size / type) could trade 5-10% latency for 20% size on large media. **Intentionally deferred** — shipping naive heuristics (e.g. "small chunks get level 1, big chunks get level 5") risks regressing operators who deliberately picked their level via `compression_level`. Needs real profile data + per-chunk decision API before it's worth doing. | deferred |
 
 ---
 
@@ -45,8 +37,6 @@ Last audited: 2026-04-23 (after Phase 4 closeout).
 | Item | Why it matters |
 |---|---|
 | `docs/operator-guide.md` § 10 table is now 95% populated — drop the "Phase 4 owner" column once 7.2 ships |
-| Chinese developer doc (`docs/小文件存储系统开发设计文档.md`) has not been updated since v0.4 — lags English operator guide by several phases |
-| `config/default.toml` now has 4 Phase-4 stanzas; consider a dedicated `reliability.toml` preset so first-time users get sane defaults out of the box |
 
 ---
 
@@ -61,3 +51,14 @@ Last audited: 2026-04-23 (after Phase 4 closeout).
 | Phase 4.6 `jihuan export/import/backup-verify` | v0.5.1 |
 | Phase 4.5 follow-up: scrub scheduler (`storage.scrub_interval_hours`) | v0.5.1 |
 | Phase 7.2 `allowed_partitions` enforcement (upload/get/delete/stat/list) | v0.5.1 |
+| Audit log auto-purge (verified: already runs inline on each GC tick when `auth.audit_retention_days > 0`; tested in `gc::tests`) | pre-v0.5.1 (docs drift only) |
+| Phase 4.4 follow-up: WAL multi-segment rotation (`storage.wal.keep_old_logs`, default 3) | v0.5.1 |
+| Phase 4.3 follow-up: tower_governor Smart-IP / XFF extractor (`server.rate_limit.trust_forwarded_for`) | v0.5.1 |
+| Phase 6b P1: `put_bytes` unified through `put_stream` (verified already in place; byte-slice keeps precise quota check then delegates to streaming path) | pre-v0.5.1 (docs drift only) |
+| Phase 6b P2 (minimal): rollover `finish()` + `sync_all()` released from `active_writer` lock | pre-v0.5.1 (docs drift only) |
+| Phase 6b P3: rayon-parallel scrub at per-block granularity (`Engine::scrub`) | v0.5.1 |
+| Phase 7 UI: `/ui/audit` page already shipped — filters by action / actor / time range | pre-v0.5.1 (docs drift only) |
+| Phase 4.6 follow-up: incremental `jihuan export --against <parent.tar.gz>` (skip unchanged files by `(path, size)`; MANIFEST records `ParentRef`) | v0.5.1 |
+| `config/reliability.toml` preset with all Phase 4 knobs pinned explicitly | v0.5.1 |
+| README gRPC auth stance: API Key only; cookies are HTTP-UI only | v0.5.1 |
+| Chinese design doc (`docs/小文件存储系统开发设计文档.md`): §12 v0.4→v0.5 change log appendix added | v0.5.1 |

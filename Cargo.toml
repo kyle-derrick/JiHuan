@@ -55,6 +55,9 @@ redb = "2"
 parking_lot = "0.12"
 dashmap = "6"
 lru = "0.12"
+# Phase 6b-P3 — data-parallel scrub: each block is an independent
+# read-only scan, so rayon folds them over the CPU pool.
+rayon = "1"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "multipart"] }

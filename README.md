@@ -258,6 +258,10 @@ grpcurl -plaintext -d '{"file_name":"test.txt","data":"aGVsbG8="}' \
   localhost:8081 jihuan.FileService/PutFile
 ```
 
+**认证**：gRPC 通道仅接受 API Key（`authorization: Bearer <key>` metadata）。
+浏览器 session cookie 是 HTTP-only 特性，gRPC 侧不会支持 —— 需要自动
+续期的客户端请改用 `POST /api/auth/keys` 申请长期 Service Account。
+
 ---
 
 ## 配置说明

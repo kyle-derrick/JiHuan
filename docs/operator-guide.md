@@ -416,17 +416,37 @@ orchestrators and humans.
 
 ```toml
 [server.rate_limit]
-enabled        = true
-per_ip_per_sec = 50   # steady-state refill
-burst          = 100  # initial bucket + headroom
+enabled             = true
+per_ip_per_sec      = 50    # steady-state refill
+burst               = 100   # initial bucket + headroom
+trust_forwarded_for = false # opt-in; see below
 ```
 
 Over-limit requests get **429 Too Many Requests** with a `Retry-After`
-header set by tower_governor. Behind a reverse proxy, set
-`proxy_set_header X-Forwarded-For $remote_addr` so the limiter can see
-the real client IP — the default key extractor reads the peer socket
-address, which would otherwise collapse to the proxy's IP and punish
-everyone equally.
+header set by tower_governor. Two key-extractor modes:
+
+- **`trust_forwarded_for = false`** (default). Uses tower_governor's
+  `PeerIpKeyExtractor` — token buckets are keyed by the TCP peer IP.
+  Header-spoof proof. Correct for direct-socket deployments and for
+  cases where the reverse proxy **preserves** the real client IP as
+  the socket peer (e.g. PROXY protocol).
+- **`trust_forwarded_for = true`**. Uses `SmartIpKeyExtractor`, which
+  reads `Forwarded` / `X-Forwarded-For` / `X-Real-IP` before falling
+  back to the peer IP. Only enable behind a trusted reverse proxy
+  that *overwrites* the client-supplied header — otherwise an
+  attacker sets `X-Forwarded-For: 1.2.3.4` on every request and
+  bypasses the limiter entirely.
+
+Nginx snippet that satisfies the Smart-IP path correctly:
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;  # overwrite, not append
+proxy_set_header X-Real-IP       $remote_addr;
+```
+
+(Using `$proxy_add_x_forwarded_for` *appends*, which the extractor still
+picks up — but the attacker-controlled prefix would come first and
+get selected.)
 
 ### 9c.3 WAL checkpoint + rotation
 
@@ -440,7 +460,19 @@ fsync), so the log is safe to truncate whenever:
 checkpoint_enabled       = true    # master switch; default on
 checkpoint_interval_secs = 300     # time trigger (5 min)
 max_file_size_mb         = 64      # size trigger
+keep_old_logs            = 3       # archival segments to retain (0 = in-place truncate)
 ```
+
+When `keep_old_logs > 0`, each checkpoint **rotates** the active file
+instead of truncating it: `jihuan.wal` → `jihuan.wal.1`, `.1` → `.2`,
+…, anything past `.{keep_old_logs}` is pruned. The active file
+restarts empty. Sequence numbers stay monotonic across rotations so a
+tool that stitches the chain together sees a gap-free log.
+
+Rotated segments are **archive-only** — redb's per-transaction fsync
+is the durability source of truth; the engine never replays them on
+startup. Use them for forensic replay, compliance pipelines, or
+ad-hoc debugging.
 
 The task fires **both** triggers: every `checkpoint_interval_secs` it
 wakes and calls `checkpoint_wal`, which truncates the log only if its
@@ -559,13 +591,13 @@ intersection is enforced before persistence.
 | TLS | **implemented** (Phase 3; in-process rustls for HTTP + gRPC, static PEM or dev auto-selfsigned) | v0.5.0 |
 | Graceful shutdown | **implemented** (SIGINT/SIGTERM → seal block + fsync WAL, 30 s drain) | — |
 | Health probes | **implemented** (`/healthz` always 200, `/readyz` 503→200) | v0.5.1 |
-| Rate limiting | **implemented** (tower_governor, per-IP, probes/login exempt) | v0.5.1 |
+| Rate limiting | **implemented** (tower_governor, per-IP or Smart-IP via `trust_forwarded_for`, probes/login exempt) | v0.5.1 |
 | Block scrub | **implemented** (`POST /api/admin/scrub`, CRC + content-hash) | v0.5.1 |
 | Scrub scheduler | **implemented** (`storage.scrub_interval_hours`, weekly default) | v0.5.1 |
 | Partition ACL enforcement | **implemented** (`allowed_partitions`; upload/get/delete/stat/list) | v0.5.1 |
 | WAL checkpoint/rotation | **implemented** (periodic + size-based truncate; default on) | v0.5.1 |
 | Backup/restore CLI | **implemented** (`jihuan export/import/backup-verify`, offline tar.gz) | v0.5.1 |
-| Audit retention auto-purge | partial (purge fn exists, no scheduler) | Phase 4 |
+| Audit retention auto-purge | **implemented** (inline step 3 of GC tick; `auth.audit_retention_days`, default 90 days, `0` = keep forever) | — |
 | Performance optimisation (P1/P2/P3/P5) | planned | Phase 6b continuation |
 | UI audit-log page | planned | Phase 2.7 follow-up |
 | gRPC session cookies | **not planned** (API keys only) | — |

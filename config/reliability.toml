@@ -1,0 +1,83 @@
+# JiHuan - Reliability-Hardened Profile (v0.5.1)
+#
+# Opinionated defaults for production operators who care about
+# observability, auditability, and graceful degradation over raw
+# throughput. All Phase 4 knobs are explicitly pinned here so a future
+# `default.toml` rename/nudge won't silently change your posture.
+#
+# Layered on top of `default.toml`'s storage tuning — only the fields
+# below differ from the general-purpose profile. Copy both sections
+# into your final config or use `--config reliability.toml` directly.
+
+[storage]
+data_dir = "./jihuan-data/data"
+meta_dir = "./jihuan-data/meta"
+wal_dir  = "./jihuan-data/wal"
+block_file_size    = 1073741824   # 1 GB
+chunk_size         = 4194304      # 4 MB
+hash_algorithm     = "sha256"     # full content hashing → dedup + scrub
+compression_algorithm = "zstd"
+compression_level  = 1
+time_partition_hours = 24
+gc_threshold       = 0.7
+gc_interval_secs   = 300
+max_open_block_files = 64
+verify_on_read     = true          # belt-and-braces read verification
+# Pinned auto-compaction profile — matches default.toml for 1GB blocks.
+auto_compact_enabled               = true
+auto_compact_threshold             = 0.5
+auto_compact_undersize_ratio       = 0.25
+auto_compact_min_file_saved        = 3
+auto_compact_min_block_age_secs    = 3600
+auto_compact_every_gc_ticks        = 12
+auto_compact_disk_headroom_bytes   = 536870912
+
+# Phase 4.5 follow-up — weekly background scrub. Matches the shipped
+# default but pinned here so operators auditing the file can confirm
+# at a glance.
+scrub_interval_hours = 168
+
+# Phase 4.4 + follow-up — WAL checkpointing at 5 min / 64 MiB with 3
+# rotated archives. Archives are forensic-only; replay on startup uses
+# redb, not the WAL.
+[storage.wal]
+checkpoint_enabled       = true
+checkpoint_interval_secs = 300
+max_file_size_mb         = 64
+keep_old_logs            = 3
+
+[server]
+http_addr    = "0.0.0.0:8080"
+grpc_addr    = "0.0.0.0:8081"
+metrics_addr = "0.0.0.0:9090"
+enable_access_log = true
+request_timeout_secs = 30
+cors_origins = []
+
+# Phase 4.3 — per-IP rate limiting ENABLED by default in this preset.
+# The numbers below are conservative — a mis-scripted client won't
+# wedge the server. Flip `trust_forwarded_for` to true only after you
+# put a proxy (Caddy/nginx/ALB) in front that *overwrites* the XFF
+# header with the real peer IP. See operator-guide §9c.2.
+[server.rate_limit]
+enabled             = true
+per_ip_per_sec      = 50
+burst               = 100
+trust_forwarded_for = false
+
+# Phase 3 — TLS OFF here (operators usually terminate TLS at the
+# proxy). Flip `enabled = true` + point `cert_path` / `key_path` at
+# your PEMs if you want in-process rustls; see operator-guide §9b.
+[tls]
+enabled         = false
+cert_path       = ""
+key_path        = ""
+auto_selfsigned = false
+
+[auth]
+# Bootstrap policy unchanged — root user gets auto-created on empty
+# metadata (password read from JIHUAN_ROOT_PASSWORD env or auto-
+# generated and printed once to stdout).
+enabled               = true
+audit_retention_days  = 90          # inline purge on every GC tick
+cookie_secure         = true        # assumes a TLS proxy; flip to false for plain HTTP dev

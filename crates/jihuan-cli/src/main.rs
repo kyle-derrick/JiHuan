@@ -139,6 +139,14 @@ enum Commands {
         /// Output archive path (`.tar.gz` extension recommended).
         #[arg(long)]
         out: PathBuf,
+        /// Phase 4.6 follow-up — produce an **incremental** archive
+        /// against this parent (`.tar.gz`). Files whose `(archive path,
+        /// size)` already appear in the parent are skipped, so the
+        /// delta only contains new-or-modified content. Restore with
+        /// `jihuan import --in <parent> ...` first, then
+        /// `jihuan import --in <delta> ... --force`.
+        #[arg(long, name = "against")]
+        against: Option<PathBuf>,
     },
 
     /// Phase 4.6: restore a backup produced by `jihuan export`.
@@ -542,9 +550,16 @@ async fn main() -> Result<()> {
         },
 
         // ── export (Phase 4.6; server MUST be stopped) ──────────────────────
-        Commands::Export { config, out } => {
+        Commands::Export { config, out, against } => {
             let cfg = AppConfig::from_file(config)
                 .with_context(|| format!("failed to load {}", config.display()))?;
+            if let Some(parent) = against {
+                eprintln!(
+                    "Exporting INCREMENTAL against {} → {}",
+                    parent.display(),
+                    out.display()
+                );
+            }
             eprintln!(
                 "Exporting data_dir={} meta_dir={} wal_dir={} → {}",
                 cfg.storage.data_dir.display(),
@@ -552,12 +567,21 @@ async fn main() -> Result<()> {
                 cfg.storage.wal_dir.display(),
                 out.display(),
             );
-            let manifest = backup::create_archive(
-                &cfg.storage.data_dir,
-                &cfg.storage.meta_dir,
-                &cfg.storage.wal_dir,
-                out,
-            )
+            let manifest = match against {
+                Some(parent) => backup::create_incremental_archive(
+                    &cfg.storage.data_dir,
+                    &cfg.storage.meta_dir,
+                    &cfg.storage.wal_dir,
+                    out,
+                    parent,
+                ),
+                None => backup::create_archive(
+                    &cfg.storage.data_dir,
+                    &cfg.storage.meta_dir,
+                    &cfg.storage.wal_dir,
+                    out,
+                ),
+            }
             .context("backup export failed")?;
             println!("Export complete.");
             println!("  archive:        {}", out.display());
@@ -565,6 +589,16 @@ async fn main() -> Result<()> {
             println!("  data entries:   {} ({} bytes)", manifest.data_entries, manifest.data_bytes);
             println!("  wal entries:    {} ({} bytes)", manifest.wal_entries, manifest.wal_bytes);
             println!("  meta db bytes:  {}", manifest.meta_bytes);
+            if let Some(p) = manifest.parent.as_ref() {
+                println!(
+                    "  parent created_at={} reused {}/{} entries (delta saved ~{} bytes)",
+                    p.created_at,
+                    p.reused_entries,
+                    p.total_entries,
+                    p.total_bytes
+                        .saturating_sub(manifest.data_bytes + manifest.meta_bytes + manifest.wal_bytes),
+                );
+            }
         }
 
         // ── import (Phase 4.6; server MUST be stopped) ──────────────────────
@@ -613,6 +647,17 @@ async fn main() -> Result<()> {
             println!("  wal bytes:         {}", manifest.wal_bytes);
             println!("  meta db bytes:     {}", manifest.meta_bytes);
             println!("  has meta.db:       {}", manifest.has_meta_db);
+            match manifest.parent.as_ref() {
+                None => println!("  archive type:      full snapshot"),
+                Some(p) => {
+                    println!("  archive type:      INCREMENTAL");
+                    println!("    parent created_at:    {}", p.created_at);
+                    println!("    parent data entries:  {}", p.data_entries);
+                    println!("    parent total entries: {}", p.total_entries);
+                    println!("    parent total bytes:   {}", p.total_bytes);
+                    println!("    reused entries:       {}", p.reused_entries);
+                }
+            }
         }
 
         // ── reseal-orphan (local, server MUST be stopped) ────────────────────

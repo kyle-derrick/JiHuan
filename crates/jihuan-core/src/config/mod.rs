@@ -317,6 +317,17 @@ pub struct WalConfig {
     /// (time-based still fires).
     #[serde(default = "default_wal_max_file_size_mb")]
     pub max_file_size_mb: u64,
+
+    /// Phase 4.4 follow-up — number of rotated old WAL segments to
+    /// keep on disk alongside the active file. `0` keeps the legacy
+    /// in-place truncate behaviour (old contents discarded). Positive
+    /// `N` renames `jihuan.wal` → `jihuan.wal.1` on each checkpoint,
+    /// shifting existing `.1` → `.2` etc., pruning anything past
+    /// `jihuan.wal.N`. The rotated segments are **not** replayed on
+    /// startup — redb's per-transaction fsync is source of truth;
+    /// the archives exist for forensic replay and compliance.
+    #[serde(default = "default_wal_keep_old_logs")]
+    pub keep_old_logs: u32,
 }
 
 impl Default for WalConfig {
@@ -325,6 +336,7 @@ impl Default for WalConfig {
             checkpoint_enabled: default_wal_checkpoint_enabled(),
             checkpoint_interval_secs: default_wal_checkpoint_interval_secs(),
             max_file_size_mb: default_wal_max_file_size_mb(),
+            keep_old_logs: default_wal_keep_old_logs(),
         }
     }
 }
@@ -337,6 +349,9 @@ fn default_wal_checkpoint_interval_secs() -> u64 {
 }
 fn default_wal_max_file_size_mb() -> u64 {
     64
+}
+fn default_wal_keep_old_logs() -> u32 {
+    3
 }
 
 /// Server configuration
@@ -419,6 +434,17 @@ pub struct RateLimitConfig {
     /// Maximum burst size (initial bucket capacity).
     #[serde(default = "default_rate_burst")]
     pub burst: u32,
+
+    /// Phase 4.3 follow-up — switch to `SmartIpKeyExtractor`, which
+    /// reads `Forwarded` / `X-Forwarded-For` / `X-Real-IP` headers
+    /// before falling back to the peer socket IP. **Leave `false` for
+    /// direct-socket deployments** — otherwise an attacker can spoof
+    /// the header to bypass the limiter. Flip to `true` only when the
+    /// server is behind a trusted reverse proxy (Caddy/nginx/ALB)
+    /// that *overwrites* the client-supplied header with the real
+    /// peer IP.
+    #[serde(default)] // defaults to false
+    pub trust_forwarded_for: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -427,6 +453,7 @@ impl Default for RateLimitConfig {
             enabled: false,
             per_ip_per_sec: default_rate_per_ip_per_sec(),
             burst: default_rate_burst(),
+            trust_forwarded_for: false,
         }
     }
 }
@@ -905,6 +932,9 @@ mod tests {
         assert!(cfg.storage.wal.checkpoint_enabled);
         assert_eq!(cfg.storage.wal.checkpoint_interval_secs, 300);
         assert_eq!(cfg.storage.wal.max_file_size_mb, 64);
+        // Phase 4.4 follow-up: keep 3 rotated archives by default so
+        // `jihuan.wal.1/.2/.3` are available for forensic replay.
+        assert_eq!(cfg.storage.wal.keep_old_logs, 3);
     }
 
     #[test]
@@ -914,6 +944,11 @@ mod tests {
         assert!(!cfg.server.rate_limit.enabled);
         assert_eq!(cfg.server.rate_limit.per_ip_per_sec, 50);
         assert_eq!(cfg.server.rate_limit.burst, 100);
+        // Phase 4.3 follow-up: trust_forwarded_for defaults to false
+        // (XFF spoofing is the default-deny posture for direct-socket
+        // deployments; operators opt in after putting the server
+        // behind a trusted reverse proxy).
+        assert!(!cfg.server.rate_limit.trust_forwarded_for);
     }
 
     #[test]
