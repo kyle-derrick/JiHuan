@@ -11,6 +11,7 @@ use jihuan_core::{config::AppConfig, Engine};
 mod grpc;
 mod http;
 mod service;
+mod tls;
 
 #[derive(Parser, Debug)]
 #[command(name = "jihuan-server", version, about = "JiHuan storage server")]
@@ -280,12 +281,33 @@ async fn main() -> anyhow::Result<()> {
         grpc::admin_service::AdminServiceImpl::new(engine.clone()),
         grpc_interceptor,
     );
-    let grpc_server = tonic::transport::Server::builder()
-        .add_service(file_svc)
-        .add_service(admin_svc);
 
-    tracing::info!("HTTP server listening on {}", http_addr);
-    tracing::info!("gRPC server listening on {}", grpc_addr);
+    // Phase 3 — resolve TLS material once and share it between HTTP and
+    // gRPC so operators only manage a single certificate pair. Returns
+    // `None` when `tls.enabled = false`, in which case both listeners
+    // fall back to plaintext.
+    let tls_material = tls::load(&config.tls)
+        .map_err(|e| anyhow::anyhow!("TLS setup failed: {:#}", e))?;
+    if let Some(ref m) = tls_material {
+        let source = if !config.tls.cert_path.trim().is_empty() {
+            "static PEM files"
+        } else {
+            "auto-generated self-signed (dev-only, ephemeral)"
+        };
+        tracing::info!(
+            fingerprint = %m.fingerprint_sha256,
+            source = %source,
+            "TLS enabled for HTTP + gRPC"
+        );
+    }
+
+    let scheme = if tls_material.is_some() { "https" } else { "http" };
+    tracing::info!("HTTP server listening on {}://{}", scheme, http_addr);
+    tracing::info!(
+        "gRPC server listening on {}://{}",
+        if tls_material.is_some() { "grpcs" } else { "grpc" },
+        grpc_addr
+    );
 
     // ── Graceful shutdown ────────────────────────────────────────────────────
     //
@@ -330,34 +352,95 @@ async fn main() -> anyhow::Result<()> {
     let mut grpc_rx = shutdown_tx.subscribe();
     let shutdown_tx_signal = shutdown_tx.clone();
 
-    let http_handle = tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(http_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error = %e, "HTTP bind failed");
-                return;
+    // HTTP listener: plaintext via `axum::serve`, or TLS via
+    // `axum_server::bind_rustls`. The TLS branch can't reuse our
+    // tokio `TcpListener` because axum-server expects to own the
+    // accept loop; instead it binds the socket itself from `http_addr`.
+    let http_handle = {
+        let tls_for_http = tls_material.clone();
+        tokio::spawn(async move {
+            if let Some(m) = tls_for_http {
+                let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(
+                    m.server_config.clone(),
+                );
+                // axum-server's Handle drives graceful shutdown — we
+                // call `graceful_shutdown(None)` when the broadcast
+                // signal fires, then the serve future completes.
+                let handle = axum_server::Handle::new();
+                let handle_for_shutdown = handle.clone();
+                tokio::spawn(async move {
+                    let _ = http_rx.recv().await;
+                    handle_for_shutdown.graceful_shutdown(Some(
+                        std::time::Duration::from_secs(30),
+                    ));
+                });
+                if let Err(e) = axum_server::bind_rustls(http_addr, rustls_cfg)
+                    .handle(handle)
+                    .serve(http_router.into_make_service())
+                    .await
+                {
+                    tracing::error!(error = %e, "HTTPS server error");
+                }
+            } else {
+                let listener = match tokio::net::TcpListener::bind(http_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(error = %e, "HTTP bind failed");
+                        return;
+                    }
+                };
+                if let Err(e) = axum::serve(listener, http_router)
+                    .with_graceful_shutdown(async move {
+                        let _ = http_rx.recv().await;
+                    })
+                    .await
+                {
+                    tracing::error!(error = %e, "HTTP server error");
+                }
             }
-        };
-        if let Err(e) = axum::serve(listener, http_router)
-            .with_graceful_shutdown(async move {
-                let _ = http_rx.recv().await;
-            })
-            .await
-        {
-            tracing::error!(error = %e, "HTTP server error");
-        }
-    });
+        })
+    };
 
-    let grpc_handle = tokio::spawn(async move {
-        if let Err(e) = grpc_server
-            .serve_with_shutdown(grpc_addr, async move {
-                let _ = grpc_rx.recv().await;
-            })
-            .await
-        {
-            tracing::error!(error = %e, "gRPC server error");
-        }
-    });
+    // gRPC listener. tonic 0.12 requires `tls_config` to be applied to
+    // the `Server` *before* `add_service`, so we assemble the Router
+    // here rather than earlier. Under auto-selfsigned the gRPC cert is
+    // regenerated independently from the HTTP one — harmless because
+    // neither is persisted and clients don't pin ephemeral certs.
+    let grpc_handle = {
+        let tls_for_grpc = tls_material.clone();
+        let grpc_tls_cfg = config.tls.clone();
+        tokio::spawn(async move {
+            let mut builder = tonic::transport::Server::builder();
+            if tls_for_grpc.is_some() {
+                match tls::grpc_identity(&grpc_tls_cfg) {
+                    Ok(identity) => {
+                        match builder.tls_config(
+                            tonic::transport::ServerTlsConfig::new().identity(identity),
+                        ) {
+                            Ok(b) => builder = b,
+                            Err(e) => {
+                                tracing::error!(error = %e, "gRPC TLS config failed");
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "gRPC TLS setup failed");
+                        return;
+                    }
+                }
+            }
+            let router = builder.add_service(file_svc).add_service(admin_svc);
+            if let Err(e) = router
+                .serve_with_shutdown(grpc_addr, async move {
+                    let _ = grpc_rx.recv().await;
+                })
+                .await
+            {
+                tracing::error!(error = %e, "gRPC server error");
+            }
+        })
+    };
 
     // Block on signal, then fan out shutdown to both servers.
     shutdown_signal.await;

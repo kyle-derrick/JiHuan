@@ -379,6 +379,46 @@ fn default_cors_origins() -> Vec<String> {
     Vec::new()
 }
 
+/// TLS / HTTPS configuration (Phase 3).
+///
+/// When `enabled=true` the server terminates TLS for both HTTP and gRPC
+/// listeners using the same certificate+key pair. When `enabled=false`
+/// both listeners fall back to plaintext — which is the correct choice
+/// behind a reverse proxy (Caddy / nginx / Traefik) that already does
+/// TLS termination.
+///
+/// # Certificate sources
+///
+/// * **Static files** (`cert_path` + `key_path`): both PEM-encoded.
+///   `cert_path` may contain a chain (leaf first); `key_path` holds a
+///   single PKCS#8 or RSA private key.
+/// * **`auto_selfsigned = true`** (dev-only escape hatch): the server
+///   generates a short-lived self-signed cert for `localhost` / `127.0.0.1`
+///   via the `rcgen` crate on every boot. Never enable this in
+///   production — the cert is not persisted and clients will see
+///   `ERR_CERT_AUTHORITY_INVALID` until they pin it manually.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Master switch. Default: **false** (plaintext).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// PEM-encoded certificate chain (leaf-first). Empty ⇒ use
+    /// `auto_selfsigned` or refuse to start when `enabled=true`.
+    #[serde(default)]
+    pub cert_path: String,
+
+    /// PEM-encoded PKCS#8 or RSA private key.
+    #[serde(default)]
+    pub key_path: String,
+
+    /// Dev-only: generate a self-signed certificate at startup for
+    /// `localhost` / `127.0.0.1`. Mutually exclusive with non-empty
+    /// `cert_path` (static files win).
+    #[serde(default)]
+    pub auto_selfsigned: bool,
+}
+
 /// Top-level application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -386,6 +426,11 @@ pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Phase 3 — TLS/HTTPS. Defaults to disabled so upgrades from
+    /// v0.4.x remain plaintext-compatible; flip `tls.enabled = true`
+    /// and supply a cert to move the single-port listener to HTTPS.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 impl AppConfig {
@@ -483,6 +528,28 @@ impl AppConfig {
             return Err(JiHuanError::Config(
                 "auto_compact_undersize_ratio must be between 0.0 and 1.0".into(),
             ));
+        }
+
+        // Phase 3 — TLS sanity: when enabled, operator must supply either
+        // a static cert pair *or* opt in to auto-selfsigned. `cert_path`
+        // and `key_path` must both be present together — a half-configured
+        // pair is almost always a copy-paste error.
+        let t = &self.tls;
+        if t.enabled {
+            let has_cert = !t.cert_path.trim().is_empty();
+            let has_key = !t.key_path.trim().is_empty();
+            if has_cert != has_key {
+                return Err(JiHuanError::Config(
+                    "tls.cert_path and tls.key_path must be set together".into(),
+                ));
+            }
+            if !has_cert && !t.auto_selfsigned {
+                return Err(JiHuanError::Config(
+                    "tls.enabled = true but no certificate source configured: set \
+                     tls.cert_path + tls.key_path, or tls.auto_selfsigned = true for dev"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -598,6 +665,7 @@ impl ConfigTemplate {
                 request_timeout_secs: default_request_timeout_secs(),
             },
             auth: AuthConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -642,6 +710,47 @@ mod tests {
         let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
         cfg.storage.chunk_size = cfg.storage.block_file_size + 1;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_defaults_disabled() {
+        // Phase 3: plaintext-by-default so v0.4 configs keep working.
+        let dir = tempdir().unwrap();
+        let cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        assert!(!cfg.tls.enabled);
+        assert!(cfg.tls.cert_path.is_empty());
+        assert!(cfg.tls.key_path.is_empty());
+        assert!(!cfg.tls.auto_selfsigned);
+    }
+
+    #[test]
+    fn test_tls_validation_rejects_enabled_without_source() {
+        let dir = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        cfg.tls.enabled = true;
+        // Neither cert_path nor auto_selfsigned — must fail.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.enabled"), "got: {err}");
+    }
+
+    #[test]
+    fn test_tls_validation_rejects_half_configured_pair() {
+        let dir = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = "/etc/jihuan/cert.pem".to_string();
+        // key_path intentionally empty
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cert_path") && err.contains("key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn test_tls_validation_accepts_auto_selfsigned() {
+        let dir = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        cfg.tls.enabled = true;
+        cfg.tls.auto_selfsigned = true;
+        cfg.validate().unwrap();
     }
 
     #[test]

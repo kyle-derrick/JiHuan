@@ -63,9 +63,16 @@ axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = { version = "0.4", features = ["util", "timeout"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs", "timeout"] }
 hyper = { version = "1", features = ["full"] }
+# Phase 3 — TLS/HTTPS termination inside the server process (single-port
+# axum + tonic both use rustls). Pinned to versions compatible with the
+# existing axum 0.7 / tonic 0.12 stack.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
 
 # gRPC
-tonic = { version = "0.12", features = ["transport", "codegen"] }
+tonic = { version = "0.12", features = ["transport", "codegen", "tls"] }
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"

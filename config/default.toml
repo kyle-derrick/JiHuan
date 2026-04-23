@@ -57,3 +57,18 @@ exempt_routes = ["/api/status", "/ui"]
 # Retention window for audit-log rows. 0 = keep forever. The background GC
 # loop purges events older than (now - audit_retention_days * 86400s).
 audit_retention_days = 90
+# Emit the `Secure` flag on session cookies. Keep `false` for plain-HTTP
+# dev; flip to `true` once you terminate TLS (either via [tls] below or a
+# reverse proxy), otherwise the browser silently drops the cookie.
+cookie_secure = false
+
+# Phase 3 — TLS/HTTPS. Default is off so v0.4.x configs keep working
+# as plaintext. Two ways to turn it on:
+#   1. Static PEM files (production): set cert_path + key_path.
+#   2. Auto self-signed (dev only): set auto_selfsigned = true.
+# See docs/operator-guide.md § 9b for full details + reverse-proxy examples.
+[tls]
+enabled         = false
+cert_path       = ""
+key_path        = ""
+auto_selfsigned = false

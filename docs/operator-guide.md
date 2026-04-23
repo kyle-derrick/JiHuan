@@ -255,11 +255,131 @@ footer is a one-off operation; open a ticket if you need it, and bring:
 
 ---
 
+## 9b. TLS / HTTPS (Phase 3, v0.5.0)
+
+`jihuan-server` can terminate TLS in-process for **both** the HTTP REST
+API and the gRPC endpoint using a single certificate pair. Plaintext
+remains the default so upgrades from v0.4.x don't change behaviour
+until you opt in.
+
+### 9b.1 Production: static PEM files
+
+Put a certificate chain + private key on disk (obtained from Let's
+Encrypt, your internal CA, etc.) and point the config at them:
+
+```toml
+[tls]
+enabled        = true
+cert_path      = "/etc/jihuan/tls/fullchain.pem"
+key_path       = "/etc/jihuan/tls/privkey.pem"
+auto_selfsigned = false
+```
+
+Accepted key formats: **PKCS#8**, **PKCS#1 RSA**, and **SEC1 EC**. The
+certificate file may contain intermediate CAs in chain order (leaf
+first). Rotation is done out-of-band — after replacing the PEM files
+just restart the server (`systemctl restart jihuan`). A hot reload is
+tracked under the Phase 4 roadmap.
+
+Also flip `auth.cookie_secure = true` once you're behind TLS, otherwise
+browsers silently drop the session cookie during HTTPS redirects.
+
+### 9b.2 Dev: auto-generated self-signed cert
+
+Useful when you want to exercise the HTTPS code path locally without
+touching a CA:
+
+```toml
+[tls]
+enabled         = true
+auto_selfsigned = true
+```
+
+`jihuan-server` generates a fresh cert for `localhost` / `127.0.0.1`
+/ `::1` on every boot (via the `rcgen` crate) and prints its SHA-256
+fingerprint to the logs:
+
+```
+INFO jihuan_server: TLS enabled for HTTP + gRPC
+  fingerprint="ab12…cd34" source="auto-generated self-signed (dev-only, ephemeral)"
+```
+
+Clients will see `ERR_CERT_AUTHORITY_INVALID` until they pin the cert
+manually — do **not** use this in production. Use `curl -k` or import
+the printed fingerprint into your browser's trust store for day-to-day
+dev work.
+
+### 9b.3 Reverse proxy (recommended at scale)
+
+For multi-node deployments, SNI routing, OCSP stapling, or staple TLS
+termination on a dedicated edge tier, put `jihuan-server` behind
+Caddy / nginx / Traefik and leave `tls.enabled = false`:
+
+```caddy
+# Caddy
+jihuan.example.com {
+    reverse_proxy /api/* localhost:8080
+    reverse_proxy /ui/*  localhost:8080
+}
+```
+
+```nginx
+# nginx — HTTP + gRPC share the backend so we just need one upstream.
+server {
+    listen 443 ssl http2;
+    server_name jihuan.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/jihuan/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/jihuan/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        # Large uploads: disable buffering + extend timeouts.
+        client_max_body_size    2G;
+        proxy_request_buffering off;
+        proxy_read_timeout      600s;
+    }
+}
+
+# gRPC needs its own vhost on a dedicated port.
+server {
+    listen 50443 ssl http2;
+    server_name jihuan.example.com;
+    ssl_certificate     /etc/letsencrypt/live/jihuan/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/jihuan/privkey.pem;
+
+    location / {
+        grpc_pass grpc://127.0.0.1:50051;
+    }
+}
+```
+
+Behind any proxy, remember to also set `auth.cookie_secure = true` so
+the UI session cookie carries the `Secure` flag.
+
+### 9b.4 Smoke test
+
+```powershell
+# Static PEM path — fingerprint visible at startup
+$env:JIHUAN_CONFIG = "config/default.toml"  # with [tls] enabled = true
+./target/release/jihuan-server &
+curl -k --cacert /etc/jihuan/tls/fullchain.pem https://localhost:8080/healthz
+grpcurl -cacert /etc/jihuan/tls/fullchain.pem \
+        -H "authorization: Bearer $env:JH_KEY" \
+        localhost:50051 jihuan.admin.v1.AdminService/GetStatus
+```
+
+---
+
 ## 10. Known Limits / Next Steps
 
 | Area | Status | Owner phase |
 |---|---|---|
-| TLS | planned | Phase 3 |
+| TLS | **implemented** (Phase 3; in-process rustls for HTTP + gRPC, static PEM or dev auto-selfsigned) | v0.5.0 |
 | Graceful shutdown | **implemented** (SIGINT/SIGTERM → seal block + fsync WAL, 30 s drain) | — |
 | Health probes | planned | Phase 4 |
 | Rate limiting | planned | Phase 4 |
