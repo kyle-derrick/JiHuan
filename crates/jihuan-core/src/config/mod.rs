@@ -69,6 +69,10 @@ fn default_gc_interval_secs() -> u64 {
     300 // 5 minutes
 }
 
+fn default_scrub_interval_hours() -> u64 {
+    168 // weekly; 0 disables the scheduler
+}
+
 fn default_auto_compact_threshold() -> f64 {
     0.5
 }
@@ -185,6 +189,14 @@ pub struct StorageConfig {
     /// GC background scan interval in seconds
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
+
+    /// Phase 4.5 follow-up — run [`Engine::scrub`] automatically every
+    /// N hours. `0` disables the scheduler (operators must `POST
+    /// /api/admin/scrub` manually). The scan is I/O-bound (~1 GB/s on
+    /// warm SSD); pick a cadence that finishes well inside one
+    /// interval for your data size. Default: **168** (weekly).
+    #[serde(default = "default_scrub_interval_hours")]
+    pub scrub_interval_hours: u64,
 
     /// Maximum number of concurrently open block files
     #[serde(default = "default_max_open_block_files")]
@@ -771,6 +783,7 @@ impl ConfigTemplate {
                 time_partition_hours: 24,
                 gc_threshold: 0.7,
                 gc_interval_secs: 300,
+                scrub_interval_hours: default_scrub_interval_hours(),
                 max_open_block_files: 64,
                 verify_on_read: true,
                 max_storage_bytes: None,
@@ -872,6 +885,15 @@ mod tests {
         // key_path intentionally empty
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("cert_path") && err.contains("key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn test_scrub_scheduler_defaults_to_weekly() {
+        // Phase 4.5 follow-up: default cadence is 168 h (weekly).
+        // `0` would mean "disable the scheduler" — not the default.
+        let dir = tempdir().unwrap();
+        let cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        assert_eq!(cfg.storage.scrub_interval_hours, 168);
     }
 
     #[test]

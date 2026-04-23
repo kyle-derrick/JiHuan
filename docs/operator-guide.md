@@ -526,6 +526,32 @@ curl -X POST -H "authorization: Bearer $env:JH_KEY" https://localhost:8080/api/a
 
 ---
 
+## 9d. Partition ACL enforcement (Phase 7.2)
+
+Each `User` and `ServiceAccount` carries an
+`allowed_partitions: Option<Vec<String>>` allow-list. Semantics:
+
+| Value | Effect |
+|---|---|
+| `None` | No restriction (legacy / pre-IAM; also the admin default). |
+| `Some([])` | Explicitly zero partitions → **denies every request** including uploads (MinIO-style "SA pinned to no bucket"). |
+| `Some(["<id>", …])` | Target partition's `partition_id.to_string()` must appear. |
+
+Enforcement points (all return **403** on mismatch):
+
+- `POST /api/v1/files` — target = current time partition (server computes).
+- `GET /api/v1/files/:id` — target = file's own `partition_id`.
+- `GET /api/v1/files/:id/meta` — same as download.
+- `DELETE /api/v1/files/:id` — same as download.
+- `GET /api/v1/files` — silently filters results; `total` reflects
+  the caller's view, not the raw store.
+
+The child-grant check at `POST /api/auth/keys` refuses to mint a SA
+whose `allowed_partitions` exceeds the parent user's set — the
+intersection is enforced before persistence.
+
+---
+
 ## 10. Known Limits / Next Steps
 
 | Area | Status | Owner phase |
@@ -535,7 +561,8 @@ curl -X POST -H "authorization: Bearer $env:JH_KEY" https://localhost:8080/api/a
 | Health probes | **implemented** (`/healthz` always 200, `/readyz` 503→200) | v0.5.1 |
 | Rate limiting | **implemented** (tower_governor, per-IP, probes/login exempt) | v0.5.1 |
 | Block scrub | **implemented** (`POST /api/admin/scrub`, CRC + content-hash) | v0.5.1 |
-| Scrub scheduler | planned (`gc.scrub_interval_hours`) | Phase 4.5 follow-up |
+| Scrub scheduler | **implemented** (`storage.scrub_interval_hours`, weekly default) | v0.5.1 |
+| Partition ACL enforcement | **implemented** (`allowed_partitions`; upload/get/delete/stat/list) | v0.5.1 |
 | WAL checkpoint/rotation | **implemented** (periodic + size-based truncate; default on) | v0.5.1 |
 | Backup/restore CLI | **implemented** (`jihuan export/import/backup-verify`, offline tar.gz) | v0.5.1 |
 | Audit retention auto-purge | partial (purge fn exists, no scheduler) | Phase 4 |

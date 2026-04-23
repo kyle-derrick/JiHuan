@@ -777,6 +777,57 @@ impl Engine {
         }))
     }
 
+    /// Phase 4.5 follow-up — spawn the periodic scrub task.
+    ///
+    /// Driven by `storage.scrub_interval_hours`. `0` (or no config)
+    /// disables the scheduler; operators can still POST
+    /// `/api/admin/scrub` manually. The scan runs on a blocking
+    /// thread so it doesn't stall the async runtime; a scan in flight
+    /// when the next tick fires is allowed to finish (no overlapping
+    /// runs).
+    pub fn start_scrub_task(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let hours = self.config.storage.scrub_interval_hours;
+        if hours == 0 {
+            return None;
+        }
+        let period = std::time::Duration::from_secs(hours.saturating_mul(3600));
+        let engine = self.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // consume immediate first tick
+            loop {
+                ticker.tick().await;
+                let e = engine.clone();
+                let res = tokio::task::spawn_blocking(move || e.scrub()).await;
+                match res {
+                    Ok(Ok(report)) => {
+                        if report.chunks_corrupt > 0 || report.blocks_failed > 0 {
+                            tracing::error!(
+                                blocks_failed = report.blocks_failed,
+                                chunks_corrupt = report.chunks_corrupt,
+                                chunks_checked = report.chunks_checked,
+                                elapsed_ms = report.elapsed_ms,
+                                "scheduled scrub: DETECTED CORRUPTION"
+                            );
+                        } else {
+                            tracing::info!(
+                                blocks_checked = report.blocks_checked,
+                                chunks_checked = report.chunks_checked,
+                                elapsed_ms = report.elapsed_ms,
+                                "scheduled scrub: clean"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "scheduled scrub failed"),
+                    Err(e) => tracing::warn!(error = %e, "scheduled scrub task panicked"),
+                }
+            }
+        }))
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Write path
     // ─────────────────────────────────────────────────────────────────────────
@@ -4387,6 +4438,18 @@ gc_threshold = 0.7
         // Next_seq is now >= 1, so checkpoint should truncate.
         let truncated = engine.checkpoint_wal().unwrap();
         assert!(truncated, "WAL with records should be truncated when size gate is off");
+    }
+
+    #[test]
+    fn test_start_scrub_task_none_when_disabled() {
+        // Phase 4.5 follow-up: `scrub_interval_hours = 0` means
+        // "scheduler off" — start_scrub_task must return None so the
+        // zero-overhead path is observable (no spawned task handle).
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.scrub_interval_hours = 0;
+        let engine = Arc::new(Engine::open(cfg).unwrap());
+        assert!(engine.start_scrub_task().is_none());
     }
 
     #[test]

@@ -73,6 +73,13 @@ cert_path       = ""
 key_path        = ""
 auto_selfsigned = false
 
+# Phase 4.5 follow-up — periodic block-integrity scrub schedule.
+# `0` disables the scheduler entirely; operators can still run scrub
+# on demand via `POST /api/admin/scrub`. Clean runs log at INFO;
+# detected corruption logs at ERROR with block_id / chunk_hash.
+# This knob lives under `[storage]` since scrub walks the block store.
+# scrub_interval_hours = 168   # weekly; uncomment to override default
+
 # Phase 4.4 — WAL checkpoint + size-based rotation.
 # The background task wakes every checkpoint_interval_secs and
 # truncates the WAL in place once it exceeds max_file_size_mb.

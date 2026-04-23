@@ -180,6 +180,46 @@ pub fn require_scope(key: &AuthedKey, required: &str) -> Result<(), AppError> {
     }
 }
 
+/// Phase 7.2 — verify the caller is allowed to operate on the time
+/// partition `partition_id`.
+///
+/// Semantics (matches `metadata/store.rs` multimap key encoding):
+/// * `allowed_partitions == None`  ⇒ no restriction (legacy behaviour).
+/// * `allowed_partitions == Some(list)` ⇒ `partition_id.to_string()`
+///   must appear verbatim in `list`. An empty `list` therefore denies
+///   every partition, including the current one — this is by design
+///   (matches the MinIO-style "ServiceAccount pinned to no bucket"
+///   model).
+///
+/// Used by upload (target partition = current), download / stat /
+/// delete (target partition = file's own `partition_id`).
+pub fn require_partition(key: &AuthedKey, partition_id: u64) -> Result<(), AppError> {
+    let Some(ref allowed) = key.0.allowed_partitions else {
+        return Ok(());
+    };
+    if allowed.iter().any(|p| p == &partition_id.to_string()) {
+        Ok(())
+    } else {
+        Err(AppError {
+            status: StatusCode::FORBIDDEN,
+            message: format!(
+                "partition {} is not in caller's allow-list",
+                partition_id
+            ),
+        })
+    }
+}
+
+/// Phase 7.2 — return `true` iff the caller is allowed to see files
+/// in `partition_id`. Intended for silent filtering of list results
+/// (where 403 on the whole request would be too noisy).
+pub fn partition_visible(key: &AuthedKey, partition_id: u64) -> bool {
+    match &key.0.allowed_partitions {
+        None => true,
+        Some(list) => list.iter().any(|p| p == &partition_id.to_string()),
+    }
+}
+
 // ─── Auth state shared via axum Extension ─────────────────────────────────────
 
 #[derive(Clone)]
@@ -1009,4 +1049,76 @@ pub async fn change_password(
         Some(204),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jihuan_core::metadata::types::ApiKeyMeta;
+
+    fn make_key(allowed: Option<Vec<String>>) -> AuthedKey {
+        AuthedKey(ApiKeyMeta {
+            key_id: "k".into(),
+            name: "n".into(),
+            key_hash: "h".into(),
+            key_prefix: "p".into(),
+            created_at: 0,
+            last_used_at: 0,
+            enabled: true,
+            scopes: vec!["read".into(), "write".into()],
+            parent_user: String::new(),
+            allowed_partitions: allowed,
+            expires_at: None,
+        })
+    }
+
+    #[test]
+    fn test_require_partition_none_is_unrestricted() {
+        // Phase 7.2: legacy pre-IAM keys have allowed_partitions=None
+        // and must pass through unchanged — this is the backwards-
+        // compatible fast path.
+        let key = make_key(None);
+        assert!(require_partition(&key, 0).is_ok());
+        assert!(require_partition(&key, 42).is_ok());
+        assert!(require_partition(&key, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn test_require_partition_allows_listed_ids() {
+        let key = make_key(Some(vec!["42".into(), "1000".into()]));
+        assert!(require_partition(&key, 42).is_ok());
+        assert!(require_partition(&key, 1000).is_ok());
+    }
+
+    #[test]
+    fn test_require_partition_rejects_unlisted() {
+        let key = make_key(Some(vec!["42".into()]));
+        let err = require_partition(&key, 7).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(err.message.contains("partition 7"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_require_partition_empty_vec_denies_everything() {
+        // Explicit empty list = MinIO-style "SA pinned to no bucket".
+        // Must still deny — not a bug, a documented feature.
+        let key = make_key(Some(Vec::new()));
+        assert!(require_partition(&key, 0).is_err());
+        assert!(require_partition(&key, 42).is_err());
+    }
+
+    #[test]
+    fn test_partition_visible_agrees_with_require() {
+        for allowed in [None, Some(vec![]), Some(vec!["5".into(), "10".into()])] {
+            let key = make_key(allowed);
+            for pid in 0u64..20 {
+                assert_eq!(
+                    partition_visible(&key, pid),
+                    require_partition(&key, pid).is_ok(),
+                    "pid={pid} allowed={:?}",
+                    key.0.allowed_partitions
+                );
+            }
+        }
+    }
 }

@@ -160,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
     // in place once it exceeds `storage.wal.max_file_size_mb`. `None`
     // when disabled in config so the default path pays zero overhead.
     let _wal_checkpoint_handle = engine.start_wal_checkpoint_task();
+    // Phase 4.5 follow-up: periodic block-integrity scrub. Disabled
+    // when `storage.scrub_interval_hours == 0`; otherwise logs a
+    // ScrubReport at each tick (INFO clean / ERROR on corruption).
+    let _scrub_handle = engine.start_scrub_task();
 
     // v0.5.0-iam bootstrap: when auth is enabled, ensure a root user exists.
     // Policy:

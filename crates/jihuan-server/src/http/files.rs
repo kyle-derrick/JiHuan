@@ -174,6 +174,19 @@ pub async fn list_files(
     // keep original total for no-filter case
     let _ = total;
 
+    // Phase 7.2 — pre-filter by partition ACL *before* text search,
+    // sort, and pagination. `None` allowed_partitions keeps the legacy
+    // fast path (no per-item clone), but `Some(list)` narrows the
+    // catalogue silently — the caller sees only what they're entitled
+    // to and the `total` count reflects their view, not the raw store.
+    let all: Vec<_> = if caller.0.allowed_partitions.is_some() {
+        all.into_iter()
+            .filter(|m| crate::http::auth::partition_visible(&caller, m.partition_id))
+            .collect()
+    } else {
+        all
+    };
+
     // Filter
     let mut filtered: Vec<_> = if let Some(query) = q.q.as_ref().map(|s| s.to_lowercase()) {
         all.into_iter()
@@ -234,6 +247,12 @@ pub async fn upload_file(
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, AppError> {
     require_scope(&caller, "write")?;
+    // Phase 7.2 — new uploads always land in the current time bucket.
+    // Check the caller is permitted there *before* we start streaming.
+    let current_partition = jihuan_core::utils::current_partition_id(
+        engine.config().storage.time_partition_hours,
+    );
+    crate::http::auth::require_partition(&caller, current_partition)?;
 
     let mut file_id_field: Option<String> = None;
     let mut on_conflict_field: Option<String> = None;
@@ -425,6 +444,11 @@ pub async fn download_file(
             .map_err(AppError::from_jihuan)?
     };
     let meta = meta.ok_or_else(|| AppError::not_found(&file_id))?;
+    // Phase 7.2 — partition ACL on download. We do the check here
+    // (after resolving FileMeta) because the file's own `partition_id`
+    // is the target, not the caller's current time bucket. Caller
+    // without permission sees the same 403 they would on upload.
+    crate::http::auth::require_partition(&caller, meta.partition_id)?;
 
     let content_type = meta
         .content_type
@@ -579,6 +603,18 @@ pub async fn delete_file(
     Path(file_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_scope(&caller, "write")?;
+    // Phase 7.2 — partition ACL on delete. Look up the file's own
+    // partition before mutating anything; returning 404 for a missing
+    // file is fine (no information leak — absence is observable via
+    // list-with-filter anyway), but 403 otherwise.
+    let (e1, fid1) = (engine.clone(), file_id.clone());
+    let meta = tokio::task::spawn_blocking(move || e1.get_file_meta(&fid1))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(AppError::from_jihuan)?
+        .ok_or_else(|| AppError::not_found(&file_id))?;
+    crate::http::auth::require_partition(&caller, meta.partition_id)?;
+
     tokio::task::spawn_blocking(move || engine.delete_file(&file_id))
         .await
         .map_err(|e| AppError::internal(e.to_string()))?
@@ -604,6 +640,11 @@ pub async fn get_file_meta(
         .map_err(|e| AppError::internal(e.to_string()))?
         .map_err(AppError::from_jihuan)?
         .ok_or_else(|| AppError::not_found(&file_id))?;
+    // Phase 7.2 — partition ACL on stat/meta. Symmetric with download:
+    // a caller who can't see the bytes shouldn't see the chunk layout
+    // either (it'd leak block layout / dedup state for restricted
+    // partitions).
+    crate::http::auth::require_partition(&caller, meta.partition_id)?;
 
     // v0.4.8: ChunkMeta no longer carries an explicit `index` field
     // (derive it from the Vec position) and `original_size` is now
