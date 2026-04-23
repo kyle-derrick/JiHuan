@@ -6,8 +6,91 @@ use sha2::Sha256;
 use crate::config::HashAlgorithm;
 use crate::utils::to_hex;
 
+/// v0.4.8: canonical in-memory / on-wire representation of a chunk hash.
+///
+/// We standardise on 32 raw bytes to fit SHA-256 (the default and
+/// recommended algorithm) exactly, while still accommodating the legacy
+/// MD5 (16 B) and SHA-1 (20 B) options by left-aligning the raw digest
+/// and zero-padding the remainder. The padding costs 12-16 wasted bytes
+/// per chunk under the legacy algorithms, but they are rarely used in
+/// practice — the upside of a fixed-size representation is that it
+/// serialises as exactly 32 bytes under bincode (vs 65 bytes for the
+/// hex-string form: 1-byte length prefix + 64 ASCII chars), saving
+/// ~32 B per `ChunkMeta`.
+pub const HASH_BYTES: usize = 32;
+
+/// Alias for a fixed-size chunk hash. Callers that need `Option` semantics
+/// (to represent "dedup disabled, no hash computed") use
+/// `Option<HashBytes>`; places that only ever run with dedup on (e.g.
+/// `DedupEntry.hash`) use the bare form.
+pub type HashBytes = [u8; HASH_BYTES];
+
+/// Format a `HashBytes` for logging / human consumption.
+///
+/// Returns the full 64-character lowercase hex representation. Callers
+/// that work with legacy MD5/SHA-1 algorithms are expected to know the
+/// active algorithm and trim the trailing zero-padding themselves if
+/// they want to surface just the meaningful prefix.
+#[inline]
+pub fn hash_to_hex(h: &HashBytes) -> String {
+    to_hex(h)
+}
+
+/// Parse a block-file `ChunkEntry`'s hex-ASCII hash back into a
+/// `HashBytes`. Short digests (MD5/SHA-1) are left-aligned with the
+/// trailing bytes zero-filled, matching the on-wire convention used by
+/// [`hash_chunk_bytes`]. Returns `None` for an empty input (the
+/// `HashAlgorithm::None` case) or when the hex string is malformed.
+pub fn hash_from_hex(hex_str: &str) -> Option<HashBytes> {
+    if hex_str.is_empty() {
+        return None;
+    }
+    let raw = hex::decode(hex_str).ok()?;
+    if raw.len() > HASH_BYTES {
+        return None;
+    }
+    let mut out = [0u8; HASH_BYTES];
+    out[..raw.len()].copy_from_slice(&raw);
+    Some(out)
+}
+
+/// Compute a content hash as a fixed-size byte array, left-aligned and
+/// zero-padded when the algorithm's native digest is shorter than 32 B.
+/// Returns `None` when dedup is disabled (`HashAlgorithm::None`).
+pub fn hash_chunk_bytes(data: &[u8], algo: HashAlgorithm) -> Option<HashBytes> {
+    let mut out = [0u8; HASH_BYTES];
+    match algo {
+        HashAlgorithm::None => return None,
+        HashAlgorithm::Md5 => {
+            let mut h = Md5::new();
+            h.update(data);
+            let d = h.finalize();
+            out[..d.len()].copy_from_slice(&d);
+        }
+        HashAlgorithm::Sha1 => {
+            let mut h = Sha1::new();
+            h.update(data);
+            let d = h.finalize();
+            out[..d.len()].copy_from_slice(&d);
+        }
+        HashAlgorithm::Sha256 => {
+            let mut h = Sha256::new();
+            h.update(data);
+            let d = h.finalize();
+            // d.len() == 32, so this copies the full array
+            out.copy_from_slice(&d);
+        }
+    }
+    Some(out)
+}
+
 /// Compute a content hash for the given data using the specified algorithm.
 /// Returns an empty string when the algorithm is None (dedup disabled).
+///
+/// v0.4.8: retained for block-file format (`ChunkEntry.hash: [u8; 64]`
+/// still uses hex ASCII for backwards compatibility with existing block
+/// files) and for log / audit output. New in-memory code paths should
+/// prefer [`hash_chunk_bytes`] to avoid the allocation + hex conversion.
 pub fn hash_chunk(data: &[u8], algo: HashAlgorithm) -> String {
     match algo {
         HashAlgorithm::None => String::new(),
@@ -39,11 +122,17 @@ pub fn verify_crc32(data: &[u8], expected: u32) -> bool {
     crc32(data) == expected
 }
 
-/// A combined integrity digest: CRC32 for fast corruption detection + content hash for dedup
+/// A combined integrity digest: CRC32 for fast corruption detection + content hash for dedup.
+///
+/// v0.4.8: the `hash` field is now `Option<HashBytes>` (32 raw bytes,
+/// left-aligned with zero-padding for MD5/SHA-1). `None` indicates
+/// dedup is disabled (`HashAlgorithm::None`). Downstream call sites
+/// check the `Option` rather than comparing against the legacy
+/// "empty string means disabled" sentinel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkDigest {
-    /// Content hash for deduplication (empty if HashAlgorithm::None)
-    pub hash: String,
+    /// Content hash for deduplication; `None` iff `HashAlgorithm::None`.
+    pub hash: Option<HashBytes>,
     /// CRC32 for fast integrity check
     pub crc32: u32,
 }
@@ -51,7 +140,7 @@ pub struct ChunkDigest {
 impl ChunkDigest {
     pub fn compute(data: &[u8], algo: HashAlgorithm) -> Self {
         Self {
-            hash: hash_chunk(data, algo),
+            hash: hash_chunk_bytes(data, algo),
             crc32: crc32(data),
         }
     }

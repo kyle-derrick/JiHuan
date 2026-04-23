@@ -441,7 +441,13 @@ pub async fn get_block_detail(
     let referencing_files: Vec<ReferencingFileDto> = files
         .into_iter()
         .filter_map(|f| {
-            let n = f.chunks.iter().filter(|c| c.block_id == block_id).count();
+            // v0.4.8: block_id pool membership decides if the file
+            // matches; we still count per-chunk occurrences to
+            // populate the `chunks` field below.
+            if !f.block_ids.iter().any(|b| b == &block_id) {
+                return None;
+            }
+            let n = f.chunks.iter().filter(|c| c.block_id(&f) == block_id).count();
             if n > 0 {
                 Some(ReferencingFileDto {
                     file_id: f.file_id,

@@ -151,14 +151,18 @@ impl GcService {
             stats.files_deleted += deleted_files.len() as u64;
             stats.partitions_deleted += 1;
 
-            // Decrement ref counts for all chunks in deleted files
+            // Decrement ref counts for all chunks in deleted files.
+            //
+            // v0.4.8: block_id is pooled in `FileMeta.block_ids`; resolve
+            // via the accessor so we pay no extra allocation per chunk.
             for file in &deleted_files {
                 for chunk in &file.chunks {
-                    match self.meta.update_block_ref_count(&chunk.block_id, -1) {
+                    let bid = chunk.block_id(file);
+                    match self.meta.update_block_ref_count(bid, -1) {
                         Ok(_) => {}
                         Err(JiHuanError::NotFound(_)) => {
                             tracing::warn!(
-                                block_id = %chunk.block_id,
+                                block_id = %bid,
                                 "GC: block not found when decrementing ref count"
                             );
                         }

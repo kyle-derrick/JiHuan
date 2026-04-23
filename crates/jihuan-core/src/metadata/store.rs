@@ -9,10 +9,14 @@ use redb::{
 use crate::error::{JiHuanError, Result};
 use crate::metadata::types::{ApiKeyMeta, AuditEvent, BlockMeta, DedupEntry, FileMeta};
 
-// Table definitions: key type → value type (both &[u8] for bincode-encoded blobs)
+// Table definitions: key → value (v0.4.8: values bincode-encoded blobs).
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const BLOCKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
-const DEDUP_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("dedup");
+// v0.4.8: key is now a raw 32-byte hash (was 64-char ASCII hex) to
+// match the in-memory `ChunkMeta.hash: Option<[u8; 32]>` representation
+// — saves ~32 B/key in the redb index and avoids a hex-encode on every
+// lookup/insert.
+const DEDUP_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dedup");
 const PARTITIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partitions");
 /// Maps partition_id →→ file_id (one-to-many). v0.4.6: switched from
 /// `TableDefinition<&str, Vec<String>>` to multimap so that a single
@@ -21,7 +25,7 @@ const PARTITIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("par
 /// representation flips from "encoded vec" to "independent entries".
 const PARTITION_FILES_TABLE: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("partition_files");
-/// Maps key_id → ApiKeyMeta (JSON-encoded)
+/// Maps key_id → ApiKeyMeta (bincode-encoded)
 const APIKEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("apikeys");
 /// Maps key_hash → key_id (for fast lookup by raw key hash)
 const APIKEY_HASH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("apikey_hash");
@@ -31,12 +35,30 @@ const APIKEY_HASH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("api
 /// events landing in the same second still have a stable ordering.
 const AUDIT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("audit");
 
+// v0.4.8: metadata persistence switched from `serde_json` to bincode
+// via its serde compatibility shim. Benefits:
+//   * Field names disappear from the wire → ~50% smaller rows for the
+//     typical `FileMeta.chunks[]` payload, which is the hot spot on
+//     small-file workloads.
+//   * Numeric fields become fixed-width little-endian → faster decode
+//     and no string allocation for number parsing.
+//   * `[u8; N]` serializes as `N` raw bytes instead of a JSON array of
+//     decimal digits, which unlocks the hash = `[u8; 32]` change.
+//
+// bincode 2.x uses a configurable encoding; we stick with
+// `bincode::config::standard()` (little-endian, variable-length integer
+// encoding) everywhere to keep one canonical byte layout across redb
+// values and the WAL frame.
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(v).map_err(|e| JiHuanError::Serialization(e.to_string()))
+    bincode::serde::encode_to_vec(v, bincode::config::standard())
+        .map_err(|e| JiHuanError::Serialization(e.to_string()))
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    serde_json::from_slice(bytes).map_err(|e| JiHuanError::Serialization(e.to_string()))
+    let (v, _consumed) =
+        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| JiHuanError::Serialization(e.to_string()))?;
+    Ok(v)
 }
 
 /// Thread-safe metadata store backed by redb
@@ -222,8 +244,9 @@ impl MetadataStore {
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             for entry in new_dedup_entries {
                 let bytes = encode(entry)?;
+                // v0.4.8: DEDUP_TABLE key is raw bytes (&[u8]), not hex.
                 dedup
-                    .insert(entry.hash.as_str(), bytes.as_slice())
+                    .insert(&entry.hash[..], bytes.as_slice())
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
         }
@@ -282,9 +305,11 @@ impl MetadataStore {
         // must be released. The hot path is the idempotent overwrite
         // where new chunks dedup onto the same blocks, so +1 − 1 nets
         // to 0 for that block and we skip the whole redb rewrite.
+        // v0.4.8: `chunk.block_id` is now resolved via the owning
+        // file's pool. Resolve once per chunk — cheap Vec index.
         for chunk in &old_file.chunks {
             *ref_count_deltas
-                .entry(chunk.block_id.clone())
+                .entry(chunk.block_id(old_file).to_string())
                 .or_insert(0) -= 1;
         }
 
@@ -366,8 +391,9 @@ impl MetadataStore {
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             for entry in new_dedup_entries {
                 let bytes = encode(entry)?;
+                // v0.4.8: DEDUP_TABLE key is raw bytes (&[u8]), not hex.
                 dedup
-                    .insert(entry.hash.as_str(), bytes.as_slice())
+                    .insert(&entry.hash[..], bytes.as_slice())
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
         }
@@ -716,7 +742,11 @@ impl MetadataStore {
         &self,
         old_block_id: &str,
         new_block: &BlockMeta,
-        chunk_remap: &std::collections::HashMap<String, (String, u64, u64, u64)>,
+        // v0.4.8: keyed by raw 32-byte hash (was hex String).
+        chunk_remap: &std::collections::HashMap<
+            crate::dedup::HashBytes,
+            (String, u64, u64, u64),
+        >,
     ) -> Result<u64> {
         // chunk_remap value = (new_block_id, new_offset, new_original_size, new_compressed_size)
         // Returns: the number of chunk references that were rewritten (i.e. the
@@ -751,28 +781,70 @@ impl MetadataStore {
                 {
                     let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
                     let file: FileMeta = decode(v.value())?;
-                    if file.chunks.iter().any(|c| c.block_id == old_block_id) {
+                    // v0.4.8: pool-level membership check is O(pool_size)
+                    // and skips resolving every chunk's index on the
+                    // ~99 % of files that don't touch this block.
+                    if file.block_ids.iter().any(|b| b == old_block_id) {
                         to_rewrite.push((k.value().to_string(), file));
                     }
                 }
             }
             for (k, mut file) in to_rewrite {
+                let file_chunk_size = file.chunk_size;
+                // v0.4.8: locate the pool slot that held `old_block_id`
+                // so we can (a) filter chunks pointing at it by
+                // `block_idx` instead of allocating a resolved string
+                // per chunk, and (b) replace the pool entry in-place
+                // with `new_block.block_id`. Each `ChunkMeta.block_idx`
+                // keeps its numeric value — the pool now resolves it
+                // to the new block — so we don't touch every chunk's
+                // bytes to remap the reference itself.
+                let old_pool_idx = match file
+                    .block_ids
+                    .iter()
+                    .position(|b| b == old_block_id)
+                {
+                    Some(i) => i as u16,
+                    None => continue, // pool check above should have excluded this
+                };
                 for chunk in &mut file.chunks {
-                    if chunk.block_id == old_block_id {
-                        if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&chunk.hash) {
-                            chunk.block_id = nb.clone();
+                    if chunk.block_idx == old_pool_idx {
+                        // v0.4.8: chunks on a live block always have
+                        // `hash = Some(_)` — dedup-disabled uploads
+                        // never share a block with others anyway, but
+                        // we guard here to avoid a silent data loss if
+                        // that invariant regresses.
+                        let hash_bytes = chunk.hash.as_ref().ok_or_else(|| {
+                            JiHuanError::Internal(format!(
+                                "rewrite_block_references: chunk in file {} points at block {} but has no hash",
+                                file.file_id, old_block_id
+                            ))
+                        })?;
+                        if let Some((_nb, no, norig, ncomp)) = chunk_remap.get(hash_bytes) {
                             chunk.offset = *no;
-                            chunk.original_size = *norig;
+                            // v0.4.8: re-apply the default-elided encoding
+                            // against the owning file's canonical size.
+                            // `norig` is always the resolved byte length.
+                            chunk.original_size = if *norig == file_chunk_size {
+                                None
+                            } else {
+                                Some(*norig)
+                            };
                             chunk.compressed_size = *ncomp;
                             new_ref_count += 1;
                         } else {
                             return Err(JiHuanError::Internal(format!(
                                 "rewrite_block_references: hash {} not in remap for file {}",
-                                chunk.hash, file.file_id
+                                crate::dedup::hash_to_hex(hash_bytes),
+                                file.file_id
                             )));
                         }
                     }
                 }
+                // Pool swap: every chunk that previously pointed at
+                // `old_block_id` now transparently points at
+                // `new_block.block_id` via the same `block_idx`.
+                file.block_ids[old_pool_idx as usize] = new_block.block_id.clone();
                 let bytes = encode(&file)?;
                 files
                     .insert(k.as_str(), bytes.as_slice())
@@ -801,8 +873,9 @@ impl MetadataStore {
             let mut dedup = tx
                 .open_table(DEDUP_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            let mut to_update: Vec<(String, DedupEntry)> = Vec::new();
-            let mut to_drop: Vec<String> = Vec::new();
+            // v0.4.8: keys are raw 32-byte hashes (not hex strings).
+            let mut to_update: Vec<(crate::dedup::HashBytes, DedupEntry)> = Vec::new();
+            let mut to_drop: Vec<crate::dedup::HashBytes> = Vec::new();
             {
                 for entry in dedup
                     .iter()
@@ -811,7 +884,16 @@ impl MetadataStore {
                     let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
                     let de: DedupEntry = decode(v.value())?;
                     if de.block_id == old_block_id {
-                        let hash = k.value().to_string();
+                        // Key is `&[u8]`; convert to the fixed-size array.
+                        let hash: crate::dedup::HashBytes =
+                            <[u8; crate::dedup::HASH_BYTES]>::try_from(k.value())
+                                .map_err(|_| {
+                                    JiHuanError::DataCorruption(format!(
+                                        "DEDUP_TABLE key length {} != {}",
+                                        k.value().len(),
+                                        crate::dedup::HASH_BYTES
+                                    ))
+                                })?;
                         if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&hash) {
                             let mut updated = de;
                             updated.block_id = nb.clone();
@@ -831,12 +913,12 @@ impl MetadataStore {
             for (hash, updated) in to_update {
                 let bytes = encode(&updated)?;
                 dedup
-                    .insert(hash.as_str(), bytes.as_slice())
+                    .insert(&hash[..], bytes.as_slice())
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
             for hash in to_drop {
                 dedup
-                    .remove(hash.as_str())
+                    .remove(&hash[..])
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
         }
@@ -865,7 +947,11 @@ impl MetadataStore {
         &self,
         old_block_ids: &[String],
         new_block: &BlockMeta,
-        chunk_remap: &std::collections::HashMap<String, (String, u64, u64, u64)>,
+        // v0.4.8: keyed by raw 32-byte hash (was hex String).
+        chunk_remap: &std::collections::HashMap<
+            crate::dedup::HashBytes,
+            (String, u64, u64, u64),
+        >,
     ) -> Result<u64> {
         // Build a set for fast membership. Empty input is a no-op (caller
         // bug, but we won't blow up; just commit an empty tx).
@@ -897,31 +983,69 @@ impl MetadataStore {
                 {
                     let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
                     let file: FileMeta = decode(v.value())?;
+                    // v0.4.8: pool-level membership check avoids
+                    // resolving every chunk's index when the file
+                    // doesn't touch any block in the merge group.
                     if file
-                        .chunks
+                        .block_ids
                         .iter()
-                        .any(|c| old_set.contains(c.block_id.as_str()))
+                        .any(|b| old_set.contains(b.as_str()))
                     {
                         to_rewrite.push((k.value().to_string(), file));
                     }
                 }
             }
             for (k, mut file) in to_rewrite {
+                let file_chunk_size = file.chunk_size;
+                // v0.4.8: collect the set of pool indices whose slot
+                // holds one of the merged-away block ids. Every
+                // `ChunkMeta.block_idx` in this set needs its offset/
+                // size re-bound via `chunk_remap`; the pool slot gets
+                // replaced with `new_block.block_id` in-place so the
+                // numeric `block_idx` stays stable.
+                let mut old_pool_idxs: std::collections::HashSet<u16> =
+                    std::collections::HashSet::new();
+                for (i, b) in file.block_ids.iter().enumerate() {
+                    if old_set.contains(b.as_str()) {
+                        old_pool_idxs.insert(i as u16);
+                    }
+                }
                 for chunk in &mut file.chunks {
-                    if old_set.contains(chunk.block_id.as_str()) {
-                        if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&chunk.hash) {
-                            chunk.block_id = nb.clone();
+                    if old_pool_idxs.contains(&chunk.block_idx) {
+                        let hash_bytes = chunk.hash.as_ref().ok_or_else(|| {
+                            JiHuanError::Internal(format!(
+                                "rewrite_block_references_group: chunk in file {} has no hash",
+                                file.file_id
+                            ))
+                        })?;
+                        if let Some((_nb, no, norig, ncomp)) = chunk_remap.get(hash_bytes) {
                             chunk.offset = *no;
-                            chunk.original_size = *norig;
+                            // v0.4.8: re-apply the default-elided encoding
+                            // against the owning file's canonical size.
+                            chunk.original_size = if *norig == file_chunk_size {
+                                None
+                            } else {
+                                Some(*norig)
+                            };
                             chunk.compressed_size = *ncomp;
                             new_ref_count += 1;
                         } else {
                             return Err(JiHuanError::Internal(format!(
                                 "rewrite_block_references_group: hash {} not in remap for file {}",
-                                chunk.hash, file.file_id
+                                crate::dedup::hash_to_hex(hash_bytes),
+                                file.file_id
                             )));
                         }
                     }
+                }
+                // Pool swap: every old slot now resolves to the single
+                // merged destination block. Entries for old blocks
+                // this file doesn't actually reference anymore (all of
+                // them, after the swap) collapse to duplicate
+                // strings, which is functionally harmless — they waste
+                // ~36 B each until the file is rewritten again.
+                for idx in &old_pool_idxs {
+                    file.block_ids[*idx as usize] = new_block.block_id.clone();
                 }
                 let bytes = encode(&file)?;
                 files
@@ -953,8 +1077,9 @@ impl MetadataStore {
             let mut dedup = tx
                 .open_table(DEDUP_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            let mut to_update: Vec<(String, DedupEntry)> = Vec::new();
-            let mut to_drop: Vec<String> = Vec::new();
+            // v0.4.8: keys are raw 32-byte hashes (not hex strings).
+            let mut to_update: Vec<(crate::dedup::HashBytes, DedupEntry)> = Vec::new();
+            let mut to_drop: Vec<crate::dedup::HashBytes> = Vec::new();
             {
                 for entry in dedup
                     .iter()
@@ -963,7 +1088,15 @@ impl MetadataStore {
                     let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
                     let de: DedupEntry = decode(v.value())?;
                     if old_set.contains(de.block_id.as_str()) {
-                        let hash = k.value().to_string();
+                        let hash: crate::dedup::HashBytes =
+                            <[u8; crate::dedup::HASH_BYTES]>::try_from(k.value())
+                                .map_err(|_| {
+                                    JiHuanError::DataCorruption(format!(
+                                        "DEDUP_TABLE key length {} != {}",
+                                        k.value().len(),
+                                        crate::dedup::HASH_BYTES
+                                    ))
+                                })?;
                         if let Some((nb, no, norig, ncomp)) = chunk_remap.get(&hash) {
                             let mut updated = de;
                             updated.block_id = nb.clone();
@@ -980,12 +1113,12 @@ impl MetadataStore {
             for (hash, updated) in to_update {
                 let bytes = encode(&updated)?;
                 dedup
-                    .insert(hash.as_str(), bytes.as_slice())
+                    .insert(&hash[..], bytes.as_slice())
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
             for hash in to_drop {
                 dedup
-                    .remove(hash.as_str())
+                    .remove(&hash[..])
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
             }
         }
@@ -1011,7 +1144,11 @@ impl MetadataStore {
             let mut dedup = tx
                 .open_table(DEDUP_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
-            let mut to_drop: Vec<String> = Vec::new();
+            // v0.4.8: DEDUP_TABLE keys are raw bytes (was hex String).
+            // We buffer them as owned `Vec<u8>` (not the fixed-size
+            // array) so a corrupted row with the wrong key length still
+            // gets purged along with the rest.
+            let mut to_drop: Vec<Vec<u8>> = Vec::new();
             {
                 for entry in dedup
                     .iter()
@@ -1020,13 +1157,13 @@ impl MetadataStore {
                     let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
                     let de: DedupEntry = decode(v.value())?;
                     if de.block_id == block_id {
-                        to_drop.push(k.value().to_string());
+                        to_drop.push(k.value().to_vec());
                     }
                 }
             }
             for hash in to_drop {
                 dedup
-                    .remove(hash.as_str())
+                    .remove(hash.as_slice())
                     .map_err(|e| JiHuanError::Database(e.to_string()))?;
                 count += 1;
             }
@@ -1040,7 +1177,15 @@ impl MetadataStore {
     // Dedup index operations
     // ─────────────────────────────────────────────────────────────────────────
 
-    pub fn get_dedup_entry(&self, hash: &str) -> Result<Option<DedupEntry>> {
+    /// v0.4.8: lookup key is raw bytes (32-byte hash) rather than hex
+    /// string. Callers that have a `ChunkMeta.hash: Option<HashBytes>`
+    /// should pass `hash.as_ref().map(|h| &h[..]).unwrap_or(&[])` — an
+    /// empty slice short-circuits to `None` because no real row is
+    /// keyed by zero bytes.
+    pub fn get_dedup_entry(&self, hash: &[u8]) -> Result<Option<DedupEntry>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
         let tx = self
             .db
             .begin_read()
@@ -1064,7 +1209,12 @@ impl MetadataStore {
     /// (no DedupEntry clone) so a large dedup table doesn't spike memory
     /// during a repair pass — we only need the hash + block_id to decide
     /// whether to delete.
-    pub fn list_dedup_hash_block_pairs(&self) -> Result<Vec<(String, String)>> {
+    /// v0.4.8: hash pairs are surfaced as `(HashBytes, block_id)`
+    /// tuples. Callers that need to log them should go through
+    /// [`crate::dedup::hash_to_hex`] to format the bytes.
+    pub fn list_dedup_hash_block_pairs(
+        &self,
+    ) -> Result<Vec<(crate::dedup::HashBytes, String)>> {
         let tx = self
             .db
             .begin_read()
@@ -1079,12 +1229,21 @@ impl MetadataStore {
         {
             let (k, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
             let de: DedupEntry = decode(v.value())?;
-            out.push((k.value().to_string(), de.block_id));
+            let hash: crate::dedup::HashBytes =
+                <[u8; crate::dedup::HASH_BYTES]>::try_from(k.value()).map_err(|_| {
+                    JiHuanError::DataCorruption(format!(
+                        "DEDUP_TABLE key length {} != {}",
+                        k.value().len(),
+                        crate::dedup::HASH_BYTES
+                    ))
+                })?;
+            out.push((hash, de.block_id));
         }
         Ok(out)
     }
 
-    pub fn remove_dedup_entry(&self, hash: &str) -> Result<()> {
+    /// v0.4.8: key is raw bytes (32-byte hash) rather than hex string.
+    pub fn remove_dedup_entry(&self, hash: &[u8]) -> Result<()> {
         let tx = self
             .db
             .begin_write()
@@ -1540,13 +1699,25 @@ mod tests {
             file_size: 1024,
             create_time: 1000000,
             partition_id,
+            // v0.4.8: tests use an artificial file_chunk_size of 1024 so
+            // the single chunk below can sit at the default-elided size
+            // (`original_size = None`) and still round-trip correctly.
+            chunk_size: 1024,
+            // v0.4.8: block_id pool — the single chunk points at slot 0
+            // which resolves to "blk1".
+            block_ids: vec!["blk1".to_string()],
             chunks: vec![ChunkMeta {
-                block_id: "blk1".to_string(),
+                block_idx: 0,
                 offset: 0,
-                original_size: 1024,
+                original_size: None,
                 compressed_size: 512,
-                hash: "abc123".to_string(),
-                index: 0,
+                // v0.4.8: hash is now a fixed-size byte array. The
+                // value here is a deterministic sentinel for tests.
+                hash: Some({
+                    let mut h = [0u8; crate::dedup::HASH_BYTES];
+                    h[..6].copy_from_slice(b"abc123");
+                    h
+                }),
             }],
             content_type: None,
         }
@@ -1667,8 +1838,13 @@ mod tests {
     #[test]
     fn test_dedup_entry_crud() {
         let (store, _tmp) = make_store();
+        // v0.4.8: DedupEntry.hash is now `[u8; 32]`. We build a
+        // deterministic sentinel from an ASCII seed so the assertions
+        // stay readable.
+        let mut hash = [0u8; crate::dedup::HASH_BYTES];
+        hash[..9].copy_from_slice(b"sha256abc");
         let entry = DedupEntry {
-            hash: "sha256abc".to_string(),
+            hash,
             block_id: "blk1".to_string(),
             offset: 64,
             original_size: 4096,
@@ -1680,10 +1856,10 @@ mod tests {
         store
             .commit_file_batch(&dummy_file, &std::collections::HashMap::new(), std::slice::from_ref(&entry))
             .unwrap();
-        let got = store.get_dedup_entry("sha256abc").unwrap();
+        let got = store.get_dedup_entry(&hash[..]).unwrap();
         assert!(got.is_some());
-        store.remove_dedup_entry("sha256abc").unwrap();
-        assert!(store.get_dedup_entry("sha256abc").unwrap().is_none());
+        store.remove_dedup_entry(&hash[..]).unwrap();
+        assert!(store.get_dedup_entry(&hash[..]).unwrap().is_none());
     }
 
     // ─── Phase 2.6 audit log ─────────────────────────────────────────────────

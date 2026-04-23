@@ -12,7 +12,7 @@ use crate::block::reader::BlockReader;
 use crate::block::writer::{BlockSummary, BlockWriter};
 use crate::chunking::RawChunk;
 use crate::config::AppConfig;
-use crate::dedup::hash_chunk;
+use crate::dedup::{hash_chunk_bytes, hash_to_hex, HashBytes};
 use crate::error::{JiHuanError, Result};
 use crate::gc::{cleanup_incomplete_blocks, GcConfig, GcService};
 use crate::metadata::store::MetadataStore;
@@ -102,6 +102,29 @@ impl<'a> PutOptions<'a> {
 
 /// The central storage engine.
 ///
+/// v0.4.8: helper shared by all three `read_chunk_bytes` verify paths.
+///
+/// Recomputes the content hash of `data` using the active algorithm
+/// and compares it to the `expected` reference (both are raw 32-byte
+/// arrays). On mismatch, surfaces a `ChecksumMismatch` error with both
+/// sides hex-formatted for human-readable logs. Returns `Ok(())` when
+/// the active algorithm is `None` — dedup was off at upload time so we
+/// have no expectation to verify against.
+fn verify_hash_bytes(
+    data: &[u8],
+    algo: crate::config::HashAlgorithm,
+    expected: &HashBytes,
+) -> Result<()> {
+    let actual = hash_chunk_bytes(data, algo);
+    match actual {
+        Some(a) if &a == expected => Ok(()),
+        _ => Err(JiHuanError::ChecksumMismatch {
+            expected: hash_to_hex(expected),
+            actual: actual.map(|a| hash_to_hex(&a)).unwrap_or_default(),
+        }),
+    }
+}
+
 /// All public methods are synchronous (internally they may hold locks).
 /// Wrap in an `Arc` and use from async code via `tokio::task::spawn_blocking`.
 pub struct Engine {
@@ -151,7 +174,10 @@ struct FileBatch {
     /// In-flight dedup overlay: content-hash → already-written location
     /// within **this** upload. Needed because `new_dedup_entries` aren't
     /// visible via `get_dedup_entry` until commit.
-    overlay: std::collections::HashMap<String, OverlayEntry>,
+    ///
+    /// v0.4.8: keyed by the canonical 32-byte hash array rather than
+    /// its hex-string form (matches `ChunkMeta.hash: Option<HashBytes>`).
+    overlay: std::collections::HashMap<crate::dedup::HashBytes, OverlayEntry>,
 }
 
 #[derive(Clone)]
@@ -160,6 +186,23 @@ struct OverlayEntry {
     offset: u64,
     original_size: u64,
     compressed_size: u64,
+}
+
+/// v0.4.8: intermediate per-chunk record held inside `put_stream_with`
+/// between `store_chunk_batched` and the final `FileMeta` assembly.
+///
+/// Carries the concrete `block_id: String` (what the chunk writer
+/// knows) instead of the pooled `block_idx: u16` that `ChunkMeta`
+/// stores. The pool itself is only knowable after *all* chunks of
+/// the file have been written — at assembly time we deduplicate the
+/// `block_id`s into `FileMeta.block_ids` and rewrite each pending
+/// chunk into a final `ChunkMeta`.
+struct PendingChunk {
+    block_id: String,
+    offset: u64,
+    original_size: Option<u64>,
+    compressed_size: u64,
+    hash: Option<HashBytes>,
 }
 
 /// Info about a block that was just sealed by [`Engine::seal_active_block`].
@@ -210,7 +253,12 @@ pub struct BlockLiveInfo {
     /// candidate tuple without re-allocating every hash — a cheap refcount
     /// bump instead of N String allocations. Matters on dedup-heavy tiers
     /// where a single candidate block can easily hold 10k+ unique hashes.
-    pub live_hashes: std::collections::HashSet<std::sync::Arc<str>>,
+    ///
+    /// v0.4.8: the set is keyed by the raw 32-byte hash rather than an
+    /// interned `Arc<str>`. `HashBytes` is `Copy` and only 32 B, so the
+    /// old intern pool no longer saves memory once the hex-string form
+    /// is off the table — each reference now has exactly one live copy.
+    pub live_hashes: std::collections::HashSet<HashBytes>,
 }
 
 /// TTL for the `stats()` cache. Five seconds balances Dashboard freshness
@@ -236,7 +284,10 @@ pub struct RepairSummary {
 /// the cross-block compaction merger. Named to appease clippy's
 /// `type_complexity` lint and to make the many `Vec<...>` / `&[...]`
 /// signatures in `engine.rs` readable.
-type CompactSource = (BlockMeta, u64, std::collections::HashSet<std::sync::Arc<str>>);
+// v0.4.8: the third tuple element (live-hash set) now stores raw
+// `HashBytes` arrays rather than interned `Arc<str>`. See
+// `BlockLiveInfo::live_hashes` for the rationale.
+type CompactSource = (BlockMeta, u64, std::collections::HashSet<HashBytes>);
 
 /// v0.4.7: why the scanner selected a block as a compaction candidate.
 /// Carried alongside each [`CompactSource`] in a parallel map so the
@@ -764,7 +815,11 @@ impl Engine {
         let create_time = now_secs();
         let partition_id = current_partition_id(self.config.storage.time_partition_hours);
 
-        let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
+        // v0.4.8: `store_chunk_batched` yields `PendingChunk` (carries
+        // the raw block_id string); we dedup-pool those into
+        // `FileMeta.block_ids` at file-assembly time and rewrite each
+        // into a `ChunkMeta` with `block_idx: u16`.
+        let mut pending_chunks: Vec<PendingChunk> = Vec::new();
         let mut file_size: u64 = 0;
         let mut index: u32 = 0;
         let mut buf = vec![0u8; chunk_size];
@@ -796,7 +851,7 @@ impl Engine {
                         digest,
                     };
                     let cm = self.store_chunk_batched(&raw, &mut batch)?;
-                    chunk_metas.push(cm);
+                    pending_chunks.push(cm);
                 }
                 break;
             }
@@ -810,7 +865,7 @@ impl Engine {
                 digest,
             };
             let cm = self.store_chunk_batched(&raw, &mut batch)?;
-            chunk_metas.push(cm);
+            pending_chunks.push(cm);
 
             index += 1;
             if total_read < chunk_size {
@@ -818,12 +873,56 @@ impl Engine {
             }
         }
 
+        // v0.4.8: assemble `block_ids` pool + `ChunkMeta.block_idx`
+        // references. Typical uploads produce 1–2 distinct block ids
+        // shared across every chunk, so the pool is tiny and indices
+        // fit comfortably in `u16` (capped at 65 535 distinct blocks
+        // per file, which at 1 GiB/block would need a 64 TiB file).
+        let (block_ids_pool, chunk_metas) = {
+            use std::collections::HashMap;
+            let mut pool: Vec<String> = Vec::new();
+            let mut by_id: HashMap<String, u16> = HashMap::new();
+            let mut out: Vec<ChunkMeta> = Vec::with_capacity(pending_chunks.len());
+            for pc in pending_chunks {
+                let idx = match by_id.get(&pc.block_id) {
+                    Some(&i) => i,
+                    None => {
+                        let i = pool.len();
+                        if i > u16::MAX as usize {
+                            return Err(JiHuanError::Internal(format!(
+                                "file references more than {} distinct blocks — \
+                                 raise block_file_size so a single upload fits in fewer blocks",
+                                u16::MAX
+                            )));
+                        }
+                        let i = i as u16;
+                        by_id.insert(pc.block_id.clone(), i);
+                        pool.push(pc.block_id);
+                        i
+                    }
+                };
+                out.push(ChunkMeta {
+                    block_idx: idx,
+                    offset: pc.offset,
+                    original_size: pc.original_size,
+                    compressed_size: pc.compressed_size,
+                    hash: pc.hash,
+                });
+            }
+            (pool, out)
+        };
+
         let file_meta = FileMeta {
             file_id: effective_id.clone(),
             file_name: opts.file_name.to_string(),
             file_size,
             create_time,
             partition_id,
+            // v0.4.8: record the canonical chunk size for this file so
+            // downstream readers can resolve `ChunkMeta.original_size =
+            // None` back to a real byte length.
+            chunk_size: self.config.storage.chunk_size,
+            block_ids: block_ids_pool,
             chunks: chunk_metas,
             content_type: opts.content_type.map(|s| s.to_string()),
         };
@@ -890,44 +989,55 @@ impl Engine {
         &self,
         raw: &RawChunk,
         batch: &mut FileBatch,
-    ) -> Result<ChunkMeta> {
-        let hash = &raw.digest.hash;
-        let use_dedup = !hash.is_empty();
+    ) -> Result<PendingChunk> {
+        // v0.4.8: `raw.digest.hash` is now `Option<HashBytes>` (None
+        // iff dedup is disabled). When present, we use the raw bytes
+        // as the overlay / DEDUP_TABLE key and copy them into
+        // `ChunkMeta.hash`. The block-file `ChunkEntry` format still
+        // carries a hex string — we format it on demand just before
+        // the block write.
+        let hash_opt: Option<&crate::dedup::HashBytes> = raw.digest.hash.as_ref();
+
+        // v0.4.8: the "canonical" chunk size for this upload. When the
+        // stored chunk happens to be exactly this size (the
+        // overwhelmingly common case for every non-tail chunk) we
+        // encode `ChunkMeta.original_size = None` to save ~5 B/chunk
+        // on the wire. See `ChunkMeta::effective_original_size`.
+        let file_chunk_size = self.config.storage.chunk_size;
+        let elide_size = |n: u64| -> Option<u64> {
+            if n == file_chunk_size { None } else { Some(n) }
+        };
 
         // 1) Same-upload overlay dedup. A file with repeated chunks (e.g.
         //    identical 4 MB blocks of zeros) reuses the first-seen location
         //    without needing a committed dedup entry, because the batch
         //    hasn't been committed yet so `get_dedup_entry` would miss.
-        if use_dedup {
+        if let Some(hash) = hash_opt {
             if let Some(o) = batch.overlay.get(hash).cloned() {
                 *batch.ref_count_deltas.entry(o.block_id.clone()).or_insert(0) += 1;
                 metrics::counter!("jihuan_dedup_hits_total").increment(1);
-                return Ok(ChunkMeta {
+                return Ok(PendingChunk {
                     block_id: o.block_id,
                     offset: o.offset,
-                    original_size: o.original_size,
+                    original_size: elide_size(o.original_size),
                     compressed_size: o.compressed_size,
-                    hash: hash.clone(),
-                    index: raw.index,
+                    hash: Some(*hash),
                 });
             }
-        }
 
-        // 2) Persisted dedup index (hits across uploads).
-        if use_dedup {
-            if let Some(dedup) = self.meta.get_dedup_entry(hash)? {
+            // 2) Persisted dedup index (hits across uploads).
+            if let Some(dedup) = self.meta.get_dedup_entry(&hash[..])? {
                 *batch
                     .ref_count_deltas
                     .entry(dedup.block_id.clone())
                     .or_insert(0) += 1;
                 metrics::counter!("jihuan_dedup_hits_total").increment(1);
-                return Ok(ChunkMeta {
+                return Ok(PendingChunk {
                     block_id: dedup.block_id,
                     offset: dedup.offset,
-                    original_size: dedup.original_size,
+                    original_size: elide_size(dedup.original_size),
                     compressed_size: dedup.compressed_size,
-                    hash: hash.clone(),
-                    index: raw.index,
+                    hash: Some(*hash),
                 });
             }
         }
@@ -940,28 +1050,35 @@ impl Engine {
             self.config.storage.compression_algorithm,
             self.config.storage.compression_level,
         )?;
-        let (block_id, entry) = self.write_chunk_to_block(&raw.data, &compressed, hash)?;
+        // v0.4.8: BlockWriter's on-disk `ChunkEntry` still uses a
+        // 64-char hex ASCII hash (block format unchanged). Format the
+        // raw bytes here — empty string when dedup is off.
+        let hash_hex = match hash_opt {
+            Some(h) => crate::dedup::hash_to_hex(h),
+            None => String::new(),
+        };
+        let (block_id, entry) =
+            self.write_chunk_to_block(&raw.data, &compressed, &hash_hex)?;
 
-        let chunk_meta = ChunkMeta {
+        let chunk_meta = PendingChunk {
             block_id: block_id.clone(),
             offset: entry.data_offset,
-            original_size: entry.original_size as u64,
+            original_size: elide_size(entry.original_size as u64),
             compressed_size: entry.compressed_size as u64,
-            hash: hash.clone(),
-            index: raw.index,
+            hash: hash_opt.copied(),
         };
 
         *batch.ref_count_deltas.entry(block_id.clone()).or_insert(0) += 1;
-        if use_dedup {
+        if let Some(hash) = hash_opt {
             batch.new_dedup_entries.push(DedupEntry {
-                hash: hash.clone(),
+                hash: *hash,
                 block_id: block_id.clone(),
                 offset: entry.data_offset,
                 original_size: entry.original_size as u64,
                 compressed_size: entry.compressed_size as u64,
             });
             batch.overlay.insert(
-                hash.clone(),
+                *hash,
                 OverlayEntry {
                     block_id: block_id.clone(),
                     offset: entry.data_offset,
@@ -1250,7 +1367,11 @@ impl Engine {
 
         // 1) Remove files whose chunks reference any missing block.
         for f in meta.list_all_files()? {
-            let references_missing = f.chunks.iter().any(|c| missing.contains(&c.block_id));
+            // v0.4.8: block_id is pooled in `f.block_ids`; a block is
+            // referenced iff it appears in that per-file pool. Testing
+            // the pool is O(pool_size) (usually 1–2) and avoids the
+            // need to resolve every chunk's index.
+            let references_missing = f.block_ids.iter().any(|b| missing.contains(b));
             if references_missing {
                 if let Err(e) = meta.delete_file(&f.file_id) {
                     tracing::error!(file_id=%f.file_id, error=%e, "Repair: delete_file failed");
@@ -1266,10 +1387,16 @@ impl Engine {
         }
 
         // 2) Remove dedup entries pointing at missing blocks.
+        // v0.4.8: `hash` is now `HashBytes`; surface it as hex for the
+        // error log and pass raw bytes to `remove_dedup_entry`.
         for (hash, block_id) in meta.list_dedup_hash_block_pairs()? {
             if missing.contains(&block_id) {
-                if let Err(e) = meta.remove_dedup_entry(&hash) {
-                    tracing::error!(hash=%hash, error=%e, "Repair: remove_dedup_entry failed");
+                if let Err(e) = meta.remove_dedup_entry(&hash[..]) {
+                    tracing::error!(
+                        hash = %hash_to_hex(&hash),
+                        error = %e,
+                        "Repair: remove_dedup_entry failed"
+                    );
                 } else {
                     summary.dedup_removed += 1;
                 }
@@ -1369,13 +1496,31 @@ impl Engine {
         // ── 2. Collect unique chunks pointing at this block ──────────────
         // Dedup by hash: multiple FileMeta rows may reference the same
         // physical (offset, compressed_size) tuple. Take the first.
-        let mut unique: HashMap<String, (u64, u32, u32)> = HashMap::new();
+        //
+        // v0.4.8: key is a `HashBytes` array (was hex `String`). Chunks
+        // without a hash (dedup-disabled uploads) are skipped — reseal
+        // only makes sense for dedup-enabled storage anyway, since the
+        // rewrite flow reconstructs the block from unique hashes.
+        let mut unique: HashMap<HashBytes, (u64, u32, u32)> = HashMap::new();
         meta.for_each_file(|f| {
+            // v0.4.8: skip files whose pool doesn't reference this
+            // block at all — avoids resolving every chunk's index when
+            // the answer is obviously "no".
+            if !f.block_ids.iter().any(|b| b == block_id) {
+                return Ok(());
+            }
             for c in &f.chunks {
-                if c.block_id == block_id {
-                    unique
-                        .entry(c.hash.clone())
-                        .or_insert((c.offset, c.compressed_size as u32, c.original_size as u32));
+                if c.block_id(&f) == block_id {
+                    if let Some(h) = c.hash.as_ref() {
+                        unique.entry(*h).or_insert((
+                            c.offset,
+                            c.compressed_size as u32,
+                            // v0.4.8: resolve the default-elided size
+                            // against the owning file's canonical
+                            // chunk_size.
+                            c.effective_original_size(f.chunk_size) as u32,
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -1389,9 +1534,13 @@ impl Engine {
         }
 
         // ── 3. Sort by offset & verify the orphan file covers them all ──
+        // v0.4.8: hashes are 32-byte arrays in metadata; the block-file
+        // `ChunkEntry::new` constructor still takes a hex &str so we
+        // pre-format once here instead of redoing the allocation inside
+        // the append loop below.
         let mut sorted: Vec<(String, u64, u32, u32)> = unique
             .into_iter()
-            .map(|(h, (off, cs, os))| (h, off, cs, os))
+            .map(|(h, (off, cs, os))| (hash_to_hex(&h), off, cs, os))
             .collect();
         sorted.sort_by_key(|x| x.1);
         let data_end: u64 = sorted
@@ -1512,12 +1661,13 @@ impl Engine {
         let mut result = Vec::with_capacity(file_meta.file_size as usize);
         let verify = self.config.storage.verify_on_read;
 
-        // Chunks are ordered by index; read them in order.
-        let mut sorted_chunks = file_meta.chunks.clone();
-        sorted_chunks.sort_by_key(|c| c.index);
-
-        for chunk_meta in &sorted_chunks {
-            let data = self.read_chunk_bytes(chunk_meta, verify)?;
+        // v0.4.8: chunks are already in order by Vec position; no
+        // `index` field to sort by. `effective_original_size` resolves
+        // the elided-default `None` against the file's canonical
+        // `chunk_size`.
+        for chunk_meta in &file_meta.chunks {
+            let size = chunk_meta.effective_original_size(file_meta.chunk_size);
+            let data = self.read_chunk_bytes(&file_meta, chunk_meta, size, verify)?;
             result.extend_from_slice(&data);
         }
 
@@ -1542,6 +1692,10 @@ impl Engine {
         &self,
         block_path: &std::path::Path,
         chunk_meta: &crate::metadata::types::ChunkMeta,
+        // v0.4.8: original size is resolved by the caller against the
+        // owning file's `chunk_size`, because `ChunkMeta.original_size`
+        // is now `Option<u64>` (None = "same as file_chunk_size").
+        effective_original_size: u64,
     ) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(block_path).map_err(JiHuanError::Io)?;
@@ -1552,7 +1706,7 @@ impl Engine {
         crate::compression::decompress(
             &compressed,
             self.config.storage.compression_algorithm,
-            chunk_meta.original_size as usize,
+            effective_original_size as usize,
         )
     }
 
@@ -1648,16 +1802,14 @@ impl Engine {
 
         let verify = self.config.storage.verify_on_read;
 
-        // Chunks are ordered by index
-        let mut sorted_chunks = file_meta.chunks.clone();
-        sorted_chunks.sort_by_key(|c| c.index);
-
+        // v0.4.8: chunks are already in order by Vec position.
         let mut result = Vec::with_capacity(wanted_len);
         let mut cursor: u64 = 0; // byte position of the first byte in the current chunk
 
-        for chunk_meta in &sorted_chunks {
+        for chunk_meta in &file_meta.chunks {
+            let chunk_size = chunk_meta.effective_original_size(file_meta.chunk_size);
             let chunk_start = cursor;
-            let chunk_end = cursor + chunk_meta.original_size; // exclusive
+            let chunk_end = cursor + chunk_size; // exclusive
             cursor = chunk_end;
 
             if chunk_end <= start {
@@ -1668,7 +1820,7 @@ impl Engine {
             }
 
             // Fetch the full chunk bytes (active cache or sealed block)
-            let chunk_data = self.read_chunk_bytes(chunk_meta, verify)?;
+            let chunk_data = self.read_chunk_bytes(&file_meta, chunk_meta, chunk_size, verify)?;
 
             // Slice the overlap
             let lo = start.saturating_sub(chunk_start) as usize;
@@ -1686,11 +1838,21 @@ impl Engine {
     /// Helper: fetch the full bytes of a single chunk, honoring the active-block
     /// chunk cache and the sealed-block reader cache. Used by both `get_bytes`
     /// and `get_range`.
+    ///
+    /// v0.4.8: callers pass `effective_original_size` (already resolved
+    /// against the owning file's `chunk_size`) so this helper can feed
+    /// the decompressor even when `chunk_meta.original_size == None`.
     fn read_chunk_bytes(
         &self,
+        file_meta: &FileMeta,
         chunk_meta: &crate::metadata::types::ChunkMeta,
+        effective_original_size: u64,
         verify: bool,
     ) -> Result<Vec<u8>> {
+        // v0.4.8: resolve the pooled block_idx once at the top so the
+        // three read paths below share the same borrow and don't pay
+        // the lookup on every branch.
+        let block_id: &str = chunk_meta.block_id(file_meta);
         // ── Fast path: active (unsealed) block's in-memory cache ────────────
         //
         // We also capture the on-disk path under the same lock so that, on a
@@ -1701,16 +1863,17 @@ impl Engine {
         let active_miss: Option<std::path::PathBuf> = {
             let mut guard = self.active_writer.lock();
             match guard.as_mut() {
-                Some(ab) if ab.writer.block_id() == chunk_meta.block_id => {
+                Some(ab) if ab.writer.block_id() == block_id => {
                     if let Some(cached) = ab.chunk_cache.get(&chunk_meta.offset) {
-                        if verify && !chunk_meta.hash.is_empty() {
-                            let actual =
-                                hash_chunk(&cached.data, self.config.storage.hash_algorithm);
-                            if actual != chunk_meta.hash {
-                                return Err(JiHuanError::ChecksumMismatch {
-                                    expected: chunk_meta.hash.clone(),
-                                    actual,
-                                });
+                        // v0.4.8: hash is `Option<HashBytes>`; verify
+                        // only when the chunk actually carries a hash.
+                        if verify {
+                            if let Some(expected) = chunk_meta.hash.as_ref() {
+                                verify_hash_bytes(
+                                    &cached.data,
+                                    self.config.storage.hash_algorithm,
+                                    expected,
+                                )?;
                             }
                         }
                         return Ok(cached.data.clone());
@@ -1724,24 +1887,28 @@ impl Engine {
         };
 
         if let Some(active_path) = active_miss {
-            let data = self.read_active_chunk_from_disk(&active_path, chunk_meta)?;
-            if verify && !chunk_meta.hash.is_empty() {
-                let actual = hash_chunk(&data, self.config.storage.hash_algorithm);
-                if actual != chunk_meta.hash {
-                    return Err(JiHuanError::ChecksumMismatch {
-                        expected: chunk_meta.hash.clone(),
-                        actual,
-                    });
+            let data = self.read_active_chunk_from_disk(
+                &active_path,
+                chunk_meta,
+                effective_original_size,
+            )?;
+            if verify {
+                if let Some(expected) = chunk_meta.hash.as_ref() {
+                    verify_hash_bytes(
+                        &data,
+                        self.config.storage.hash_algorithm,
+                        expected,
+                    )?;
                 }
             }
             return Ok(data);
         }
 
         // ── Slow path: sealed block via reader cache ────────────────────────
-        let block_info = self.meta.get_block(&chunk_meta.block_id)?.ok_or_else(|| {
+        let block_info = self.meta.get_block(block_id)?.ok_or_else(|| {
             JiHuanError::NotFound(format!(
                 "Block '{}' not found for chunk at offset {}",
-                chunk_meta.block_id, chunk_meta.offset
+                block_id, chunk_meta.offset
             ))
         })?;
 
@@ -1751,13 +1918,9 @@ impl Engine {
             verify,
         )?;
 
-        if verify && !chunk_meta.hash.is_empty() {
-            let actual = hash_chunk(&data, self.config.storage.hash_algorithm);
-            if actual != chunk_meta.hash {
-                return Err(JiHuanError::ChecksumMismatch {
-                    expected: chunk_meta.hash.clone(),
-                    actual,
-                });
+        if verify {
+            if let Some(expected) = chunk_meta.hash.as_ref() {
+                verify_hash_bytes(&data, self.config.storage.hash_algorithm, expected)?;
             }
         }
         Ok(data)
@@ -1824,7 +1987,7 @@ impl Engine {
         // Each chunk reference was counted independently (one increment per stored chunk),
         // so we must decrement once per chunk even if multiple chunks share the same block.
         for chunk in &file_meta.chunks {
-            match self.meta.update_block_ref_count(&chunk.block_id, -1) {
+            match self.meta.update_block_ref_count(chunk.block_id(&file_meta), -1) {
                 Ok(_) | Err(JiHuanError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -1952,45 +2115,38 @@ impl Engine {
         &self,
     ) -> Result<std::collections::HashMap<String, BlockLiveInfo>> {
         use std::collections::{HashMap, HashSet};
-        use std::sync::Arc;
 
-        // Streaming aggregation: we never hold more than one FileMeta in
-        // heap at a time (beyond the growing per-block HashSets). For a
-        // 1 M-file deployment this replaces an ~O(files × avg_chunks)
-        // Vec<FileMeta> allocation (~hundreds of MB) with O(unique_hashes)
-        // Arc<str> buffers (~dozens of MB).
-        let mut live_hashes_per_block: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        // Hash-string intern pool: dedup-heavy tiers see the same hash
-        // referenced by many files; this keeps only one `Arc<str>` alive.
-        let mut intern: HashMap<String, Arc<str>> = HashMap::new();
-        // `compressed_size` per (block_id, hash) pair. All references to
-        // the same (block, hash) agree on the size; we take the first.
-        let mut size_by_block_hash: HashMap<(String, Arc<str>), u64> = HashMap::new();
+        // v0.4.8: hashes are now `HashBytes` (`[u8; 32]`, `Copy`).
+        // The pre-0.4.8 intern pool existed to avoid N `String`
+        // allocations of the 64-char hex form; with fixed-size byte
+        // arrays we pay exactly 32 B per set member and skip the
+        // `Arc<str>` refcount dance entirely.
+        let mut live_hashes_per_block: HashMap<String, HashSet<HashBytes>> = HashMap::new();
+        // `compressed_size` per (block_id, hash) pair. All references
+        // to the same (block, hash) agree on the size; we take the
+        // first.
+        let mut size_by_block_hash: HashMap<(String, HashBytes), u64> = HashMap::new();
 
         self.meta.for_each_file(|f| {
             for c in &f.chunks {
-                let h: Arc<str> = match intern.get(&c.hash) {
-                    Some(a) => a.clone(),
-                    None => {
-                        let a: Arc<str> = Arc::from(c.hash.as_str());
-                        intern.insert(c.hash.clone(), a.clone());
-                        a
-                    }
-                };
+                // Chunks uploaded with dedup disabled have no hash; they
+                // can't participate in live-set aggregation because
+                // the block only shows up in utilisation stats once
+                // per unique hash. Skip them silently.
+                let Some(h) = c.hash.as_ref() else { continue };
+                // v0.4.8: resolve the pooled block id once — the
+                // borrow is stable for both map inserts below.
+                let bid = c.block_id(&f);
                 live_hashes_per_block
-                    .entry(c.block_id.clone())
+                    .entry(bid.to_string())
                     .or_default()
-                    .insert(h.clone());
+                    .insert(*h);
                 size_by_block_hash
-                    .entry((c.block_id.clone(), h))
+                    .entry((bid.to_string(), *h))
                     .or_insert(c.compressed_size);
             }
             Ok(())
         })?;
-        // intern is no longer needed now that every Arc<str> has been
-        // cloned into the sets; drop it early to free memory before the
-        // live_bytes reduction below.
-        drop(intern);
 
         let mut out: HashMap<String, BlockLiveInfo> = HashMap::new();
         for (block_id, hashes) in live_hashes_per_block {
@@ -1998,7 +2154,7 @@ impl Engine {
                 .iter()
                 .map(|h| {
                     size_by_block_hash
-                        .get(&(block_id.clone(), h.clone()))
+                        .get(&(block_id.clone(), *h))
                         .copied()
                         .unwrap_or(0)
                 })
@@ -2089,25 +2245,43 @@ impl Engine {
         // `rewrite_block_references` at commit time, so a concurrent upload
         // that slips in between pre-scan and commit is still counted
         // correctly.
-        let live_hashes: std::collections::HashSet<String> = {
+        // v0.4.8: live-hash set is now `HashSet<HashBytes>`. Chunks
+        // without a hash (dedup-disabled uploads) can't be re-used
+        // during compaction — the block would carry redundant copies
+        // of the same raw bytes with no way to dedup them — so we
+        // skip them here. Such blocks typically have ref_count==1
+        // anyway and get collected by GC instead of compacted.
+        let live_hashes: std::collections::HashSet<HashBytes> = {
             let all_files = self.meta.list_all_files()?;
             let mut set = std::collections::HashSet::new();
             for f in &all_files {
+                // v0.4.8: early-skip files whose pool doesn't contain
+                // the target — the common case for cross-file scans.
+                if !f.block_ids.iter().any(|b| b == old_block_id) {
+                    continue;
+                }
                 for c in &f.chunks {
-                    if c.block_id == old_block_id {
-                        set.insert(c.hash.clone());
+                    if c.block_id(f) == old_block_id {
+                        if let Some(h) = c.hash.as_ref() {
+                            set.insert(*h);
+                        }
                     }
                 }
             }
             set
         };
 
-        // Open the old block and build a hash → entry map.
+        // Open the old block and build a hash → entry map. The block
+        // file format still stores the hash as hex ASCII; we parse it
+        // back into `HashBytes` here so lookups use the same key type
+        // as the in-memory metadata layer.
         let mut old_reader = BlockReader::open(&old_path)?;
-        let hash_to_entry: HashMap<String, ChunkEntry> = old_reader
+        let hash_to_entry: HashMap<HashBytes, ChunkEntry> = old_reader
             .entries
             .iter()
-            .map(|e| (e.hash_str(), e.clone()))
+            .filter_map(|e| {
+                crate::dedup::hash_from_hex(&e.hash_str()).map(|h| (h, e.clone()))
+            })
             .collect();
         let old_chunks = old_reader.entries.len() as u64;
 
@@ -2163,14 +2337,16 @@ impl Engine {
 
         // Copy each live chunk. Re-compress on write so the new entry's
         // compressed_size / offset reflect the current algorithm+level.
-        let mut chunk_remap: HashMap<String, (String, u64, u64, u64)> = HashMap::new();
+        // v0.4.8: keyed by `HashBytes` to match rewrite_block_references.
+        let mut chunk_remap: HashMap<HashBytes, (String, u64, u64, u64)> = HashMap::new();
         let mut live_chunks: u64 = 0;
         let verify = self.config.storage.verify_on_read;
         for hash in &live_hashes {
             let entry = hash_to_entry.get(hash).ok_or_else(|| {
                 JiHuanError::DataCorruption(format!(
                     "compact: live hash {} missing from block {}'s index",
-                    hash, old_block_id
+                    hash_to_hex(hash),
+                    old_block_id
                 ))
             })?;
             let data = old_reader.read_chunk(entry, verify)?;
@@ -2179,10 +2355,15 @@ impl Engine {
                 self.config.storage.compression_algorithm,
                 self.config.storage.compression_level,
             )?;
-            let new_entry =
-                writer.append_precompressed_chunk(&compressed, data.len() as u32, hash)?;
+            // BlockWriter still takes hex &str; format from bytes here.
+            let hash_hex = hash_to_hex(hash);
+            let new_entry = writer.append_precompressed_chunk(
+                &compressed,
+                data.len() as u32,
+                &hash_hex,
+            )?;
             chunk_remap.insert(
-                hash.clone(),
+                *hash,
                 (
                     new_block_id.clone(),
                     new_entry.data_offset,
@@ -2648,7 +2829,9 @@ impl Engine {
             contributed_bytes: u64,
         }
         let mut outcomes: Vec<SourceOutcome> = Vec::new();
-        let mut chunk_remap: HashMap<String, (String, u64, u64, u64)> = HashMap::new();
+        // v0.4.8: keyed by `HashBytes` to match
+        // `rewrite_block_references_group`.
+        let mut chunk_remap: HashMap<HashBytes, (String, u64, u64, u64)> = HashMap::new();
         let verify = self.config.storage.verify_on_read;
 
         // Stream each source's live chunks into the shared writer.
@@ -2670,11 +2853,17 @@ impl Engine {
             }
 
             let mut old_reader = BlockReader::open(&old_path)?;
-            let hash_to_entry: HashMap<String, crate::block::format::ChunkEntry> = old_reader
-                .entries
-                .iter()
-                .map(|e| (e.hash_str(), e.clone()))
-                .collect();
+            // v0.4.8: keyed by `HashBytes` to match the live-hash set;
+            // hex↔bytes happens once per entry at load time instead of
+            // once per lookup.
+            let hash_to_entry: HashMap<HashBytes, crate::block::format::ChunkEntry> =
+                old_reader
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        crate::dedup::hash_from_hex(&e.hash_str()).map(|h| (h, e.clone()))
+                    })
+                    .collect();
             let old_chunks = old_reader.entries.len() as u64;
 
             let mut live_count: u64 = 0;
@@ -2682,13 +2871,12 @@ impl Engine {
             let target_algo = self.config.storage.compression_algorithm;
             let target_level = self.config.storage.compression_level;
             for hash in live_hashes {
-                // hash is &Arc<str>; HashMap<String, _>::get wants &str via
-                // String: Borrow<str>. as_ref() yields the &str we need.
-                let hash_str: &str = hash.as_ref();
-                let src_entry = hash_to_entry.get(hash_str).ok_or_else(|| {
+                // `hash` is `&HashBytes`.
+                let src_entry = hash_to_entry.get(hash).ok_or_else(|| {
                     JiHuanError::DataCorruption(format!(
                         "compact_merge_group: live hash {} missing from block {}'s index",
-                        hash_str, old_meta.block_id
+                        hash_to_hex(hash),
+                        old_meta.block_id
                     ))
                 })?;
                 // v0.4.7: read the source's compressed bytes + recorded
@@ -2697,12 +2885,16 @@ impl Engine {
                 // Cross-algorithm sources pay the full round-trip.
                 let (src_compressed, src_algo) = old_reader.read_chunk_raw(src_entry, verify)?;
                 let original_size = src_entry.original_size;
+                // BlockWriter::append_precompressed_chunk still takes
+                // hex &str; format once per chunk and reuse it for
+                // both the passthrough and recompress branches.
+                let hash_hex = hash_to_hex(hash);
                 let new_entry = if src_algo == target_algo {
                     metrics::counter!("jihuan_compactions_passthrough_chunks_total").increment(1);
                     writer.append_precompressed_chunk(
                         &src_compressed,
                         original_size,
-                        hash_str,
+                        &hash_hex,
                     )?
                 } else {
                     metrics::counter!("jihuan_compactions_recompressed_chunks_total")
@@ -2717,15 +2909,11 @@ impl Engine {
                     writer.append_precompressed_chunk(
                         &compressed,
                         data.len() as u32,
-                        hash_str,
+                        &hash_hex,
                     )?
                 };
                 chunk_remap.insert(
-                    // rewrite_block_references_group's tx layer expects
-                    // owned String keys, so pay one allocation here. The
-                    // Arc<str> savings are on the live_hashes fan-out,
-                    // not on this inner per-live-chunk map.
-                    hash_str.to_string(),
+                    *hash,
                     (
                         new_block_id.clone(),
                         new_entry.data_offset,
@@ -2920,9 +3108,9 @@ mod tests {
         let id_a = engine.put_bytes(&p_a, "a.bin", None).unwrap();
         let id_b = engine.put_bytes(&p_b, "b.bin", None).unwrap();
         engine.seal_active_block().unwrap();
-        let old_block = engine.meta.get_file(&id_a).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        // v0.4.8: resolve chunk[0]'s pooled block id via the file.
+        let fa = engine.meta.get_file(&id_a).unwrap().unwrap();
+        let old_block = fa.chunks[0].block_id(&fa).to_string();
         engine.delete_file(&id_b).unwrap();
 
         let _handle = engine.start_auto_compaction().expect("handle");
@@ -2962,7 +3150,7 @@ mod tests {
 
         // Pick the block id that holds A's first chunk.
         let file_a = engine.meta.get_file(&id_a).unwrap().unwrap();
-        let block_id = file_a.chunks[0].block_id.clone();
+        let block_id = file_a.chunks[0].block_id(&file_a).to_string();
         let old_size = engine.meta.get_block(&block_id).unwrap().unwrap().size;
 
         // Delete file B.
@@ -3018,7 +3206,7 @@ mod tests {
         engine.seal_active_block().unwrap();
 
         let file_a = engine.meta.get_file(&id_a).unwrap().unwrap();
-        let old_block = file_a.chunks[0].block_id.clone();
+        let old_block = file_a.chunks[0].block_id(&file_a).to_string();
         engine.delete_file(&id_b).unwrap();
         let stats = engine.compact_block(&old_block).unwrap();
         let new_block = stats.new_block_id.clone().unwrap();
@@ -3029,7 +3217,7 @@ mod tests {
         let file_a2 = engine.meta.get_file(&id_a2).unwrap().unwrap();
         for c in &file_a2.chunks {
             assert_eq!(
-                c.block_id, new_block,
+                c.block_id(&file_a2), new_block,
                 "dedup must follow the compaction remap, not point at the purged old block"
             );
         }
@@ -3046,7 +3234,7 @@ mod tests {
         let engine = open_engine(&tmp);
         let id = engine.put_bytes(b"something", "x.txt", None).unwrap();
         let file = engine.meta.get_file(&id).unwrap().unwrap();
-        let active_block = file.chunks[0].block_id.clone();
+        let active_block = file.chunks[0].block_id(&file).to_string();
 
         let err = engine.compact_block(&active_block).unwrap_err();
         assert!(matches!(err, JiHuanError::InvalidArgument(_)), "got {:?}", err);
@@ -3074,9 +3262,8 @@ mod tests {
         let id1 = engine.put_bytes(&p1, "k1.bin", None).unwrap();
         let _id2 = engine.put_bytes(&p2, "k2.bin", None).unwrap();
         engine.seal_active_block().unwrap();
-        let block_hi = engine.meta.get_file(&id1).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let fhi = engine.meta.get_file(&id1).unwrap().unwrap();
+        let block_hi = fhi.chunks[0].block_id(&fhi).to_string();
 
         // Block 2: 2 files, delete 1 → low utilization.
         let p3: Vec<u8> = (0..150_000u32).map(|j| ((j * 11) % 251) as u8).collect();
@@ -3084,9 +3271,8 @@ mod tests {
         let _id3 = engine.put_bytes(&p3, "k3.bin", None).unwrap();
         let id4 = engine.put_bytes(&p4, "k4.bin", None).unwrap();
         engine.seal_active_block().unwrap();
-        let block_lo = engine.meta.get_file(&id4).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let flo = engine.meta.get_file(&id4).unwrap().unwrap();
+        let block_lo = flo.chunks[0].block_id(&flo).to_string();
         engine.delete_file(&id4).unwrap();
 
         // Threshold: compact anything under 75% utilization.
@@ -3130,14 +3316,8 @@ mod tests {
             let keep_id = engine.put_bytes(&keep_payload, &keep_name, None).unwrap();
             let drop_id = engine.put_bytes(&drop_payload, &drop_name, None).unwrap();
             engine.seal_active_block().unwrap();
-            let block_id = engine
-                .meta
-                .get_file(&keep_id)
-                .unwrap()
-                .unwrap()
-                .chunks[0]
-                .block_id
-                .clone();
+            let fk = engine.meta.get_file(&keep_id).unwrap().unwrap();
+            let block_id = fk.chunks[0].block_id(&fk).to_string();
             engine.delete_file(&drop_id).unwrap();
             keepers.push((keep_id, keep_payload));
             old_block_ids.push(block_id);
@@ -3213,9 +3393,8 @@ mod tests {
         // NOTE: deliberately do NOT call seal_active_block — this mirrors the
         // kill -9 failure mode. The block file currently has a valid header
         // and chunk data but no footer / index table.
-        let block_id = engine.meta.get_file(&id_a).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let fa = engine.meta.get_file(&id_a).unwrap().unwrap();
+        let block_id = fa.chunks[0].block_id(&fa).to_string();
         let block_meta = engine.meta.get_block(&block_id).unwrap().unwrap();
         let sealed_path = std::path::PathBuf::from(&block_meta.path);
         let orphan_path = sealed_path.with_extension("blk.orphan");
@@ -3274,9 +3453,8 @@ mod tests {
         let _id2 = engine.put_bytes(&payload, "b.bin", None).unwrap();
         engine.seal_active_block().unwrap();
 
-        let block_id = engine.meta.get_file(&id1).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let f1 = engine.meta.get_file(&id1).unwrap().unwrap();
+        let block_id = f1.chunks[0].block_id(&f1).to_string();
         let block_meta = engine.meta.get_block(&block_id).unwrap().unwrap();
 
         let info = engine.compute_block_live_info().unwrap();
@@ -3318,9 +3496,8 @@ mod tests {
                 (0..150_000u32).map(|j| ((j + i as u32 * 31) % 251) as u8).collect();
             let id = engine.put_bytes(&payload, &format!("k{}.bin", i), None).unwrap();
             engine.seal_active_block().unwrap();
-            let bid = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
-                .block_id
-                .clone();
+            let fb = engine.meta.get_file(&id).unwrap().unwrap();
+            let bid = fb.chunks[0].block_id(&fb).to_string();
             block_ids.push(bid);
         }
 
@@ -3411,9 +3588,8 @@ mod tests {
         let payload: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
         let id = engine.put_bytes(&payload, "solo.bin", None).unwrap();
         engine.seal_active_block().unwrap();
-        let old_bid = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let fsolo = engine.meta.get_file(&id).unwrap().unwrap();
+        let old_bid = fsolo.chunks[0].block_id(&fsolo).to_string();
 
         // Same gate-B-failing config as above, but with force=true.
         let opts = CompactionOptions {
@@ -3548,9 +3724,8 @@ gc_threshold = 0.7
         // Upload one file, don't seal — active block has ref_count=1.
         let payload = vec![7u8; 100_000];
         let id = engine.put_bytes(&payload, "only.bin", None).unwrap();
-        let active_id = engine.meta.get_file(&id).unwrap().unwrap().chunks[0]
-            .block_id
-            .clone();
+        let fonly = engine.meta.get_file(&id).unwrap().unwrap();
+        let active_id = fonly.chunks[0].block_id(&fonly).to_string();
 
         // seal_if_dead is a no-op while the file still references the block.
         assert!(
@@ -3595,19 +3770,23 @@ gc_threshold = 0.7
         let id = engine.put_bytes(&payload, "once.bin", None).unwrap();
         let file = engine.meta.get_file(&id).unwrap().unwrap();
         assert_eq!(file.chunks.len(), 1);
-        let hash = file.chunks[0].hash.clone();
+        // v0.4.8: ChunkMeta.hash is now `Option<HashBytes>`. Unwrap
+        // the Some variant: this test always uploads with dedup on.
+        let hash = file.chunks[0]
+            .hash
+            .expect("dedup is enabled in this test; chunk must carry a hash");
 
         engine.seal_active_block().unwrap();
         engine.delete_file(&id).unwrap();
 
         // After delete, block has ref_count==0 but dedup row lingers until GC.
-        assert!(engine.meta.get_dedup_entry(&hash).unwrap().is_some());
+        assert!(engine.meta.get_dedup_entry(&hash[..]).unwrap().is_some());
 
         // GC runs → ref_count==0 block deleted AND its dedup purged.
         rt.block_on(async { engine.trigger_gc().await.unwrap() });
 
         assert!(
-            engine.meta.get_dedup_entry(&hash).unwrap().is_none(),
+            engine.meta.get_dedup_entry(&hash[..]).unwrap().is_none(),
             "dedup entry must be purged after its block is GC'd"
         );
     }
@@ -3634,9 +3813,11 @@ gc_threshold = 0.7
 
         let file = engine.meta.get_file(&file_id).unwrap().unwrap();
         assert_eq!(file.chunks.len(), 2, "expected exactly 2 chunks");
+        // v0.4.8: both chunks must share the same pool slot (and
+        // therefore the same resolved block id) + offset.
         assert_eq!(
-            (&file.chunks[0].block_id, file.chunks[0].offset),
-            (&file.chunks[1].block_id, file.chunks[1].offset),
+            (file.chunks[0].block_idx, file.chunks[0].offset),
+            (file.chunks[1].block_idx, file.chunks[1].offset),
             "same-content chunks must point at the same block+offset \
              after P5 overlay dedup",
         );
@@ -3666,11 +3847,11 @@ gc_threshold = 0.7
 
         let file = engine.meta.get_file(&file_id).unwrap().unwrap();
         assert_eq!(file.chunks.len(), 3);
-        let block_id = &file.chunks[0].block_id;
-        // All 3 chunks landed on the same (currently active) block.
-        assert!(file.chunks.iter().all(|c| c.block_id == *block_id));
+        let block_id = file.chunks[0].block_id(&file).to_string();
+        // v0.4.8: all chunks landed on the same pool slot (block_idx=0).
+        assert!(file.chunks.iter().all(|c| c.block_idx == file.chunks[0].block_idx));
 
-        let block = engine.meta.get_block(block_id).unwrap().unwrap();
+        let block = engine.meta.get_block(&block_id).unwrap().unwrap();
         assert_eq!(
             block.ref_count, 3,
             "block ref_count must equal chunk count after batched commit"
@@ -3678,7 +3859,7 @@ gc_threshold = 0.7
 
         // Delete: decrements 3 times → ref_count back to 0.
         engine.delete_file(&file_id).unwrap();
-        let block = engine.meta.get_block(block_id).unwrap().unwrap();
+        let block = engine.meta.get_block(&block_id).unwrap().unwrap();
         assert_eq!(block.ref_count, 0, "delete must bring ref_count back to 0");
     }
 
@@ -3709,7 +3890,7 @@ gc_threshold = 0.7
         // back to 0. This mimics the "just-inserted, not yet incremented"
         // window the pin is designed to cover.
         let file = engine.meta.get_file(&file_id).unwrap().unwrap();
-        let block_id = file.chunks[0].block_id.clone();
+        let block_id = file.chunks[0].block_id(&file).to_string();
         let mut b = engine.meta.get_block(&block_id).unwrap().unwrap();
         b.ref_count = 0;
         engine.meta.delete_block(&block_id).unwrap();
@@ -3749,7 +3930,7 @@ gc_threshold = 0.7
         engine.seal_active_block().unwrap();
 
         let file = engine.meta.get_file(&file_id).unwrap().unwrap();
-        let block_id = file.chunks[0].block_id.clone();
+        let block_id = file.chunks[0].block_id(&file).to_string();
         // Force ref_count to 0 again; this time the block is unpinned.
         let mut b = engine.meta.get_block(&block_id).unwrap().unwrap();
         b.ref_count = 0;
@@ -3880,7 +4061,7 @@ gc_threshold = 0.7
         // (b) identify the block backing `lost_id` and delete its .blk file
         //     to simulate the historical bug.
         let lost_meta = engine.metadata().get_file(&lost_id).unwrap().unwrap();
-        let lost_block_id = lost_meta.chunks[0].block_id.clone();
+        let lost_block_id = lost_meta.chunks[0].block_id(&lost_meta).to_string();
         let lost_block_row = engine
             .metadata()
             .get_block(&lost_block_id)

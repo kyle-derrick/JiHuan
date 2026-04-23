@@ -605,16 +605,33 @@ pub async fn get_file_meta(
         .map_err(AppError::from_jihuan)?
         .ok_or_else(|| AppError::not_found(&file_id))?;
 
+    // v0.4.8: ChunkMeta no longer carries an explicit `index` field
+    // (derive it from the Vec position) and `original_size` is now
+    // default-elided — `None` means "same as the file's chunk_size".
+    // We expand both back out in the DTO so API/UI consumers get a
+    // fully-resolved view without needing to know the encoding rules.
+    let file_chunk_size = meta.chunk_size;
     let chunks: Vec<ChunkInfoDto> = meta
         .chunks
         .iter()
-        .map(|c| ChunkInfoDto {
-            index: c.index,
-            block_id: c.block_id.clone(),
+        .enumerate()
+        .map(|(i, c)| ChunkInfoDto {
+            index: i as u32,
+            // v0.4.8: block_id is now pooled on FileMeta; resolve to
+            // the concrete string for the API client.
+            block_id: c.block_id(&meta).to_string(),
             offset: c.offset,
-            original_size: c.original_size,
+            original_size: c.effective_original_size(file_chunk_size),
             compressed_size: c.compressed_size,
-            hash: c.hash.clone(),
+            // v0.4.8: ChunkMeta.hash is now `Option<[u8; 32]>`.
+            // Surface the wire format (hex ASCII) to API clients so
+            // existing consumers keep working; an empty string stands
+            // in for "dedup disabled at upload time".
+            hash: c
+                .hash
+                .as_ref()
+                .map(jihuan_core::dedup::hash_to_hex)
+                .unwrap_or_default(),
         })
         .collect();
 

@@ -81,9 +81,62 @@ pub struct AuditQuery {
     pub limit: Option<usize>,
 }
 
+/// HTTP-shape `AuditResult`. We cannot derive `Serialize` with
+/// `#[serde(tag = "kind")]` on the core enum because bincode can't
+/// round-trip internally-tagged enums (no `deserialize_any`). So we
+/// translate to a DTO here that matches the Web UI's expected shape:
+///   `{"kind": "ok"}`
+///   `{"kind": "denied", "reason": "..."}`
+///   `{"kind": "error", "message": "..."}`
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditResultDto {
+    Ok,
+    Denied { reason: String },
+    Error { message: String },
+}
+
+impl From<AuditResult> for AuditResultDto {
+    fn from(r: AuditResult) -> Self {
+        match r {
+            AuditResult::Ok => AuditResultDto::Ok,
+            AuditResult::Denied { reason } => AuditResultDto::Denied { reason },
+            AuditResult::Error { message } => AuditResultDto::Error { message },
+        }
+    }
+}
+
+/// HTTP-shape of `AuditEvent` — identical to the core type except the
+/// nested `result` uses `AuditResultDto` so the JSON on the wire
+/// carries the internally-tagged `kind` discriminator the UI relies on.
+#[derive(Debug, Serialize)]
+pub struct AuditEventDto {
+    pub ts: u64,
+    pub actor_key_id: Option<String>,
+    pub actor_ip: Option<String>,
+    pub action: String,
+    pub target: Option<String>,
+    pub result: AuditResultDto,
+    pub http_status: Option<u16>,
+}
+
+impl From<AuditEvent> for AuditEventDto {
+    fn from(e: AuditEvent) -> Self {
+        AuditEventDto {
+            ts: e.ts,
+            actor_key_id: e.actor_key_id,
+            actor_ip: e.actor_ip,
+            action: e.action,
+            target: e.target,
+            result: e.result.into(),
+            http_status: e.http_status,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuditListResponse {
-    pub events: Vec<AuditEvent>,
+    pub events: Vec<AuditEventDto>,
     pub count: usize,
 }
 
@@ -115,6 +168,10 @@ pub async fn list_audit(
     .map_err(|e| AppError::internal(e.to_string()))?
     .map_err(AppError::from_jihuan)?;
     let count = events.len();
+    // Translate core → HTTP DTO so the JSON shape carries `kind` on
+    // each `result` entry. Cheap: single-pass move, no per-event clone
+    // beyond what `Into` already does.
+    let events: Vec<AuditEventDto> = events.into_iter().map(AuditEventDto::from).collect();
     Ok(Json(AuditListResponse { events, count }))
 }
 

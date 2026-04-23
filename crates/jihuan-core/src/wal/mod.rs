@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::dedup::crc32;
+use crate::dedup::{crc32, HashBytes};
 use crate::error::{JiHuanError, Result};
 
 /// WAL record types
@@ -20,24 +20,30 @@ pub enum WalOperation {
     BlockRefDelta { block_id: String, delta: i64 },
     /// A block was deleted (ref_count reached 0)
     DeleteBlock { block_id: String },
-    /// A dedup entry was inserted
-    InsertDedup { hash: String },
-    /// A dedup entry was removed
-    RemoveDedup { hash: String },
+    /// A dedup entry was inserted (v0.4.8: 32 raw bytes, was hex String)
+    InsertDedup { hash: HashBytes },
+    /// A dedup entry was removed (v0.4.8: 32 raw bytes, was hex String)
+    RemoveDedup { hash: HashBytes },
     /// A partition was deleted
     DeletePartition { partition_id: u64 },
     /// Checkpoint marker – all records before this are applied
     Checkpoint,
 }
 
-/// A single WAL log entry with length-prefix framing and CRC32 integrity
+/// A single WAL log entry with length-prefix framing and CRC32 integrity.
+///
+/// v0.4.8: frame + payload are bincode-encoded (not JSON). The CRC32 is
+/// taken over the bincode-encoded `op` bytes — a bincode round-trip is
+/// canonical (same struct always produces the same byte sequence with
+/// `config::standard()`), which is what the replay verifier relies on.
 #[derive(Debug, Serialize, Deserialize)]
 struct WalFrame {
     /// Sequence number (monotonically increasing)
     seq: u64,
     /// The operation payload
     op: WalOperation,
-    /// CRC32 of the JSON-serialised op
+    /// CRC32 of the bincode-encoded op (canonical under
+    /// `bincode::config::standard()`)
     crc32: u32,
 }
 
@@ -80,9 +86,9 @@ impl WriteAheadLog {
 
     /// Append an operation to the WAL
     pub fn append(&mut self, op: WalOperation) -> Result<u64> {
-        let op_json =
-            serde_json::to_vec(&op).map_err(|e| JiHuanError::Serialization(e.to_string()))?;
-        let crc = crc32(&op_json);
+        let op_bytes = bincode::serde::encode_to_vec(&op, bincode::config::standard())
+            .map_err(|e| JiHuanError::Serialization(e.to_string()))?;
+        let crc = crc32(&op_bytes);
 
         let frame = WalFrame {
             seq: self.next_seq,
@@ -90,9 +96,9 @@ impl WriteAheadLog {
             crc32: crc,
         };
 
-        // Length-prefix framing: 4-byte little-endian length + JSON bytes
-        let frame_bytes =
-            serde_json::to_vec(&frame).map_err(|e| JiHuanError::Serialization(e.to_string()))?;
+        // Length-prefix framing: 4-byte little-endian length + bincode bytes
+        let frame_bytes = bincode::serde::encode_to_vec(&frame, bincode::config::standard())
+            .map_err(|e| JiHuanError::Serialization(e.to_string()))?;
         let len = frame_bytes.len() as u32;
         self.writer
             .write_all(&len.to_le_bytes())
@@ -150,18 +156,21 @@ impl WriteAheadLog {
                 Err(e) => return Err(JiHuanError::Io(e)),
             }
 
-            let frame: WalFrame = match serde_json::from_slice(&frame_buf) {
-                Ok(f) => f,
+            let frame: WalFrame = match bincode::serde::decode_from_slice::<WalFrame, _>(
+                &frame_buf,
+                bincode::config::standard(),
+            ) {
+                Ok((f, _)) => f,
                 Err(e) => {
                     tracing::warn!(error=%e, "WAL: failed to decode frame, stopping replay");
                     break;
                 }
             };
 
-            // Verify integrity
-            let op_json = serde_json::to_vec(&frame.op)
+            // Verify integrity (CRC32 taken over the bincode-encoded op)
+            let op_bytes = bincode::serde::encode_to_vec(&frame.op, bincode::config::standard())
                 .map_err(|e| JiHuanError::Serialization(e.to_string()))?;
-            if crc32(&op_json) != frame.crc32 {
+            if crc32(&op_bytes) != frame.crc32 {
                 tracing::warn!(seq = frame.seq, "WAL: CRC32 mismatch, stopping replay");
                 break;
             }

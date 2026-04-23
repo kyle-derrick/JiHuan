@@ -10,25 +10,56 @@ const ACTION_PRESETS: { label: string; value: string }[] = [
   { label: '密钥管理', value: 'key.' },
 ]
 
+/** Canonical action → Chinese label. Falls back to the raw snake_case
+ *  string when the action is unknown (e.g. after the server grows a new
+ *  event kind and the UI hasn't been re-deployed yet). */
+const ACTION_LABELS: Record<string, string> = {
+  'auth.login': '登录成功',
+  'auth.login_failed': '登录失败',
+  'auth.logout': '登出',
+  'auth.change_password': '修改密码',
+  'key.create': '创建密钥',
+  'key.delete': '删除密钥',
+}
+
+function actionLabel(action: string): string {
+  return ACTION_LABELS[action] ?? action
+}
+
 function formatTs(unixSecs: number): string {
   return new Date(unixSecs * 1000).toLocaleString()
 }
 
-function resultBadge(r: AuditResult): { text: string; cls: string; title?: string } {
-  switch (r.kind) {
+/** Map an `AuditResult` to a visible badge. Defensive against an
+ *  unknown / missing discriminant (e.g. older servers that haven't been
+ *  upgraded to the DTO-shaped response): we never return `undefined`,
+ *  so `b.title` / `b.cls` accesses can't throw. */
+function resultBadge(r: AuditResult | undefined): {
+  text: string
+  cls: string
+  title?: string
+} {
+  const kind = r?.kind
+  switch (kind) {
     case 'ok':
       return { text: 'OK', cls: 'bg-green-50 text-green-700 border-green-200' }
     case 'denied':
       return {
-        text: 'Denied',
+        text: '拒绝',
         cls: 'bg-yellow-50 text-yellow-700 border-yellow-200',
-        title: r.reason,
+        title: (r as { kind: 'denied'; reason: string }).reason,
       }
     case 'error':
       return {
-        text: 'Error',
+        text: '错误',
         cls: 'bg-red-50 text-red-700 border-red-200',
-        title: r.message,
+        title: (r as { kind: 'error'; message: string }).message,
+      }
+    default:
+      return {
+        text: '未知',
+        cls: 'bg-gray-50 text-gray-600 border-gray-200',
+        title: r ? JSON.stringify(r) : undefined,
       }
   }
 }
@@ -174,7 +205,9 @@ export default function Audit() {
                 return (
                   <tr key={i} className="hover:bg-gray-50">
                     <td className="px-4 py-2 text-gray-600 whitespace-nowrap">{formatTs(e.ts)}</td>
-                    <td className="px-4 py-2 font-mono text-xs text-gray-800">{e.action}</td>
+                    <td className="px-4 py-2 text-xs text-gray-800" title={e.action}>
+                      {actionLabel(e.action)}
+                    </td>
                     <td className="px-4 py-2 font-mono text-xs text-gray-600">
                       {e.actor_key_id ?? <span className="text-gray-400">—</span>}
                     </td>
