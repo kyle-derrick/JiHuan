@@ -156,6 +156,10 @@ async fn main() -> anyhow::Result<()> {
     // v0.4.4: start background auto-compaction loop if enabled in config.
     // When disabled, this is a no-op (returns None) and the handle is dropped.
     let _compaction_handle = engine.start_auto_compaction();
+    // Phase 4.4: periodic WAL checkpoint. Truncates the write-ahead log
+    // in place once it exceeds `storage.wal.max_file_size_mb`. `None`
+    // when disabled in config so the default path pays zero overhead.
+    let _wal_checkpoint_handle = engine.start_wal_checkpoint_task();
 
     // v0.5.0-iam bootstrap: when auth is enabled, ensure a root user exists.
     // Policy:

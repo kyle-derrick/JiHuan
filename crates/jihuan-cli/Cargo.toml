@@ -19,3 +19,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
+# Phase 4.6 — export/import archive backends (tar + gzip)
+tar = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -73,6 +73,16 @@ cert_path       = ""
 key_path        = ""
 auto_selfsigned = false
 
+# Phase 4.4 — WAL checkpoint + size-based rotation.
+# The background task wakes every checkpoint_interval_secs and
+# truncates the WAL in place once it exceeds max_file_size_mb.
+# Safe at any time: every WAL entry mirrors a metadata mutation
+# already durable in redb. Replay on restart is a no-op superset.
+[storage.wal]
+checkpoint_enabled      = true
+checkpoint_interval_secs = 300
+max_file_size_mb         = 64
+
 # Phase 4.3 — per-IP token-bucket rate limiting. Disabled by default.
 # When enabled, the limiter drops flood traffic with HTTP 429 +
 # Retry-After BEFORE the auth middleware runs. /healthz, /readyz,

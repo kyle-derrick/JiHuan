@@ -703,6 +703,80 @@ impl Engine {
         }))
     }
 
+    /// Phase 4.4 — run one checkpoint pass on the WAL.
+    ///
+    /// Only truncates the log when **both** safety conditions hold:
+    ///
+    /// * The current on-disk size exceeds `max_file_size_mb` (when
+    ///   non-zero). Pointless to fsync+truncate an already-small file.
+    /// * The WAL contains at least one record. Truncating an empty WAL
+    ///   rewrites a Checkpoint marker for no reason.
+    ///
+    /// Returns `true` if a truncation actually happened. The WAL is
+    /// safe to truncate unconditionally *once redb is durable* — every
+    /// WAL entry mirrors a metadata mutation that has already been
+    /// committed via `MetadataStore`'s per-transaction fsync. Replay on
+    /// next startup is therefore always a no-op superset of what's
+    /// already in redb.
+    pub fn checkpoint_wal(&self) -> Result<bool> {
+        let w = &self.config.storage.wal;
+        let mut wal = self.wal.lock();
+
+        // Size gate: skip if under the threshold (when threshold > 0).
+        if w.max_file_size_mb > 0 {
+            if let Ok(meta) = std::fs::metadata(wal.path()) {
+                let threshold = w.max_file_size_mb.saturating_mul(1024 * 1024);
+                if meta.len() < threshold {
+                    return Ok(false);
+                }
+            }
+        }
+        // Content gate: skip empty WAL. `next_seq == 0` → no records
+        // appended in this process lifetime; combined with the size
+        // gate above this is a double safety net.
+        if wal.next_seq() == 0 {
+            return Ok(false);
+        }
+
+        wal.sync()?; // ensure any buffered bytes are on disk before we truncate
+        wal.truncate()?;
+        tracing::info!("WAL checkpoint: truncated");
+        Ok(true)
+    }
+
+    /// Phase 4.4 — spawn the periodic checkpoint task. `None` when
+    /// disabled so the standard deployment path stays zero-overhead.
+    ///
+    /// The loop wakes every `checkpoint_interval_secs` and calls
+    /// [`Engine::checkpoint_wal`]; each call is O(1) when nothing
+    /// needs truncating. Errors are logged and the loop continues —
+    /// a stuck checkpoint thread is worse than a fat WAL.
+    pub fn start_wal_checkpoint_task(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let w = &self.config.storage.wal;
+        if !w.checkpoint_enabled || w.checkpoint_interval_secs == 0 {
+            return None;
+        }
+        let period_secs = w.checkpoint_interval_secs;
+        let engine = self.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period_secs));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                let e = engine.clone();
+                let res = tokio::task::spawn_blocking(move || e.checkpoint_wal()).await;
+                match res {
+                    Ok(Ok(true)) => {} // already logged inside checkpoint_wal
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "WAL checkpoint failed"),
+                    Err(e) => tracing::warn!(error = %e, "WAL checkpoint task panicked"),
+                }
+            }
+        }))
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Write path
     // ─────────────────────────────────────────────────────────────────────────
@@ -4282,6 +4356,46 @@ gc_threshold = 0.7
         assert!(report.chunks_checked >= 2, "{report:?}");
         assert_eq!(report.chunks_corrupt, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn test_checkpoint_wal_skips_when_under_threshold() {
+        // Phase 4.4: a freshly-written WAL is far below 64 MiB, so
+        // the default checkpoint must be a no-op and leave the WAL
+        // content intact.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine.put_bytes(b"hello", "a.txt", None).unwrap();
+
+        let truncated = engine.checkpoint_wal().unwrap();
+        assert!(!truncated, "tiny WAL should not be truncated");
+    }
+
+    #[test]
+    fn test_checkpoint_wal_truncates_when_threshold_exceeded() {
+        // Phase 4.4: set max_file_size_mb = 0 bypass (the config
+        // disables the size gate) — but we want the *opposite*: force
+        // truncation. The simplest way is to set the threshold to 0
+        // bytes which means "never skip on size", then rely on the
+        // content gate (`next_seq != 0`) to let the truncate fire.
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.wal.max_file_size_mb = 0; // size gate disabled → always allow
+        let engine = Engine::open(cfg).unwrap();
+
+        engine.put_bytes(b"x", "a.txt", None).unwrap();
+        // Next_seq is now >= 1, so checkpoint should truncate.
+        let truncated = engine.checkpoint_wal().unwrap();
+        assert!(truncated, "WAL with records should be truncated when size gate is off");
+    }
+
+    #[test]
+    fn test_start_wal_checkpoint_task_none_when_disabled() {
+        let tmp = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(tmp.path().to_path_buf());
+        cfg.storage.wal.checkpoint_enabled = false;
+        let engine = Arc::new(Engine::open(cfg).unwrap());
+        assert!(engine.start_wal_checkpoint_task().is_none());
     }
 
     #[test]

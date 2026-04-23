@@ -428,7 +428,71 @@ the real client IP — the default key extractor reads the peer socket
 address, which would otherwise collapse to the proxy's IP and punish
 everyone equally.
 
-### 9c.3 Block-integrity scrub (`POST /api/admin/scrub`)
+### 9c.3 WAL checkpoint + rotation
+
+A background task checkpoints the write-ahead log so it doesn't grow
+without bound. Every entry in the WAL is a mirror of a metadata
+mutation that has already been committed to redb (per-transaction
+fsync), so the log is safe to truncate whenever:
+
+```toml
+[storage.wal]
+checkpoint_enabled       = true    # master switch; default on
+checkpoint_interval_secs = 300     # time trigger (5 min)
+max_file_size_mb         = 64      # size trigger
+```
+
+The task fires **both** triggers: every `checkpoint_interval_secs` it
+wakes and calls `checkpoint_wal`, which truncates the log only if its
+on-disk size already exceeds `max_file_size_mb`. Disable by setting
+`checkpoint_enabled = false` — useful when an external tool ships the
+raw WAL for forensic replay.
+
+Replay after a crash still works correctly: the engine scans every
+WAL entry on `Engine::open`, ignoring duplicates that redb already
+has. Checkpoint just resets the file to a single `Checkpoint` marker
+so future scans are faster.
+
+### 9c.4 Backup / restore (`jihuan export` / `import`)
+
+The `jihuan-cli` binary ships an offline backup workflow. The server
+**must be stopped** for both operations — redb takes an exclusive
+lock, so the tools refuse to run against a live instance instead of
+silently producing a torn snapshot.
+
+**Export** → single `.tar.gz` containing `MANIFEST.json`, `data/`,
+`meta/meta.db`, and `wal/`:
+
+```powershell
+$env:JIHUAN_CONFIG = "config/default.toml"
+jihuan export --config config/default.toml --out ./backup/jh-2026-04-23.tar.gz
+```
+
+**Restore** into a fresh host (must point `--config` at a TOML whose
+`data_dir` / `meta_dir` / `wal_dir` are either empty or `--force`):
+
+```powershell
+jihuan import --in ./backup/jh-2026-04-23.tar.gz --config config/new.toml
+# add --force to overwrite a non-empty target
+```
+
+**Verify** (safe while the server is running — reads only the leading
+manifest, not the full archive):
+
+```powershell
+jihuan backup-verify --in ./backup/jh-2026-04-23.tar.gz
+```
+
+Archive layout:
+
+```
+MANIFEST.json        # version, producer, created_at, counts
+data/<...>.blk       # every block file, tree preserved
+meta/meta.db         # redb store
+wal/*.wal            # WAL segments (usually small after checkpointing)
+```
+
+### 9c.5 Block-integrity scrub (`POST /api/admin/scrub`)
 
 Walks every sealed block, verifies the header/footer CRC32s, then
 re-reads every chunk with per-chunk CRC32 check + content-hash
@@ -472,8 +536,8 @@ curl -X POST -H "authorization: Bearer $env:JH_KEY" https://localhost:8080/api/a
 | Rate limiting | **implemented** (tower_governor, per-IP, probes/login exempt) | v0.5.1 |
 | Block scrub | **implemented** (`POST /api/admin/scrub`, CRC + content-hash) | v0.5.1 |
 | Scrub scheduler | planned (`gc.scrub_interval_hours`) | Phase 4.5 follow-up |
-| WAL checkpoint/rotation | planned | Phase 4.4 |
-| Backup/restore CLI | planned | Phase 4.6 |
+| WAL checkpoint/rotation | **implemented** (periodic + size-based truncate; default on) | v0.5.1 |
+| Backup/restore CLI | **implemented** (`jihuan export/import/backup-verify`, offline tar.gz) | v0.5.1 |
 | Audit retention auto-purge | partial (purge fn exists, no scheduler) | Phase 4 |
 | Performance optimisation (P1/P2/P3/P5) | planned | Phase 6b continuation |
 | UI audit-log page | planned | Phase 2.7 follow-up |

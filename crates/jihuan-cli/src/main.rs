@@ -7,6 +7,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use jihuan_core::config::AppConfig;
 
+mod backup;
+
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
 #[derive(Parser, Debug)]
@@ -113,6 +115,62 @@ enum Commands {
         config: PathBuf,
         /// Block ID (from the startup log line `block_id=...`).
         block_id: String,
+    },
+
+    /// Phase 4.6: export a full backup of `data_dir + meta_dir + wal_dir`
+    /// to a single `.tar.gz` archive. The server **must be stopped** for
+    /// the snapshot to be consistent — redb takes an exclusive lock, so
+    /// attempting to export while running fails loudly instead of
+    /// silently producing a half-written archive.
+    ///
+    /// Archive layout:
+    ///   MANIFEST.json        — version, counts, created_at, sha256
+    ///   data/...             — every .blk file
+    ///   meta/meta.db         — redb store
+    ///   wal/*.wal            — uncheckpointed WAL
+    ///
+    /// Use `jihuan import --in <archive> --config <new.toml>` on the
+    /// target host to restore into a fresh data directory.
+    Export {
+        /// Path to the live server config TOML (so we know where
+        /// data/meta/wal live).
+        #[arg(long)]
+        config: PathBuf,
+        /// Output archive path (`.tar.gz` extension recommended).
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Phase 4.6: restore a backup produced by `jihuan export`.
+    ///
+    /// Untars the archive into the `data_dir` / `meta_dir` / `wal_dir`
+    /// declared in `--config`. Refuses to overwrite a non-empty target
+    /// unless `--force` is passed. The server **must be stopped**
+    /// during restore.
+    Import {
+        /// Input archive (`.tar.gz`).
+        #[arg(long, name = "in")]
+        input: PathBuf,
+        /// Path to the server config TOML that declares where data
+        /// should land.
+        #[arg(long)]
+        config: PathBuf,
+        /// Allow restoring on top of a non-empty data/meta/wal dir.
+        /// Existing files are overwritten with archive contents;
+        /// nothing is deleted up front, so stale files left over from
+        /// a previous run can still linger — operators should wipe the
+        /// target dir manually when in doubt.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Phase 4.6: read `MANIFEST.json` out of a backup archive and
+    /// print its contents without unpacking anything else. Safe to run
+    /// while the server is live.
+    BackupVerify {
+        /// Input archive (`.tar.gz`).
+        #[arg(long, name = "in")]
+        input: PathBuf,
     },
 }
 
@@ -482,6 +540,80 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         },
+
+        // ── export (Phase 4.6; server MUST be stopped) ──────────────────────
+        Commands::Export { config, out } => {
+            let cfg = AppConfig::from_file(config)
+                .with_context(|| format!("failed to load {}", config.display()))?;
+            eprintln!(
+                "Exporting data_dir={} meta_dir={} wal_dir={} → {}",
+                cfg.storage.data_dir.display(),
+                cfg.storage.meta_dir.display(),
+                cfg.storage.wal_dir.display(),
+                out.display(),
+            );
+            let manifest = backup::create_archive(
+                &cfg.storage.data_dir,
+                &cfg.storage.meta_dir,
+                &cfg.storage.wal_dir,
+                out,
+            )
+            .context("backup export failed")?;
+            println!("Export complete.");
+            println!("  archive:        {}", out.display());
+            println!("  producer:       {}", manifest.producer);
+            println!("  data entries:   {} ({} bytes)", manifest.data_entries, manifest.data_bytes);
+            println!("  wal entries:    {} ({} bytes)", manifest.wal_entries, manifest.wal_bytes);
+            println!("  meta db bytes:  {}", manifest.meta_bytes);
+        }
+
+        // ── import (Phase 4.6; server MUST be stopped) ──────────────────────
+        Commands::Import {
+            input,
+            config,
+            force,
+        } => {
+            let cfg = AppConfig::from_file(config)
+                .with_context(|| format!("failed to load {}", config.display()))?;
+            eprintln!(
+                "Restoring {} → data_dir={} meta_dir={} wal_dir={} (force={})",
+                input.display(),
+                cfg.storage.data_dir.display(),
+                cfg.storage.meta_dir.display(),
+                cfg.storage.wal_dir.display(),
+                force,
+            );
+            let manifest = backup::restore_archive(
+                input,
+                &cfg.storage.data_dir,
+                &cfg.storage.meta_dir,
+                &cfg.storage.wal_dir,
+                *force,
+            )
+            .context("backup import failed")?;
+            println!("Restore complete.");
+            println!("  archive producer: {}", manifest.producer);
+            println!("  data entries:     {}", manifest.data_entries);
+            println!("  wal entries:      {}", manifest.wal_entries);
+            println!("  created_at:       {} (unix seconds)", manifest.created_at);
+            println!("You can now start the server.");
+        }
+
+        // ── backup-verify (reads manifest only; safe while server runs) ─────
+        Commands::BackupVerify { input } => {
+            let manifest = backup::read_manifest(input)
+                .with_context(|| format!("reading manifest from {}", input.display()))?;
+            println!("Archive {}", input.display());
+            println!("  manifest version:  {}", manifest.version);
+            println!("  producer:          {}", manifest.producer);
+            println!("  created_at:        {}", manifest.created_at);
+            println!("  data entries:      {}", manifest.data_entries);
+            println!("  data bytes:        {}", manifest.data_bytes);
+            println!("  wal entries:       {}", manifest.wal_entries);
+            println!("  wal bytes:         {}", manifest.wal_bytes);
+            println!("  meta db bytes:     {}", manifest.meta_bytes);
+            println!("  has meta.db:       {}", manifest.has_meta_db);
+        }
 
         // ── reseal-orphan (local, server MUST be stopped) ────────────────────
         Commands::ResealOrphan { config, block_id } => {

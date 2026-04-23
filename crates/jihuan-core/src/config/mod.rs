@@ -264,6 +264,67 @@ pub struct StorageConfig {
     /// the admin `force=true` flag.
     #[serde(default = "default_auto_compact_disk_headroom_bytes")]
     pub auto_compact_disk_headroom_bytes: u64,
+
+    /// Phase 4.4 — WAL checkpoint + rotation settings. Defaults are
+    /// conservative (5-minute checkpoint, 64 MiB rotation threshold)
+    /// so idle deployments don't fsync for nothing while long-lived
+    /// write-heavy instances still see their WAL truncated before it
+    /// grows unbounded.
+    #[serde(default)]
+    pub wal: WalConfig,
+}
+
+/// Phase 4.4 — Write-Ahead-Log runtime parameters.
+///
+/// The WAL mirrors every metadata mutation before the redb transaction
+/// commits. Once redb is durable the WAL entry is redundant, so we
+/// periodically truncate ("checkpoint") the log to keep its on-disk
+/// footprint bounded. Two independent triggers:
+///
+/// * **Time-based** (`checkpoint_interval_secs`): wake every N seconds
+///   and checkpoint if the WAL contains at least one entry. Handles
+///   the steady-state low-write case.
+/// * **Size-based** (`max_file_size_mb`): checkpoint immediately once
+///   the file exceeds this threshold. Handles bursty writes that
+///   would otherwise blow past the time budget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalConfig {
+    /// Master switch. Default: **true** (checkpoint loop runs).
+    /// Set to `false` for workloads that rely on external snapshots
+    /// and want a fully growing WAL for forensic replay.
+    #[serde(default = "default_wal_checkpoint_enabled")]
+    pub checkpoint_enabled: bool,
+
+    /// How often the background task considers checkpointing.
+    /// `0` disables the periodic trigger (size-based still fires).
+    #[serde(default = "default_wal_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+
+    /// Size threshold in megabytes above which the WAL is
+    /// checkpointed on the next tick. `0` disables the size trigger
+    /// (time-based still fires).
+    #[serde(default = "default_wal_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_enabled: default_wal_checkpoint_enabled(),
+            checkpoint_interval_secs: default_wal_checkpoint_interval_secs(),
+            max_file_size_mb: default_wal_max_file_size_mb(),
+        }
+    }
+}
+
+fn default_wal_checkpoint_enabled() -> bool {
+    true
+}
+fn default_wal_checkpoint_interval_secs() -> u64 {
+    300
+}
+fn default_wal_max_file_size_mb() -> u64 {
+    64
 }
 
 /// Server configuration
@@ -720,6 +781,7 @@ impl ConfigTemplate {
                 auto_compact_min_file_saved: default_auto_compact_min_file_saved(),
                 auto_compact_min_block_age_secs: default_auto_compact_min_block_age_secs(),
                 auto_compact_disk_headroom_bytes: default_auto_compact_disk_headroom_bytes(),
+                wal: WalConfig::default(),
             },
             server: ServerConfig {
                 http_addr: default_http_addr(),
@@ -810,6 +872,17 @@ mod tests {
         // key_path intentionally empty
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("cert_path") && err.contains("key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn test_wal_defaults_enabled() {
+        // Phase 4.4: WAL checkpoint loop is on by default so operators
+        // don't need to opt in — an unbounded WAL is a worse default.
+        let dir = tempdir().unwrap();
+        let cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        assert!(cfg.storage.wal.checkpoint_enabled);
+        assert_eq!(cfg.storage.wal.checkpoint_interval_secs, 300);
+        assert_eq!(cfg.storage.wal.max_file_size_mb, 64);
     }
 
     #[test]
