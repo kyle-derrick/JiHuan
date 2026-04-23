@@ -310,10 +310,60 @@ pub struct ServerConfig {
     /// than the default.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Phase 4.3 — per-IP rate limiting. Disabled by default so upgrades
+    /// don't trip existing clients; flip `rate_limit.enabled = true` to
+    /// turn on a token-bucket limiter that rejects bursts with HTTP
+    /// 429 + `Retry-After`.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 fn default_request_timeout_secs() -> u64 {
     30
+}
+
+/// Phase 4.3 — per-IP token-bucket rate limiting config.
+///
+/// The limiter runs at the tower layer, **before** the auth middleware,
+/// so even unauthenticated flood traffic costs only the TCP accept +
+/// one `Extension` lookup. Probe routes (`/healthz`, `/readyz`), the
+/// metrics endpoint, and the login form are exempt from the limiter
+/// so orchestrators and humans locked out by misconfiguration can
+/// always get back in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Master switch. Default: **false**.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Steady-state allowance per client IP, requests per second.
+    /// tower_governor models this as `per_second` → one token refills
+    /// every `1/per_second` seconds.
+    #[serde(default = "default_rate_per_ip_per_sec")]
+    pub per_ip_per_sec: u32,
+
+    /// Maximum burst size (initial bucket capacity).
+    #[serde(default = "default_rate_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_ip_per_sec: default_rate_per_ip_per_sec(),
+            burst: default_rate_burst(),
+        }
+    }
+}
+
+fn default_rate_per_ip_per_sec() -> u32 {
+    50
+}
+
+fn default_rate_burst() -> u32 {
+    100
 }
 
 fn default_audit_retention_days() -> u64 {
@@ -530,6 +580,23 @@ impl AppConfig {
             ));
         }
 
+        // Phase 4.3 — rate-limit sanity: reject "enabled but zero rate"
+        // (would reject every request) and "burst < 1" (bucket never
+        // holds a token).
+        let rl = &self.server.rate_limit;
+        if rl.enabled {
+            if rl.per_ip_per_sec == 0 {
+                return Err(JiHuanError::Config(
+                    "server.rate_limit.per_ip_per_sec must be > 0 when enabled".into(),
+                ));
+            }
+            if rl.burst == 0 {
+                return Err(JiHuanError::Config(
+                    "server.rate_limit.burst must be > 0 when enabled".into(),
+                ));
+            }
+        }
+
         // Phase 3 — TLS sanity: when enabled, operator must supply either
         // a static cert pair *or* opt in to auto-selfsigned. `cert_path`
         // and `key_path` must both be present together — a half-configured
@@ -663,6 +730,7 @@ impl ConfigTemplate {
                 enable_access_log: true,
                 cors_origins: default_cors_origins(),
                 request_timeout_secs: default_request_timeout_secs(),
+                rate_limit: RateLimitConfig::default(),
             },
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
@@ -742,6 +810,35 @@ mod tests {
         // key_path intentionally empty
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("cert_path") && err.contains("key_path"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rate_limit_defaults_disabled() {
+        let dir = tempdir().unwrap();
+        let cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        assert!(!cfg.server.rate_limit.enabled);
+        assert_eq!(cfg.server.rate_limit.per_ip_per_sec, 50);
+        assert_eq!(cfg.server.rate_limit.burst, 100);
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_zero_rate() {
+        let dir = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        cfg.server.rate_limit.enabled = true;
+        cfg.server.rate_limit.per_ip_per_sec = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("per_ip_per_sec"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_zero_burst() {
+        let dir = tempdir().unwrap();
+        let mut cfg = ConfigTemplate::general(dir.path().to_path_buf());
+        cfg.server.rate_limit.enabled = true;
+        cfg.server.rate_limit.burst = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("burst"), "got: {err}");
     }
 
     #[test]

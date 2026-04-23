@@ -1,13 +1,18 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
     middleware,
+    response::IntoResponse,
     routing::{delete, get, post},
-    Extension, Router,
+    Extension, Json, Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
+use serde_json::json;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use jihuan_core::Engine;
@@ -19,7 +24,58 @@ pub mod files;
 pub mod iam;
 pub mod ui;
 
-pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> Router {
+/// Shared liveness/readiness flag. Cloned into the probe router so
+/// `/readyz` can return 503 during the narrow window between process
+/// start and engine bootstrap completion. Operators (k8s, Nomad,
+/// Docker healthchecks) should use `/healthz` for liveness (always 200
+/// while the HTTP task is accepting connections) and `/readyz` for
+/// readiness (only 200 once the engine is servicing requests).
+#[derive(Clone, Default)]
+pub struct ReadyFlag(pub Arc<AtomicBool>);
+
+impl ReadyFlag {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    pub fn set_ready(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn is_ready(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+async fn handle_healthz() -> impl IntoResponse {
+    // Liveness: the HTTP task is alive enough to run this handler.
+    // Always 200 — if k8s sees a non-200 here something is very wrong.
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn handle_readyz(State(ready): State<ReadyFlag>) -> impl IntoResponse {
+    if ready.is_ready() {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ready" })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "starting",
+                "reason": "engine bootstrap in progress"
+            })),
+        )
+    }
+}
+
+pub fn router(
+    engine: Arc<Engine>,
+    metrics_handle: Option<PrometheusHandle>,
+    ready: ReadyFlag,
+) -> Router {
     let auth_state = auth::AuthState {
         engine: engine.clone(),
         config: engine.config().auth.clone(),
@@ -44,6 +100,41 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         None
     } else {
         Some(TimeoutLayer::new(Duration::from_secs(timeout_secs)))
+    };
+
+    // Phase 4.3 — per-IP token-bucket limiter. We build the shared
+    // `GovernorConfig` once and wrap it in `Arc`; each sub-router that
+    // opts in constructs its own lightweight `GovernorLayer` that
+    // points at the same config (the token buckets live inside the
+    // config's internal state keyed by peer IP). Probe routes, login,
+    // and the metrics endpoint are merged *without* this layer so a
+    // locked-out operator or orchestrator can always reach them.
+    let rate_cfg = &engine.config().server.rate_limit;
+    let governor_config = if rate_cfg.enabled {
+        let per_second = rate_cfg.per_ip_per_sec.max(1) as u64;
+        let burst = rate_cfg.burst.max(1);
+        match GovernorConfigBuilder::default()
+            .per_second(per_second)
+            .burst_size(burst)
+            .finish()
+        {
+            Some(conf) => Some(Arc::new(conf)),
+            None => {
+                // Defensive degrade — validate() + the clamps above
+                // should guarantee `Some(_)`, but if tower_governor's
+                // internal invariants change we prefer plaintext over
+                // a crash loop.
+                tracing::warn!(
+                    "tower_governor rejected rate_limit config ({} per second, burst {}), \
+                     rate limiting disabled",
+                    per_second,
+                    burst
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // Streaming-path routers: upload (configurable body limit, no timeout)
@@ -96,6 +187,7 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         .route("/api/gc/trigger", post(admin::trigger_gc))
         .route("/api/admin/compact", post(admin::compact))
         .route("/api/admin/seal", post(admin::seal))
+        .route("/api/admin/scrub", post(admin::scrub))
         .route("/api/block/list", get(admin::list_blocks))
         .route(
             "/api/block/:block_id",
@@ -162,13 +254,37 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         main_router = main_router.layer(t);
     }
 
-    // Liveness / readiness probes (k8s-compatible). Served outside the auth
-    // and CORS layers so orchestrators can hit them without a credential
-    // and without worrying about preflight headers. They must stay cheap
-    // — no engine access, no allocations beyond the static body.
+    // Apply the rate-limit layer to the three request-serving routers
+    // but *not* to the auth or probe routers. Each `GovernorLayer`
+    // instance points at the shared `Arc<GovernorConfig>` so all
+    // sub-routers hit the same per-IP buckets.
+    let (upload_router, download_router) = if let Some(cfg) = governor_config.as_ref() {
+        let u = upload_router.layer(GovernorLayer {
+            config: cfg.clone(),
+        });
+        let d = download_router.layer(GovernorLayer {
+            config: cfg.clone(),
+        });
+        (u, d)
+    } else {
+        (upload_router, download_router)
+    };
+    if let Some(cfg) = governor_config.as_ref() {
+        main_router = main_router.layer(GovernorLayer {
+            config: cfg.clone(),
+        });
+    }
+
+    // Liveness / readiness probes (k8s-compatible). Served outside the
+    // auth and CORS layers so orchestrators can hit them without a
+    // credential and without worrying about preflight headers. Must
+    // stay cheap — no engine access, no allocations beyond a tiny JSON
+    // body. `/readyz` returns 503 with `{status:"starting"}` until the
+    // engine reports ready; this is what gates Kubernetes traffic to
+    // new pods during rolling deploys.
     let probe_router: Router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ready" }));
+        .route("/healthz", get(handle_healthz))
+        .route("/readyz", get(handle_readyz).with_state(ready));
 
     Router::new()
         .merge(probe_router)
@@ -176,4 +292,78 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         .merge(upload_router)
         .merge(download_router)
         .merge(main_router)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn probe_only_router(ready: ReadyFlag) -> Router {
+        Router::new()
+            .route("/healthz", get(handle_healthz))
+            .route("/readyz", get(handle_readyz).with_state(ready))
+    }
+
+    #[tokio::test]
+    async fn test_healthz_always_ok() {
+        let app = probe_only_router(ReadyFlag::new()); // not-ready shouldn't matter
+        let resp = app
+            .oneshot(Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_readyz_503_before_set_ready() {
+        let flag = ReadyFlag::new();
+        let app = probe_only_router(flag);
+        let resp = app
+            .oneshot(Request::builder().uri("/readyz").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "starting");
+    }
+
+    #[tokio::test]
+    async fn test_governor_config_builds_for_valid_rate_limit() {
+        // Phase 4.3 sanity: the production code path
+        // (`GovernorConfigBuilder::per_second + burst_size`) used in
+        // `router()` must yield `Some(_)` for the default config
+        // values. An E2E 429 test requires a live socket + ConnectInfo
+        // (tower_governor's peer-IP extractor needs it), covered by
+        // the `tests/perf/` smoke scripts; here we just lock in that
+        // the builder accepts our config surface.
+        use tower_governor::governor::GovernorConfigBuilder;
+        let conf = GovernorConfigBuilder::default()
+            .per_second(50)
+            .burst_size(100)
+            .finish();
+        assert!(conf.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_readyz_200_after_set_ready() {
+        let flag = ReadyFlag::new();
+        flag.set_ready();
+        let app = probe_only_router(flag);
+        let resp = app
+            .oneshot(Request::builder().uri("/readyz").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+    }
 }

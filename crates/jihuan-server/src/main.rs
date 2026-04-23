@@ -260,8 +260,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Readiness flag — starts `false`, flipped to `true` below once the
+    // engine's background tasks (GC, compaction, audit retention) have
+    // been spawned and the HTTP listener is about to accept traffic.
+    // Kubernetes `/readyz` probe consumes this to gate rolling deploys.
+    let ready_flag = http::ReadyFlag::new();
+
     // Build HTTP router
-    let http_router = http::router(engine.clone(), metrics_handle.clone())
+    let http_router = http::router(engine.clone(), metrics_handle.clone(), ready_flag.clone())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors_layer);
 
@@ -441,6 +447,15 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
+
+    // Engine + GC + compaction + HTTP/gRPC listeners are all spawned.
+    // Flip the readiness flag so `/readyz` returns 200 and the load
+    // balancer can start sending traffic. There's a tiny race where a
+    // request could hit `/readyz` just before the TCP listener binds,
+    // but the listener task's `bind` happens synchronously inside the
+    // spawned future — orchestrators will retry once.
+    ready_flag.set_ready();
+    tracing::info!("Server is ready (HTTP + gRPC listeners live)");
 
     // Block on signal, then fan out shutdown to both servers.
     shutdown_signal.await;

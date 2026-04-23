@@ -280,6 +280,38 @@ pub struct RepairSummary {
     pub dedup_removed: u32,
 }
 
+/// Per-chunk scrub error. Emitted by [`Engine::scrub`] whenever an
+/// on-disk chunk fails its content-hash or CRC check.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScrubError {
+    pub block_id: String,
+    pub chunk_hash: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// Report returned by [`Engine::scrub`]. Covers all sealed blocks known
+/// to the metadata store. `errors` is capped at 100 entries to keep
+/// the HTTP response bounded; when `chunks_corrupt > errors.len()` the
+/// operator should consult the server logs for the full list.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ScrubReport {
+    /// Number of sealed blocks opened successfully.
+    pub blocks_checked: u32,
+    /// Blocks that could not be opened at all (missing file, corrupt
+    /// header/footer, truncated index).
+    pub blocks_failed: u32,
+    /// Total chunks successfully read + verified.
+    pub chunks_checked: u64,
+    /// Chunks whose CRC32 or content hash didn't match.
+    pub chunks_corrupt: u64,
+    /// Wall-clock duration in milliseconds.
+    pub elapsed_ms: u64,
+    /// Up to the first 100 chunk-level errors, serialised for the
+    /// admin endpoint. Oldest errors win if more are found.
+    pub errors: Vec<ScrubError>,
+}
+
 /// v0.4.5: `(source_block_meta, live_bytes, live_hashes)` triple used by
 /// the cross-block compaction merger. Named to appease clippy's
 /// `type_complexity` lint and to make the many `Vec<...>` / `&[...]`
@@ -1422,6 +1454,140 @@ impl Engine {
     /// startup.
     pub fn repair(&self) -> Result<RepairSummary> {
         Self::repair_static(&self.meta, &self.config.storage.data_dir)
+    }
+
+    /// Phase 4.5 — block-integrity scrub.
+    ///
+    /// Walks every **sealed** block in the metadata store, opens it with
+    /// [`BlockReader::open`] (which verifies the block header / footer
+    /// CRC32 as a side effect), then reads each chunk with
+    /// `verify = true` to re-check the per-chunk compressed-data CRC32
+    /// recorded at write time. When the engine was configured with a
+    /// non-`None` hash algorithm we additionally recompute the content
+    /// hash on the decompressed bytes and compare it to the hash stored
+    /// in the chunk index — this catches silent disk corruption that
+    /// happens to leave the CRC intact (e.g. NAND bit-flip inside a
+    /// chunk smaller than the redundancy window).
+    ///
+    /// The active (unsealed) block is **skipped**: it has no footer, so
+    /// `BlockReader::open` would reject it. Newly-sealed blocks created
+    /// mid-scrub are also safe — we took a snapshot of the block list
+    /// up front.
+    ///
+    /// Returns a [`ScrubReport`] with tallies. Chunk-level errors are
+    /// collected into `report.errors` (capped at 100 entries to keep
+    /// the HTTP response bounded); all errors are also logged at WARN.
+    pub fn scrub(&self) -> Result<ScrubReport> {
+        use crate::block::reader::BlockReader;
+        use crate::dedup::hash_chunk;
+        use std::time::Instant;
+
+        const MAX_REPORTED_ERRORS: usize = 100;
+
+        let started = Instant::now();
+        let mut report = ScrubReport::default();
+        let blocks = self.meta.list_all_blocks()?;
+        let hash_algo = self.config.storage.hash_algorithm;
+
+        for block in blocks {
+            let path = std::path::Path::new(&block.path);
+            // Skip the active block — it has no footer yet. Also skip
+            // anything that doesn't exist on disk: that's a metadata/
+            // filesystem mismatch which `repair()` is the right tool
+            // for, not `scrub()`.
+            if !path.exists() || !BlockReader::is_complete(path) {
+                continue;
+            }
+
+            let mut reader = match BlockReader::open(path) {
+                Ok(r) => r,
+                Err(e) => {
+                    report.blocks_failed += 1;
+                    tracing::warn!(
+                        block_id = %block.block_id,
+                        error = %e,
+                        "scrub: block header/footer/index verification failed"
+                    );
+                    if report.errors.len() < MAX_REPORTED_ERRORS {
+                        report.errors.push(ScrubError {
+                            block_id: block.block_id.clone(),
+                            chunk_hash: String::new(),
+                            kind: "block_open".into(),
+                            detail: e.to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            report.blocks_checked += 1;
+
+            // Clone the entries so we can drop the borrow on `reader`
+            // between iterations (`read_chunk` needs `&mut reader`).
+            let entries = reader.entries.clone();
+            for entry in entries {
+                let chunk_hash_stored = entry.hash_str();
+                match reader.read_chunk(&entry, true) {
+                    Ok(plain) => {
+                        report.chunks_checked += 1;
+                        // Content-hash cross-check — only meaningful when
+                        // dedup hashing is on AND the stored hash is
+                        // non-empty (pre-hash-algo=none blocks).
+                        if !chunk_hash_stored.is_empty()
+                            && !matches!(hash_algo, crate::config::HashAlgorithm::None)
+                        {
+                            let recomputed = hash_chunk(&plain, hash_algo);
+                            if recomputed != chunk_hash_stored {
+                                report.chunks_corrupt += 1;
+                                tracing::warn!(
+                                    block_id = %block.block_id,
+                                    stored = %chunk_hash_stored,
+                                    recomputed = %recomputed,
+                                    "scrub: chunk content hash mismatch"
+                                );
+                                if report.errors.len() < MAX_REPORTED_ERRORS {
+                                    let detail =
+                                        format!("expected={chunk_hash_stored}, got={recomputed}");
+                                    report.errors.push(ScrubError {
+                                        block_id: block.block_id.clone(),
+                                        chunk_hash: chunk_hash_stored,
+                                        kind: "hash_mismatch".into(),
+                                        detail,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        report.chunks_corrupt += 1;
+                        tracing::warn!(
+                            block_id = %block.block_id,
+                            chunk_hash = %chunk_hash_stored,
+                            error = %e,
+                            "scrub: chunk read/decompress failed"
+                        );
+                        if report.errors.len() < MAX_REPORTED_ERRORS {
+                            report.errors.push(ScrubError {
+                                block_id: block.block_id.clone(),
+                                chunk_hash: chunk_hash_stored,
+                                kind: "crc_or_decompress".into(),
+                                detail: e.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        report.elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            blocks_checked = report.blocks_checked,
+            blocks_failed = report.blocks_failed,
+            chunks_checked = report.chunks_checked,
+            chunks_corrupt = report.chunks_corrupt,
+            elapsed_ms = report.elapsed_ms,
+            "scrub complete"
+        );
+        Ok(report)
     }
 
     /// Recovery helper: rebuild a valid footer + index table for a
@@ -4096,6 +4262,75 @@ gc_threshold = 0.7
         assert_eq!(summary.files_removed, 0);
         assert_eq!(summary.blocks_removed, 0);
         assert_eq!(summary.dedup_removed, 0);
+    }
+
+    #[test]
+    fn test_scrub_healthy_store_reports_zero_corruption() {
+        // Phase 4.5: clean sealed blocks with valid CRCs and matching
+        // content hashes must produce a zero-corruption report. We
+        // upload a few files, seal, then scrub — expecting every
+        // chunk to pass both CRC and hash checks.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine.put_bytes(b"hello", "a.txt", None).unwrap();
+        engine.put_bytes(b"world", "b.txt", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        let report = engine.scrub().unwrap();
+        assert_eq!(report.blocks_failed, 0);
+        assert!(report.blocks_checked >= 1, "{report:?}");
+        assert!(report.chunks_checked >= 2, "{report:?}");
+        assert_eq!(report.chunks_corrupt, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn test_scrub_detects_bitflip_in_sealed_block() {
+        // Phase 4.5: after sealing, flip a byte in the middle of the
+        // block file. The per-chunk CRC32 must catch it and report a
+        // corrupt chunk. This exercises the hot path (read_chunk with
+        // verify=true) without relying on any hash-algorithm specifics.
+        let tmp = tempdir().unwrap();
+        let engine = open_engine(&tmp);
+        engine.put_bytes(b"hello world, this is a longer chunk", "a.txt", None).unwrap();
+        engine.seal_active_block().unwrap();
+
+        // Find the sealed block's on-disk path.
+        let blocks = engine.metadata().list_all_blocks().unwrap();
+        let path = blocks
+            .iter()
+            .find(|b| b.size > 0)
+            .map(|b| b.path.clone())
+            .expect("should have at least one sealed block");
+
+        // Flip one byte somewhere in the data region (byte 32 is safely
+        // past the header for any reasonable header size).
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(32)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            b[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(32)).unwrap();
+            f.write_all(&b).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let report = engine.scrub().unwrap();
+        // Either the block open fails (footer/index CRC caught it) or
+        // a chunk read fails (data CRC caught it); either way the
+        // scrub must report ≥1 error against this block.
+        let total_errors = report.chunks_corrupt + report.blocks_failed as u64;
+        assert!(
+            total_errors >= 1,
+            "expected scrub to catch the bitflip, got {report:?}"
+        );
+        assert!(!report.errors.is_empty());
     }
 
     #[test]

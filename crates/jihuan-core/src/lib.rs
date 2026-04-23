@@ -18,6 +18,6 @@ pub mod wal;
 
 pub use engine::{
     CompactionBlockStats, CompactionOptions, ConflictPolicy, Engine, PutOptions, PutOutcome,
-    SealedBlockInfo,
+    RepairSummary, ScrubError, ScrubReport, SealedBlockInfo,
 };
 pub use error::{JiHuanError, Result};

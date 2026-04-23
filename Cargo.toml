@@ -67,6 +67,9 @@ hyper = { version = "1", features = ["full"] }
 # axum + tonic both use rustls). Pinned to versions compatible with the
 # existing axum 0.7 / tonic 0.12 stack.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Phase 4.3 — per-IP token-bucket rate limiting at the tower layer.
+# Pinned to 0.4 for axum 0.7 compatibility.
+tower_governor = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 rcgen = "0.13"

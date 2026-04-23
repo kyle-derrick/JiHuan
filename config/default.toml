@@ -72,3 +72,13 @@ enabled         = false
 cert_path       = ""
 key_path        = ""
 auto_selfsigned = false
+
+# Phase 4.3 — per-IP token-bucket rate limiting. Disabled by default.
+# When enabled, the limiter drops flood traffic with HTTP 429 +
+# Retry-After BEFORE the auth middleware runs. /healthz, /readyz,
+# /api/auth/login are exempt by routing so a misconfigured client
+# can never lock out operators/orchestrators.
+[server.rate_limit]
+enabled        = false
+per_ip_per_sec = 50
+burst          = 100

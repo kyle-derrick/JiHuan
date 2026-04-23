@@ -327,6 +327,30 @@ pub async fn seal(
     }))
 }
 
+/// POST /api/admin/scrub — Phase 4.5 block-integrity scrub.
+///
+/// Runs `Engine::scrub` on a blocking-pool thread (the scan is
+/// synchronous and I/O heavy). Returns a JSON `ScrubReport` with
+/// aggregate counters plus up to 100 per-chunk error rows. Always
+/// returns **200** even when corruption is found — operators should
+/// consume the report body, not the HTTP status.
+///
+/// Requires `admin` scope. This is a relatively expensive operation
+/// (O(chunks) disk reads + decompress), so it's an explicit API call
+/// rather than a default background task; a `gc.scrub_interval_hours`
+/// scheduler is tracked under the Phase 4.5 follow-up.
+pub async fn scrub(
+    State(engine): State<Arc<Engine>>,
+    caller: AuthedKey,
+) -> Result<Json<jihuan_core::ScrubReport>, AppError> {
+    require_scope(&caller, "admin")?;
+    let report = tokio::task::spawn_blocking(move || engine.scrub())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(report))
+}
+
 /// GET /api/block/list
 pub async fn list_blocks(
     State(engine): State<Arc<Engine>>,

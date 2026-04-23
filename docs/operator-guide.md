@@ -375,14 +375,105 @@ grpcurl -cacert /etc/jihuan/tls/fullchain.pem \
 
 ---
 
+## 9c. Reliability surface (Phase 4, v0.5.1)
+
+### 9c.1 Health probes (`/healthz` + `/readyz`)
+
+Two Kubernetes-compatible JSON endpoints served **outside** auth/CORS
+so orchestrators can hit them without a credential:
+
+| Path | Meaning | Status |
+|---|---|---|
+| `GET /healthz` | Liveness — the HTTP task is alive | **200** `{"status":"ok","version":"…"}` (always) |
+| `GET /readyz` | Readiness — engine bootstrap complete, listener bound | **200** `{"status":"ready"}` once ready, else **503** `{"status":"starting"}` |
+
+`/readyz` flips from 503 → 200 after `Engine::open()` succeeds, GC +
+auto-compaction are spawned, and the HTTP/gRPC listeners are about to
+accept. Use `/readyz` to gate rolling deploys; keep `/healthz` for
+liveness so k8s restarts hung processes but doesn't flap during the
+seconds-long startup window.
+
+Minimal k8s probe snippet:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: 8080 }
+  initialDelaySeconds: 2
+  periodSeconds: 3
+  failureThreshold: 20  # allow ≤60 s for engine bootstrap
+```
+
+### 9c.2 Rate limiting (tower_governor)
+
+Opt-in per-IP token-bucket limiter. Probe, login, and metrics routes
+are exempt (they're routed on a separate Router that never sees the
+layer) — this guarantees a flooded instance stays reachable for
+orchestrators and humans.
+
+```toml
+[server.rate_limit]
+enabled        = true
+per_ip_per_sec = 50   # steady-state refill
+burst          = 100  # initial bucket + headroom
+```
+
+Over-limit requests get **429 Too Many Requests** with a `Retry-After`
+header set by tower_governor. Behind a reverse proxy, set
+`proxy_set_header X-Forwarded-For $remote_addr` so the limiter can see
+the real client IP — the default key extractor reads the peer socket
+address, which would otherwise collapse to the proxy's IP and punish
+everyone equally.
+
+### 9c.3 Block-integrity scrub (`POST /api/admin/scrub`)
+
+Walks every sealed block, verifies the header/footer CRC32s, then
+re-reads every chunk with per-chunk CRC32 check + content-hash
+cross-check (when `storage.hash_algorithm ≠ none`). Returns a JSON
+`ScrubReport`:
+
+```json
+{
+  "blocks_checked": 42,
+  "blocks_failed": 0,
+  "chunks_checked": 15832,
+  "chunks_corrupt": 0,
+  "elapsed_ms": 418,
+  "errors": []
+}
+```
+
+**Status is always 200**, even when corruption is found — consumers
+should inspect `chunks_corrupt` and `errors[]` rather than the HTTP
+status. `errors[]` is capped at 100 entries; full error output lands
+in the server log at `WARN` level with `block_id` / `chunk_hash`.
+
+Expected cadence: weekly in production, or before every backup. The
+scan is I/O-bound — expect ~1 GB/s throughput on a warm SSD. An
+automatic scheduler (`gc.scrub_interval_hours`) is tracked under the
+Phase 4.5 follow-up.
+
+```powershell
+curl -X POST -H "authorization: Bearer $env:JH_KEY" https://localhost:8080/api/admin/scrub
+```
+
+---
+
 ## 10. Known Limits / Next Steps
 
 | Area | Status | Owner phase |
 |---|---|---|
 | TLS | **implemented** (Phase 3; in-process rustls for HTTP + gRPC, static PEM or dev auto-selfsigned) | v0.5.0 |
 | Graceful shutdown | **implemented** (SIGINT/SIGTERM → seal block + fsync WAL, 30 s drain) | — |
-| Health probes | planned | Phase 4 |
-| Rate limiting | planned | Phase 4 |
+| Health probes | **implemented** (`/healthz` always 200, `/readyz` 503→200) | v0.5.1 |
+| Rate limiting | **implemented** (tower_governor, per-IP, probes/login exempt) | v0.5.1 |
+| Block scrub | **implemented** (`POST /api/admin/scrub`, CRC + content-hash) | v0.5.1 |
+| Scrub scheduler | planned (`gc.scrub_interval_hours`) | Phase 4.5 follow-up |
+| WAL checkpoint/rotation | planned | Phase 4.4 |
+| Backup/restore CLI | planned | Phase 4.6 |
 | Audit retention auto-purge | partial (purge fn exists, no scheduler) | Phase 4 |
 | Performance optimisation (P1/P2/P3/P5) | planned | Phase 6b continuation |
 | UI audit-log page | planned | Phase 2.7 follow-up |
