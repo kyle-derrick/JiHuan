@@ -1,15 +1,16 @@
 import { useState, type FormEvent } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { HardDrive, KeyRound, Loader2 } from 'lucide-react'
+import { HardDrive, KeyRound, Loader2, User } from 'lucide-react'
 import { login } from '@/api'
 
 /**
- * /ui/login — Single-field API key prompt. On success the server sets an
- * HttpOnly `jh_session` cookie; we then navigate back to the `?next=` path
- * (or the dashboard by default).
+ * /ui/login — v0.5.0-iam: username + password form. On success the server
+ * sets an HttpOnly `jh_session` cookie; we then navigate back to the
+ * `?next=` path (or the dashboard by default).
  */
 export default function Login() {
-  const [key, setKey] = useState('')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const navigate = useNavigate()
@@ -18,15 +19,15 @@ export default function Login() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    const trimmed = key.trim()
-    if (!trimmed) {
-      setError('请粘贴一个 API Key')
+    const u = username.trim()
+    if (!u || !password) {
+      setError('请填写用户名和密码')
       return
     }
     setLoading(true)
     setError('')
     try {
-      await login(trimmed)
+      await login(u, password)
       // Clear any stale `X-API-Key` localStorage value — the cookie is now the
       // source of truth for the UI session.
       localStorage.removeItem('jihuan_api_key')
@@ -47,7 +48,7 @@ export default function Login() {
             <HardDrive className="text-indigo-600" size={32} />
           </div>
           <h1 className="text-2xl font-bold text-gray-900">JiHuan 存储控制台</h1>
-          <p className="text-sm text-gray-500 mt-1">使用 API Key 登录</p>
+          <p className="text-sm text-gray-500 mt-1">使用用户名和密码登录</p>
         </div>
 
         {/* Card */}
@@ -57,7 +58,29 @@ export default function Login() {
         >
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1.5">
-              API Key
+              用户名
+            </label>
+            <div className="relative">
+              <User
+                size={15}
+                className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
+              />
+              <input
+                type="text"
+                autoFocus
+                autoComplete="username"
+                spellCheck={false}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="root"
+                className="w-full pl-9 pr-3 py-2.5 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1.5">
+              密码
             </label>
             <div className="relative">
               <KeyRound
@@ -66,17 +89,16 @@ export default function Login() {
               />
               <input
                 type="password"
-                autoFocus
                 autoComplete="current-password"
                 spellCheck={false}
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder="jh_xxxxxxxx…"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
                 className="w-full pl-9 pr-3 py-2.5 text-sm font-mono border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300"
               />
             </div>
             <p className="text-xs text-gray-400 mt-1.5">
-              首次启动时请在服务端终端查看 bootstrap admin key。
+              首次启动时请在服务端终端查看 root 账户的初始密码。
             </p>
           </div>
 

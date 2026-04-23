@@ -10,6 +10,7 @@ import {
   Activity,
   ShieldAlert,
   LogOut,
+  Users,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { logout } from '@/api'
@@ -21,6 +22,7 @@ const nav = [
   { to: '/ui/gc', label: 'GC', icon: Trash2 },
   { to: '/ui/metrics', label: '指标', icon: Activity },
   { to: '/ui/audit', label: '审计日志', icon: ShieldAlert },
+  { to: '/ui/users', label: '用户管理', icon: Users },
   { to: '/ui/keys', label: '密钥管理', icon: KeyRound },
   { to: '/ui/settings', label: '设置', icon: Settings },
 ]

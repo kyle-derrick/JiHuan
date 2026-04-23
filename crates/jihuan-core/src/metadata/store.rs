@@ -7,7 +7,7 @@ use redb::{
 };
 
 use crate::error::{JiHuanError, Result};
-use crate::metadata::types::{ApiKeyMeta, AuditEvent, BlockMeta, DedupEntry, FileMeta};
+use crate::metadata::types::{ApiKeyMeta, AuditEvent, BlockMeta, DedupEntry, FileMeta, UserMeta};
 
 // Table definitions: key → value (v0.4.8: values bincode-encoded blobs).
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
@@ -29,6 +29,9 @@ const PARTITION_FILES_TABLE: MultimapTableDefinition<&str, &str> =
 const APIKEYS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("apikeys");
 /// Maps key_hash → key_id (for fast lookup by raw key hash)
 const APIKEY_HASH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("apikey_hash");
+/// v0.5.0-iam: users table, keyed by username (primary key).
+/// Value is bincode-encoded `UserMeta`.
+const USERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
 /// Audit log (Phase 2.6). Keyed by 16-byte BE composite `[ts_secs:u64][seq:u64]`
 /// so that table iteration returns events in chronological order. The
 /// `seq` component is monotonically increased per process so that two
@@ -118,6 +121,8 @@ impl MetadataStore {
             tx.open_table(APIKEYS_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(APIKEY_HASH_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            tx.open_table(USERS_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
             tx.open_table(AUDIT_TABLE)
                 .map_err(|e| JiHuanError::Database(e.to_string()))?;
@@ -1513,6 +1518,160 @@ impl MetadataStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Users (Phase 2B — v0.5.0-iam)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Insert (or replace) a user record. Callers must check for duplicate
+    /// usernames beforehand when creation semantics are required — `redb`
+    /// `insert` always overwrites.
+    pub fn insert_user(&self, user: &UserMeta) -> Result<()> {
+        let bytes = encode(user)?;
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(USERS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            table
+                .insert(user.username.as_str(), bytes.as_slice())
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_user(&self, username: &str) -> Result<Option<UserMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(USERS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        match table
+            .get(username)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            Some(v) => Ok(Some(decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_users(&self) -> Result<Vec<UserMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(USERS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut users = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            users.push(decode::<UserMeta>(v.value())?);
+        }
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(users)
+    }
+
+    /// Delete a user and cascade-delete all service accounts owned by them.
+    /// Returns `Ok(None)` when the user does not exist. The root user
+    /// is *not* guarded at this layer — callers (HTTP handlers) enforce
+    /// the policy that root cannot be deleted.
+    pub fn delete_user_cascade(&self, username: &str) -> Result<Option<UserMeta>> {
+        // First collect SAs owned by this user. Done under a read tx so the
+        // subsequent write can apply all deletions atomically.
+        let sas_to_delete: Vec<ApiKeyMeta> = {
+            let rtx = self
+                .db
+                .begin_read()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let table = rtx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| JiHuanError::Database(e.to_string()))?
+            {
+                let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+                let meta: ApiKeyMeta = decode(v.value())?;
+                if meta.parent_user == username {
+                    out.push(meta);
+                }
+            }
+            out
+        };
+
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+
+        let removed_user: Option<UserMeta> = {
+            let mut users = tx
+                .open_table(USERS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let raw = users
+                .remove(username)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            match raw {
+                Some(g) => Some(decode(g.value())?),
+                None => None,
+            }
+        };
+
+        if removed_user.is_some() {
+            let mut keys = tx
+                .open_table(APIKEYS_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let mut hashes = tx
+                .open_table(APIKEY_HASH_TABLE)
+                .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            for sa in &sas_to_delete {
+                keys.remove(sa.key_id.as_str())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+                hashes
+                    .remove(sa.key_hash.as_str())
+                    .map_err(|e| JiHuanError::Database(e.to_string()))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        Ok(removed_user)
+    }
+
+    /// List service accounts whose `parent_user` equals `username`.
+    pub fn list_service_accounts_by_user(&self, username: &str) -> Result<Vec<ApiKeyMeta>> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(APIKEYS_TABLE)
+            .map_err(|e| JiHuanError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|e| JiHuanError::Database(e.to_string()))?
+        {
+            let (_, v) = entry.map_err(|e| JiHuanError::Database(e.to_string()))?;
+            let meta: ApiKeyMeta = decode(v.value())?;
+            if meta.parent_user == username {
+                out.push(meta);
+            }
+        }
+        Ok(out)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Audit log (Phase 2.6)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1921,6 +2080,99 @@ mod tests {
         let remaining = store.list_audit_events(None, None, None, None, 10).unwrap();
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().all(|e| e.ts >= 25));
+    }
+
+    // ─── Phase 2B — v0.5.0-iam users ──────────────────────────────────────────
+
+    fn mk_user(name: &str, is_root: bool) -> UserMeta {
+        UserMeta {
+            username: name.to_string(),
+            password_hash: [7u8; 32],
+            salt: [3u8; 16],
+            scopes: vec!["read".to_string(), "write".to_string()],
+            allowed_partitions: None,
+            created_at: 1000,
+            enabled: true,
+            is_root,
+        }
+    }
+
+    fn mk_sa(key_id: &str, parent: &str) -> ApiKeyMeta {
+        ApiKeyMeta {
+            key_id: key_id.to_string(),
+            name: format!("{}-key", key_id),
+            key_hash: format!("hash-{}", key_id),
+            key_prefix: format!("{}...", &key_id[..key_id.len().min(4)]),
+            created_at: 1000,
+            last_used_at: 0,
+            enabled: true,
+            scopes: vec!["read".to_string()],
+            parent_user: parent.to_string(),
+            allowed_partitions: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn test_user_insert_get_list() {
+        let (store, _tmp) = make_store();
+        store.insert_user(&mk_user("alice", false)).unwrap();
+        store.insert_user(&mk_user("bob", false)).unwrap();
+        let got = store.get_user("alice").unwrap().unwrap();
+        assert_eq!(got.username, "alice");
+        assert!(!got.is_root);
+        let list = store.list_users().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].username, "alice");
+        assert_eq!(list[1].username, "bob");
+    }
+
+    #[test]
+    fn test_delete_user_cascades_service_accounts() {
+        let (store, _tmp) = make_store();
+        store.insert_user(&mk_user("alice", false)).unwrap();
+        store.insert_user(&mk_user("bob", false)).unwrap();
+        store.insert_api_key(&mk_sa("sa1", "alice")).unwrap();
+        store.insert_api_key(&mk_sa("sa2", "alice")).unwrap();
+        store.insert_api_key(&mk_sa("sa3", "bob")).unwrap();
+
+        let removed = store.delete_user_cascade("alice").unwrap().unwrap();
+        assert_eq!(removed.username, "alice");
+        assert!(store.get_user("alice").unwrap().is_none());
+        // alice's SAs gone; bob's remain
+        assert_eq!(
+            store
+                .list_service_accounts_by_user("alice")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_service_accounts_by_user("bob")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.get_api_key("sa1").unwrap().is_none());
+        assert!(store.get_api_key("sa2").unwrap().is_none());
+        assert!(store.get_api_key("sa3").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_list_service_accounts_filters_by_parent_user() {
+        let (store, _tmp) = make_store();
+        store.insert_api_key(&mk_sa("k1", "alice")).unwrap();
+        store.insert_api_key(&mk_sa("k2", "bob")).unwrap();
+        let mut orphan = mk_sa("k3", "");
+        orphan.parent_user = String::new();
+        store.insert_api_key(&orphan).unwrap();
+
+        let alice_sas = store.list_service_accounts_by_user("alice").unwrap();
+        assert_eq!(alice_sas.len(), 1);
+        assert_eq!(alice_sas[0].key_id, "k1");
+        let orphans = store.list_service_accounts_by_user("").unwrap();
+        assert_eq!(orphans.len(), 1);
     }
 
     #[test]

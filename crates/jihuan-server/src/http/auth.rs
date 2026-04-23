@@ -32,10 +32,31 @@ pub const SESSION_COOKIE: &str = "jh_session";
 /// that successfully authenticates via the cookie.
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
 
+/// A resolved session principal. In v0.5.0-iam a session can be minted
+/// from one of two sources:
+///   * A User who logged in with username+password. `key_id` is the
+///     synthetic id `"user:<username>"`; the corresponding `ApiKeyMeta`
+///     is never persisted — it is reconstructed on every request from
+///     the current `UserMeta` record.
+///   * Legacy path: a raw API key was exchanged for a cookie. Here
+///     `key_id` points at an actual `APIKEYS_TABLE` row. v0.5.0-iam no
+///     longer mints these (login refuses raw keys) but outstanding
+///     cookies from previous versions keep working until they expire.
 #[derive(Clone, Debug)]
 struct Session {
     key_id: String,
     expires_at: u64,
+}
+
+/// Compose the synthetic key_id for a session tied to a [`UserMeta`].
+pub fn user_session_key_id(username: &str) -> String {
+    format!("user:{}", username)
+}
+
+/// Extract the username from a user-session key_id, or `None` when the
+/// id does not follow the `user:<name>` convention (pre-IAM SA sessions).
+pub fn username_from_session(key_id: &str) -> Option<&str> {
+    key_id.strip_prefix("user:")
 }
 
 /// In-memory session map. `String` = opaque random token stored in the cookie.
@@ -196,6 +217,9 @@ pub(crate) fn disabled_auth_principal() -> ApiKeyMeta {
         last_used_at: 0,
         enabled: true,
         scopes: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+        parent_user: String::new(),
+        allowed_partitions: None,
+        expires_at: None,
     }
 }
 
@@ -291,6 +315,43 @@ pub async fn auth_middleware(
         }
     };
 
+    // Resolve the principal. Two cases:
+    //   * `user:<username>` → reconstruct an ephemeral `ApiKeyMeta` from
+    //     the current `UserMeta` row. This is what cookie logins produce
+    //     in v0.5.0-iam.
+    //   * anything else → real `APIKEYS_TABLE` row for a ServiceAccount
+    //     (or a pre-IAM key).
+    if let Some(username) = username_from_session(&key_id).map(str::to_string) {
+        let engine = auth.engine.clone();
+        let user_res = tokio::task::spawn_blocking(move || {
+            engine.metadata().get_user(&username)
+        })
+        .await;
+        return match user_res {
+            Ok(Ok(Some(u))) if u.enabled => {
+                let meta = user_to_principal(&u);
+                req.extensions_mut().insert(AuthedKey(meta));
+                next.run(req).await
+            }
+            Ok(Ok(Some(_))) => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "user is disabled",
+                    "code": 403
+                })),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "session user no longer exists",
+                    "code": 401
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     // Fetch the full `ApiKeyMeta` for scope enforcement. The header path
     // already retrieved it once; re-reading here keeps the code uniform and
     // also picks up the latest `enabled` flag for cookie sessions.
@@ -303,6 +364,19 @@ pub async fn auth_middleware(
 
     match meta {
         Ok(Ok(Some(key))) if key.enabled => {
+            // v0.5.0-iam: enforce SA expiry.
+            if let Some(exp) = key.expires_at {
+                if now_secs() >= exp {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({
+                            "error": "service account expired",
+                            "code": 401
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             // Touch last_used_at asynchronously (fire-and-forget)
             let engine2 = auth.engine.clone();
             let key_id2 = key.key_id.clone();
@@ -328,6 +402,25 @@ pub async fn auth_middleware(
             })),
         )
             .into_response(),
+    }
+}
+
+/// Build an ephemeral `ApiKeyMeta` principal from a `UserMeta`, used by
+/// the session-cookie path so `AuthedKey`/`require_scope` can treat User
+/// logins and ServiceAccount bearer tokens uniformly.
+fn user_to_principal(u: &jihuan_core::metadata::types::UserMeta) -> ApiKeyMeta {
+    ApiKeyMeta {
+        key_id: user_session_key_id(&u.username),
+        name: u.username.clone(),
+        key_hash: String::new(),
+        key_prefix: String::new(),
+        created_at: u.created_at,
+        last_used_at: 0,
+        enabled: u.enabled,
+        scopes: u.scopes.clone(),
+        parent_user: u.username.clone(),
+        allowed_partitions: u.allowed_partitions.clone(),
+        expires_at: None,
     }
 }
 
@@ -494,6 +587,9 @@ pub fn build_new_key(name: &str, scopes: Vec<String>) -> (String, ApiKeyMeta, u6
         last_used_at: 0,
         enabled: true,
         scopes,
+        parent_user: String::new(),
+        allowed_partitions: None,
+        expires_at: None,
     };
     (raw_key, meta, now)
 }
@@ -625,7 +721,8 @@ pub async fn delete_key(
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
-    pub key: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,49 +734,55 @@ pub struct LoginResponse {
     pub expires_in: u64,
 }
 
-/// POST /api/auth/login — exchange an API key for a session cookie.
+/// POST /api/auth/login — v0.5.0-iam: exchange a username+password for a
+/// session cookie.
 ///
-/// Accepts `{ "key": "jh_…" }`. On success sets an `HttpOnly`, `SameSite=Strict`
-/// cookie `jh_session=<token>` and returns the authenticated key's metadata.
-/// This endpoint is on the auth-exempt list so it can be called by an
-/// un-authenticated browser.
+/// Accepts `{ "username": "...", "password": "..." }`. On success sets an
+/// `HttpOnly`, `SameSite=Strict` cookie `jh_session=<token>` and returns
+/// the authenticated user's identity. Raw API keys are no longer accepted
+/// here — service-account callers must send `Authorization: Bearer` on
+/// every request instead.
 pub async fn login(
     State(auth): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
-    let raw = req.key.trim();
-    if raw.is_empty() {
-        return Err(AppError::bad_request("key must not be empty"));
+    let username = req.username.trim().to_string();
+    let password = req.password;
+    if username.is_empty() || password.is_empty() {
+        return Err(AppError::bad_request(
+            "username and password must both be provided",
+        ));
     }
 
-    // Look up the key. Hashing is cheap so do it inline; the DB read is on a
-    // blocking pool to avoid stalling the tokio runtime.
-    let hash = hash_key(raw);
+    // Fetch the user record on the blocking pool.
     let engine = auth.engine.clone();
-    let meta = tokio::task::spawn_blocking(move || engine.metadata().get_api_key_by_hash(&hash))
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?
-        .map_err(AppError::from_jihuan)?;
+    let username_for_task = username.clone();
+    let user_opt = tokio::task::spawn_blocking(move || {
+        engine.metadata().get_user(&username_for_task)
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .map_err(AppError::from_jihuan)?;
 
     let actor_ip = audit::client_ip(&headers, None);
-    let meta = match meta {
-        Some(m) if m.enabled => m,
-        Some(m) => {
+    let user = match user_opt {
+        Some(u) if u.enabled => u,
+        Some(_) => {
             audit::record(
                 auth.engine.clone(),
-                Some(m.key_id.clone()),
+                None,
                 actor_ip.clone(),
                 "auth.login_failed",
-                None,
+                Some(username.clone()),
                 AuditResult::Denied {
-                    reason: "key disabled".to_string(),
+                    reason: "user disabled".to_string(),
                 },
                 Some(403),
             );
             return Err(AppError {
                 status: StatusCode::FORBIDDEN,
-                message: "API key is disabled".to_string(),
+                message: "user is disabled".to_string(),
             });
         }
         None => {
@@ -688,34 +791,72 @@ pub async fn login(
                 None,
                 actor_ip.clone(),
                 "auth.login_failed",
-                None,
+                Some(username.clone()),
                 AuditResult::Denied {
-                    reason: "invalid key".to_string(),
+                    reason: "unknown user".to_string(),
                 },
                 Some(401),
             );
-            // Constant-ish 401 regardless of whether the key existed to avoid
-            // key-enumeration oracles.
+            // Constant-ish 401 regardless of whether the user existed to
+            // avoid username-enumeration oracles.
             return Err(AppError {
                 status: StatusCode::UNAUTHORIZED,
-                message: "invalid API key".to_string(),
+                message: "invalid username or password".to_string(),
             });
         }
     };
 
-    // Mint + persist the session.
+    // Constant-time-ish password check. SHA-256 comparisons against 32
+    // bytes are short enough that the side-channel risk is negligible in
+    // the single-node admin UI threat model.
+    let expected = crate::http::iam::hash_password(&password, &user.salt);
+    if expected != user.password_hash {
+        audit::record(
+            auth.engine.clone(),
+            None,
+            actor_ip.clone(),
+            "auth.login_failed",
+            Some(username.clone()),
+            AuditResult::Denied {
+                reason: "bad password".to_string(),
+            },
+            Some(401),
+        );
+        return Err(AppError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "invalid username or password".to_string(),
+        });
+    }
+
+    // Mint + persist the session. `user:<username>` is the synthetic
+    // key_id the middleware recognises and re-resolves to a principal
+    // built from the current UserMeta row.
+    let session_id = user_session_key_id(&username);
     let token = new_session_token();
-    auth.sessions.insert(token.clone(), meta.key_id.clone()).await;
+    auth.sessions.insert(token.clone(), session_id.clone()).await;
 
     audit::record(
         auth.engine.clone(),
-        Some(meta.key_id.clone()),
+        Some(session_id.clone()),
         actor_ip,
         "auth.login",
-        None,
+        Some(username.clone()),
         AuditResult::Ok,
         Some(200),
     );
+    let meta = ApiKeyMeta {
+        key_id: session_id,
+        name: user.username.clone(),
+        key_hash: String::new(),
+        key_prefix: String::new(),
+        created_at: user.created_at,
+        last_used_at: 0,
+        enabled: true,
+        scopes: user.scopes.clone(),
+        parent_user: user.username.clone(),
+        allowed_partitions: user.allowed_partitions.clone(),
+        expires_at: None,
+    };
 
     // Build the Set-Cookie header. `Secure` is gated on
     // `auth.cookie_secure` so plain-HTTP dev deployments still work
@@ -794,13 +935,12 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
-/// POST /api/auth/change-password — rotate the caller's own credential.
+/// POST /api/auth/change-password — rotate the caller's own password.
 ///
-/// The hash of `new_password` replaces the current key's `key_hash`, so the
-/// previously-issued raw key (e.g. the bootstrap admin key) no longer
-/// authenticates. Existing `jh_session` cookies keep working because they're
-/// bound to `key_id`, not to the hash — so the UI does not have to force a
-/// re-login. Scopes, `key_id`, `name`, and `enabled` are preserved.
+/// v0.5.0-iam: when the caller is a User (session cookie), replace the
+/// hash+salt on the corresponding `UserMeta` row. Legacy SA-backed
+/// sessions cannot change their "password" — SAs rotate their secret
+/// via the admin API instead — and return 400.
 ///
 /// Requires the caller to already be authenticated; no extra scope check,
 /// since changing your own password is a baseline capability.
@@ -810,8 +950,6 @@ pub async fn change_password(
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<StatusCode, AppError> {
     let pw = req.new_password;
-    // Minimal policy: reject trivial passwords. 8 chars is the common floor;
-    // we don't enforce complexity (the admin may prefer a long passphrase).
     if pw.chars().count() < 8 {
         return Err(AppError::bad_request(
             "new_password must be at least 8 characters",
@@ -823,37 +961,50 @@ pub async fn change_password(
         ));
     }
 
-    let new_hash = hash_key(&pw);
-    // Use a fixed prefix so the Keys page stops showing the old `jh_xxxx…`
-    // preview, signalling visually that this record is now a user password.
-    let new_prefix = "(user password)".to_string();
-    let key_id = caller.0.key_id.clone();
-    let engine = auth.engine.clone();
-    let key_id_for_task = key_id.clone();
+    let username = match username_from_session(&caller.0.key_id).map(str::to_string) {
+        Some(u) => u,
+        None => {
+            return Err(AppError::bad_request(
+                "service accounts cannot change a password; rotate the key via the admin API",
+            ));
+        }
+    };
 
-    let updated = tokio::task::spawn_blocking(move || {
-        engine
-            .metadata()
-            .update_api_key_hash(&key_id_for_task, &new_hash, &new_prefix)
+    let engine = auth.engine.clone();
+    let username_probe = username.clone();
+    let user_opt = tokio::task::spawn_blocking(move || {
+        engine.metadata().get_user(&username_probe)
     })
     .await
     .map_err(|e| AppError::internal(e.to_string()))?
     .map_err(AppError::from_jihuan)?;
+    let mut user = match user_opt {
+        Some(u) => u,
+        None => {
+            return Err(AppError {
+                status: StatusCode::NOT_FOUND,
+                message: "authenticated user no longer exists".to_string(),
+            })
+        }
+    };
 
-    if !updated {
-        return Err(AppError {
-            status: StatusCode::NOT_FOUND,
-            message: "authenticated key no longer exists".to_string(),
-        });
-    }
+    let salt = crate::http::iam::random_salt();
+    user.password_hash = crate::http::iam::hash_password(&pw, &salt);
+    user.salt = salt;
 
-    tracing::info!(%key_id, "API key credential rotated via change-password");
+    let engine_task = auth.engine.clone();
+    tokio::task::spawn_blocking(move || engine_task.metadata().insert_user(&user))
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .map_err(AppError::from_jihuan)?;
+
+    tracing::info!(%username, "User password rotated via change-password");
     audit::record(
         auth.engine.clone(),
-        Some(key_id.clone()),
+        Some(caller.0.key_id.clone()),
         None,
         "auth.change_password",
-        Some(key_id),
+        Some(username),
         AuditResult::Ok,
         Some(204),
     );

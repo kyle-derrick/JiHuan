@@ -156,69 +156,64 @@ async fn main() -> anyhow::Result<()> {
     // When disabled, this is a no-op (returns None) and the handle is dropped.
     let _compaction_handle = engine.start_auto_compaction();
 
-    // Bootstrap admin key. Policy: when auth is enabled, ensure at least one
-    // enabled admin-scoped key exists. If not, mint one and print it to stderr
-    // (one-shot). This covers three cases:
-    //   • first boot, empty metadata → bootstrap fires
-    //   • metadata has keys but none with `admin` → user locked themselves
-    //     out (e.g. revoked their only admin key); bootstrap gives them a
-    //     recovery credential
-    //   • admin key already present → skip silently
+    // v0.5.0-iam bootstrap: when auth is enabled, ensure a root user exists.
+    // Policy:
+    //   • empty metadata → create root user (password from JIHUAN_ROOT_PASSWORD
+    //     or auto-generated)
+    //   • root user already exists → skip silently
+    //   • apikeys table non-empty but users table empty → hard-fail with a
+    //     migration message (dev-only: wipe data dir and restart)
     //
-    // The decision is logged at INFO so operators can see why no banner
-    // appears on subsequent boots. (Phase 2.1, updated Phase 2.2)
+    // When auth is disabled every request is accepted with a synthetic
+    // full-scope principal — we log a prominent warning.
     if config.auth.enabled {
         let engine_for_bootstrap = engine.clone();
-        let existing = tokio::task::spawn_blocking(move || {
-            engine_for_bootstrap.metadata().list_api_keys()
+        let data_dir_for_bootstrap = config.storage.meta_dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            http::iam::root_bootstrap(&engine_for_bootstrap, &data_dir_for_bootstrap)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("bootstrap admin key task: {e}"))?
-        .map_err(|e| anyhow::anyhow!("bootstrap admin key list: {e}"))?;
-
-        let total = existing.len();
-        let admin_count = existing
-            .iter()
-            .filter(|k| k.enabled && k.scopes.iter().any(|s| s == "admin"))
-            .count();
-
-        if admin_count == 0 {
-            let (raw_key, meta, _now) = http::auth::build_new_key(
-                "bootstrap-admin",
-                vec!["read".to_string(), "write".to_string(), "admin".to_string()],
-            );
-            let key_id = meta.key_id.clone();
-            let engine_for_insert = engine.clone();
-            tokio::task::spawn_blocking(move || {
-                engine_for_insert.metadata().insert_api_key(&meta)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("bootstrap admin key insert task: {e}"))?
-            .map_err(|e| anyhow::anyhow!("bootstrap admin key insert: {e}"))?;
-
-            // Print prominently so the first-run operator cannot miss it.
-            let banner = "═".repeat(72);
-            eprintln!("\n{banner}");
-            if total == 0 {
-                eprintln!("  JiHuan bootstrap: no API keys found — creating initial admin key");
-            } else {
-                eprintln!("  JiHuan bootstrap: no admin-scoped key among {total} existing keys");
-                eprintln!("  → minting a recovery admin key");
+        .map_err(|e| anyhow::anyhow!("root bootstrap task: {e}"))??;
+        match outcome {
+            http::iam::BootstrapOutcome::Created {
+                username,
+                raw_password,
+            } => {
+                let banner = "═".repeat(72);
+                eprintln!("\n{banner}");
+                eprintln!("  JiHuan bootstrap: no users found — created the root account");
+                eprintln!("  username = {username}");
+                if !raw_password.is_empty() {
+                    eprintln!("  PASSWORD (save now — it will NEVER be shown again):");
+                    eprintln!("      {raw_password}");
+                } else {
+                    eprintln!("  password = (as supplied via JIHUAN_ROOT_PASSWORD)");
+                }
+                eprintln!(
+                    "  Log in at  http://{}/ui/login  with username+password.",
+                    config.server.http_addr
+                );
+                eprintln!("  Change your password later at  /ui/settings  → 修改登录密码.");
+                eprintln!("{banner}\n");
+                tracing::info!(%username, "Bootstrap root user created");
             }
-            eprintln!("  key_id = {key_id}");
-            eprintln!("  API KEY (save now — it will NEVER be shown again):");
-            eprintln!("      {raw_key}");
-            eprintln!("  Log in at  http://{}/ui/login  with this value as the password.",
-                config.server.http_addr);
-            eprintln!("  You can change the password later at  /ui/settings  → 修改登录密码.");
-            eprintln!("{banner}\n");
-            tracing::info!(%key_id, total, "Bootstrap admin key created");
-        } else {
-            tracing::info!(
-                total_keys = total,
-                admin_keys = admin_count,
-                "Auth enabled; skipping bootstrap (admin key already present)"
-            );
+            http::iam::BootstrapOutcome::Existing => {
+                tracing::info!(
+                    "Auth enabled; skipping bootstrap (users already present)"
+                );
+            }
+            http::iam::BootstrapOutcome::NeedsMigration(msg) => {
+                let banner = "═".repeat(72);
+                eprintln!("\n{banner}");
+                eprintln!("  JiHuan startup aborted:\n");
+                for line in msg.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!("{banner}\n");
+                return Err(anyhow::anyhow!(
+                    "identity schema migration required (v0.4.x → v0.5.0-iam); see stderr"
+                ));
+            }
         }
     } else {
         tracing::warn!("Authentication is disabled; every request is accepted");

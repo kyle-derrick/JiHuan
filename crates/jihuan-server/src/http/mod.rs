@@ -16,6 +16,7 @@ pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod files;
+pub mod iam;
 pub mod ui;
 
 pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> Router {
@@ -106,9 +107,36 @@ pub fn router(engine: Arc<Engine>, metrics_handle: Option<PrometheusHandle>) -> 
         // Same-origin Prometheus metrics proxy for UI and integrations that
         // cannot reach the standalone `:9090/metrics` port (CORS / firewall).
         .route("/api/metrics", get(admin::render_metrics))
-        // Key management routes
+        // Key management routes (legacy; kept for backward compatibility)
         .route("/api/keys", post(auth::create_key).get(auth::list_keys))
         .route("/api/keys/:key_id", delete(auth::delete_key))
+        // v0.5.0-iam: user + service-account admin routes
+        .route(
+            "/api/admin/users",
+            get(iam::list_users).post(iam::create_user),
+        )
+        .route(
+            "/api/admin/users/:username",
+            get(iam::get_user)
+                .patch(iam::update_user)
+                .delete(iam::delete_user),
+        )
+        .route(
+            "/api/admin/users/:username/password",
+            post(iam::reset_password),
+        )
+        .route(
+            "/api/admin/users/:username/sa",
+            get(iam::list_sa).post(iam::create_sa),
+        )
+        .route(
+            "/api/admin/users/:username/sa/:key_id",
+            delete(iam::delete_sa),
+        )
+        .route(
+            "/api/admin/users/:username/sa/:key_id/rotate",
+            post(iam::rotate_sa),
+        )
         // Web UI (SPA)
         .route("/ui/", get(ui::serve_index))
         .route("/ui/*path", get(ui::serve_asset))

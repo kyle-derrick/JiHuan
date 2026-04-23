@@ -154,7 +154,14 @@ pub struct PartitionMeta {
     pub file_count: u64,
 }
 
-/// Metadata for an API key
+/// Metadata for an API key (v0.5.0-iam: aka ServiceAccount).
+///
+/// Type name kept as `ApiKeyMeta` for backward compatibility with existing
+/// callers and table definitions; new fields (`parent_user`,
+/// `allowed_partitions`, `expires_at`) give the record the semantics of
+/// a MinIO-style ServiceAccount attached to a `User`. Legacy records
+/// persisted before v0.5.0 lack these fields — serde `default` keeps them
+/// readable (parent_user = "", no partition restriction, no expiry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyMeta {
     /// Unique identifier (UUID simple string)
@@ -176,6 +183,53 @@ pub struct ApiKeyMeta {
     /// written by this codebase.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// v0.5.0-iam: parent User that owns this service account. Empty string
+    /// means "no owner" — only used by legacy pre-IAM keys and by the
+    /// session-cookie virtual SA that login mints for a User.
+    #[serde(default)]
+    pub parent_user: String,
+    /// v0.5.0-iam: optional partition allow-list. `None` = full access
+    /// (default for all pre-IAM keys and for admin SAs). `Some(vec![])` =
+    /// explicitly no partitions (effectively denies upload/download).
+    #[serde(default)]
+    pub allowed_partitions: Option<Vec<String>>,
+    /// v0.5.0-iam: unix timestamp at which the SA auto-disables. `None` =
+    /// never expires. Checked on every auth; expired SAs return 401 with
+    /// audit `auth.sa_expired`.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+/// v0.5.0-iam: a human user account. Distinct from a ServiceAccount
+/// (`ApiKeyMeta`) — users authenticate with username+password to obtain
+/// a session cookie; service accounts authenticate with a raw bearer key.
+/// One User owns 0..N ServiceAccounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMeta {
+    /// Unique username (primary key), 2-64 bytes of `[a-zA-Z0-9_.-]`.
+    pub username: String,
+    /// SHA-256 hash of `password || salt`.
+    pub password_hash: [u8; 32],
+    /// Per-user random salt mixed into the password hash.
+    pub salt: [u8; 16],
+    /// Permission scopes. Same vocabulary as [`ApiKeyMeta::scopes`] —
+    /// `"admin"`, `"operator"`, `"viewer"`, `"read"`, `"write"`.
+    /// Convention: `admin` elevates to `read`+`write`; `operator` = `read+write`;
+    /// `viewer` = `read`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Optional partition allow-list. `None` = all partitions.
+    #[serde(default)]
+    pub allowed_partitions: Option<Vec<String>>,
+    /// Unix timestamp when this user was created.
+    pub created_at: u64,
+    /// Whether this user can currently log in. Disabling a user does NOT
+    /// automatically revoke its service accounts.
+    pub enabled: bool,
+    /// True only for the single root account. Guarded against deletion
+    /// and against `enabled = false` transitions.
+    #[serde(default)]
+    pub is_root: bool,
 }
 
 /// A dedup index entry: maps a content hash → block location.

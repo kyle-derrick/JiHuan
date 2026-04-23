@@ -381,12 +381,15 @@ export interface LoginResponse {
   expires_in: number
 }
 
-/** Exchange an API key for an HttpOnly `jh_session` cookie. */
-export const login = (key: string) =>
+/** v0.5.0-iam: exchange a username+password for an HttpOnly
+ *  `jh_session` cookie. Raw API keys are no longer accepted here;
+ *  service-account callers must send `Authorization: Bearer` on every
+ *  request instead. */
+export const login = (username: string, password: string) =>
   apiJSON<LoginResponse>('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key }),
+    body: JSON.stringify({ username, password }),
   })
 
 /** Clear the session cookie. Always resolves (204 is expected). */
@@ -414,6 +417,147 @@ export async function changePassword(newPassword: string) {
   try { msg = JSON.parse(text).error ?? text } catch {}
   throw new Error(`HTTP ${resp.status}: ${msg}`)
 }
+
+// ── IAM: users + service accounts (Phase 2B, v0.5.0-iam) ────────────────────
+
+export interface UserInfo {
+  username: string
+  scopes: string[]
+  allowed_partitions: string[] | null
+  created_at: number
+  enabled: boolean
+  is_root: boolean
+}
+
+export interface UserListResponse {
+  users: UserInfo[]
+  count: number
+}
+
+export const listUsers = () =>
+  apiJSON<UserListResponse>('/api/admin/users')
+
+export const getUser = (username: string) =>
+  apiJSON<UserInfo>(`/api/admin/users/${encodeURIComponent(username)}`)
+
+export const createUser = (req: {
+  username: string
+  password: string
+  scopes?: string[]
+  allowed_partitions?: string[] | null
+}) =>
+  apiJSON<UserInfo>('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+
+export const updateUser = (
+  username: string,
+  req: {
+    scopes?: string[]
+    allowed_partitions?: string[] | null
+    enabled?: boolean
+  },
+) =>
+  apiJSON<UserInfo>(`/api/admin/users/${encodeURIComponent(username)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+
+export async function deleteUser(username: string) {
+  const resp = await apiFetch(
+    `/api/admin/users/${encodeURIComponent(username)}`,
+    { method: 'DELETE' },
+  )
+  if (!resp.ok && resp.status !== 204) {
+    const text = await resp.text()
+    let msg = text
+    try { msg = JSON.parse(text).error ?? text } catch {}
+    throw new Error(`HTTP ${resp.status}: ${msg}`)
+  }
+}
+
+export async function resetUserPassword(username: string, password: string) {
+  const resp = await apiFetch(
+    `/api/admin/users/${encodeURIComponent(username)}/password`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    },
+  )
+  if (resp.status === 204) return
+  const text = await resp.text()
+  let msg = text
+  try { msg = JSON.parse(text).error ?? text } catch {}
+  throw new Error(`HTTP ${resp.status}: ${msg}`)
+}
+
+export interface SaInfo {
+  key_id: string
+  name: string
+  key_prefix: string
+  parent_user: string
+  scopes: string[]
+  allowed_partitions: string[] | null
+  created_at: number
+  last_used_at: number
+  expires_at: number | null
+  enabled: boolean
+}
+
+export interface SaListResponse {
+  service_accounts: SaInfo[]
+  count: number
+}
+
+export interface CreateSaResponse extends SaInfo {
+  key: string
+}
+
+export const listUserSa = (username: string) =>
+  apiJSON<SaListResponse>(
+    `/api/admin/users/${encodeURIComponent(username)}/sa`,
+  )
+
+export const createUserSa = (
+  username: string,
+  req: {
+    name: string
+    scopes?: string[]
+    allowed_partitions?: string[] | null
+    expires_at?: number | null
+  },
+) =>
+  apiJSON<CreateSaResponse>(
+    `/api/admin/users/${encodeURIComponent(username)}/sa`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    },
+  )
+
+export async function deleteUserSa(username: string, keyId: string) {
+  const resp = await apiFetch(
+    `/api/admin/users/${encodeURIComponent(username)}/sa/${encodeURIComponent(keyId)}`,
+    { method: 'DELETE' },
+  )
+  if (!resp.ok && resp.status !== 204) {
+    const text = await resp.text()
+    let msg = text
+    try { msg = JSON.parse(text).error ?? text } catch {}
+    throw new Error(`HTTP ${resp.status}: ${msg}`)
+  }
+}
+
+export const rotateUserSa = (username: string, keyId: string) =>
+  apiJSON<CreateSaResponse>(
+    `/api/admin/users/${encodeURIComponent(username)}/sa/${encodeURIComponent(keyId)}/rotate`,
+    { method: 'POST' },
+  )
 
 // ── Audit log (Phase 2.6) ────────────────────────────────────────────────────
 
